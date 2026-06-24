@@ -4,8 +4,8 @@ use std::future::Future;
 use tokio::sync::{mpsc, oneshot};
 
 use super::events::{AgentEvent, UiEvent};
-use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 use crate::core::session::Session;
+use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 
 pub struct AgentConfig {
     pub model: String,
@@ -87,7 +87,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 Some(UiEvent::UserMessage { text }) => break text,
                 Some(UiEvent::SetModel { model }) => {
                     cfg.model = model;
-                    emit_session_info_if_changed(&agent_tx, &cfg.model, backend.git_branch(), &session, &mut last_session_ctx).await;
+                    emit_session_info_if_changed(
+                        &agent_tx,
+                        &cfg.model,
+                        backend.git_branch(),
+                        &session,
+                        &mut last_session_ctx,
+                    )
+                    .await;
                 }
                 Some(UiEvent::Quit) | None => return Ok(()),
                 Some(ev) => {
@@ -165,7 +172,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 messages.push(assistant_msg);
                 last_good_snapshot = messages.len();
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
-                emit_session_info_if_changed(&agent_tx, &cfg.model, backend.git_branch(), &session, &mut last_session_ctx).await;
+                emit_session_info_if_changed(
+                    &agent_tx,
+                    &cfg.model,
+                    backend.git_branch(),
+                    &session,
+                    &mut last_session_ctx,
+                )
+                .await;
                 break;
             }
 
@@ -178,7 +192,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
             // model sees "denied — try this instead" in one coherent step.
             if denied {
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
-                emit_session_info_if_changed(&agent_tx, &cfg.model, backend.git_branch(), &session, &mut last_session_ctx).await;
+                emit_session_info_if_changed(
+                    &agent_tx,
+                    &cfg.model,
+                    backend.git_branch(),
+                    &session,
+                    &mut last_session_ctx,
+                )
+                .await;
                 loop {
                     match ui_rx.recv().await {
                         Some(UiEvent::UserMessage { text }) => {
@@ -187,7 +208,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         }
                         Some(UiEvent::SetModel { model }) => {
                             cfg.model = model;
-                            emit_session_info_if_changed(&agent_tx, &cfg.model, backend.git_branch(), &session, &mut last_session_ctx).await;
+                            emit_session_info_if_changed(
+                                &agent_tx,
+                                &cfg.model,
+                                backend.git_branch(),
+                                &session,
+                                &mut last_session_ctx,
+                            )
+                            .await;
                         }
                         Some(UiEvent::Quit) | None => return Ok(()),
                         Some(ev) => {
@@ -231,7 +259,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 messages.push(synthetic);
                 last_good_snapshot = messages.len();
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
-                emit_session_info_if_changed(&agent_tx, &cfg.model, backend.git_branch(), &session, &mut last_session_ctx).await;
+                emit_session_info_if_changed(
+                    &agent_tx,
+                    &cfg.model,
+                    backend.git_branch(),
+                    &session,
+                    &mut last_session_ctx,
+                )
+                .await;
             }
         }
     }

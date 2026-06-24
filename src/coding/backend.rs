@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
-use crate::coding::context::{claude_md_block, collect_git_info, stable_env_block, volatile_env_block};
+use crate::coding::context::{
+    claude_md_block, collect_git_info, stable_env_block, volatile_env_block,
+};
 use crate::coding::file_state::FileState;
 use crate::coding::mcp::{LOAD_TOOL_NAME, McpRegistry};
 use crate::coding::prompt::system_prompt_body;
@@ -45,7 +47,12 @@ impl CodingBackend {
 impl Backend for CodingBackend {
     fn system_blocks(&self) -> Vec<SystemBlock> {
         let volatile_env = volatile_env_block(&self.cwd);
-        build_system_blocks(&self.system_prompt, &self.claude_md, &self.stable_env, &volatile_env)
+        build_system_blocks(
+            &self.system_prompt,
+            &self.claude_md,
+            &self.stable_env,
+            &volatile_env,
+        )
     }
 
     fn tool_schemas(&self) -> (Vec<serde_json::Value>, Option<usize>) {
@@ -153,12 +160,24 @@ fn build_system_blocks(
     stable_env: &str,
     volatile_env: &str,
 ) -> Vec<SystemBlock> {
-    let mut system = vec![SystemBlock { text: system_prompt.to_string(), cache: false }];
+    let mut system = vec![SystemBlock {
+        text: system_prompt.to_string(),
+        cache: false,
+    }];
     if let Some(cm) = claude_md {
-        system.push(SystemBlock { text: cm.clone(), cache: false });
+        system.push(SystemBlock {
+            text: cm.clone(),
+            cache: false,
+        });
     }
-    system.push(SystemBlock { text: stable_env.to_string(), cache: true });
-    system.push(SystemBlock { text: volatile_env.to_string(), cache: true });
+    system.push(SystemBlock {
+        text: stable_env.to_string(),
+        cache: true,
+    });
+    system.push(SystemBlock {
+        text: volatile_env.to_string(),
+        cache: true,
+    });
     system
 }
 

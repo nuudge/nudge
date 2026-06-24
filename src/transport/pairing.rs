@@ -75,9 +75,10 @@ impl Pairing {
     // 16-byte rendezvous id, 32-byte key, then the relay URL as UTF-8 (variable,
     // so it goes last — no length prefix needed).
     pub fn decode(code: &str) -> Result<Self> {
-        let b64 = code.trim().strip_prefix(SCHEME).with_context(|| {
-            format!("not a nudge pairing code (missing '{SCHEME}' prefix)")
-        })?;
+        let b64 = code
+            .trim()
+            .strip_prefix(SCHEME)
+            .with_context(|| format!("not a nudge pairing code (missing '{SCHEME}' prefix)"))?;
         let bytes = URL_SAFE_NO_PAD
             .decode(b64)
             .context("pairing code is not valid base64url")?;

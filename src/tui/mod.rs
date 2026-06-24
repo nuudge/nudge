@@ -832,7 +832,10 @@ impl App {
             let chars: Vec<char> = code.chars().collect();
             for chunk in chars.chunks(w) {
                 let s: String = chunk.iter().collect();
-                out.push(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray))));
+                out.push(Line::from(Span::styled(
+                    s,
+                    Style::default().fg(Color::DarkGray),
+                )));
             }
         }
         out.push(Line::from(""));
@@ -853,7 +856,7 @@ impl App {
         let (input_rows, cursor_row, cursor_col) =
             wrap_input(&self.input, self.cursor, input_inner_width);
         let total_input_lines = input_rows.len();
-        let visible_input_lines = total_input_lines.min(MAX_INPUT_LINES).max(1);
+        let visible_input_lines = total_input_lines.clamp(1, MAX_INPUT_LINES);
         let input_height = (visible_input_lines as u16) + 2;
         let input_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES) as u16;
 
@@ -987,8 +990,11 @@ impl App {
             // where the input box was. No alt-screen exit — the conversation stays
             // visible above. No cursor (we're detached).
             let body = self.pair_panel_body(input_area.width.saturating_sub(2) as usize);
-            let panel = Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title("pair a device"));
+            let panel = Paragraph::new(body).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("pair a device"),
+            );
             f.render_widget(panel, input_area);
         } else if self.mode == Mode::Background {
             // Frozen banner instead of the input box; the log above stays as it
@@ -1517,7 +1523,12 @@ async fn run_loop<H: SessionHandle>(
 // owned separately (it stays on across a pair-screen suspend so the EventStream
 // keeps delivering keys), so it's not toggled here.
 fn enter_screen<W: Write>(w: &mut W) -> io::Result<()> {
-    execute!(w, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(
+        w,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     // Opt into the kitty keyboard protocol so terminals that support it
     // (Kitty, WezTerm, Ghostty, foot, Alacritty ≥ 0.13, iTerm2 ≥ 3.5, …)
     // report Shift+Enter / Ctrl+Enter as distinct events instead of
@@ -1538,7 +1549,12 @@ fn enter_screen<W: Write>(w: &mut W) -> io::Result<()> {
 // both on final teardown and to drop to the plain-terminal pair screen.
 fn leave_screen<W: Write>(w: &mut W) -> io::Result<()> {
     let _ = execute!(w, PopKeyboardEnhancementFlags);
-    execute!(w, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(
+        w,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 

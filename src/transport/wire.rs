@@ -212,7 +212,10 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         // Compact JSON must not contain a raw newline — the framing relies on it.
-        assert!(!json.contains('\n'), "compact JSON leaked a raw newline: {json}");
+        assert!(
+            !json.contains('\n'),
+            "compact JSON leaked a raw newline: {json}"
+        );
         let back: ControllerEvent = serde_json::from_str(&json).unwrap();
         match back {
             ControllerEvent::ToolResult {

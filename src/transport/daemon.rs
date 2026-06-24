@@ -239,11 +239,10 @@ where
                         seq += 1;
                         // Honour the resume cursor: drain replayed events the
                         // client already has without re-sending them.
-                        if let Some(a) = after_seq {
-                            if this_seq <= a {
+                        if let Some(a) = after_seq
+                            && this_seq <= a {
                                 continue;
                             }
-                        }
                         if writer
                             .send(&ServerFrame::Event { seq: this_seq, event })
                             .await

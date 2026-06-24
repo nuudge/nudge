@@ -195,7 +195,8 @@ async fn main() -> Result<()> {
             session_id: session.id.clone(),
         },
     );
-    let mut host = core::SessionHost::spawn(cfg, provider, backend, session, initial_messages, seed);
+    let mut host =
+        core::SessionHost::spawn(cfg, provider, backend, session, initial_messages, seed);
 
     // Headless daemon vs local in-process TUI (--connect returned earlier). Over the
     // relay the daemon dials OUT (--relay); otherwise it binds a local Unix socket.
@@ -339,7 +340,9 @@ async fn run_connect(cli: Cli) -> Result<()> {
         let client = transport::SocketClient::new(path);
         let controller = match client.connect(None).await? {
             Some(c) => c,
-            None => bail!("could not attach: the daemon is busy (another client holds the session)"),
+            None => {
+                bail!("could not attach: the daemon is busy (another client holds the session)")
+            }
         };
         tui::run(&client, ui_cfg, controller).await
     }
@@ -400,7 +403,9 @@ fn print_pairing(pairing: &transport::Pairing) -> Result<()> {
         "Scan to pair a device — this code carries the relay address, room id, and E2E key, so keep it secret:\n"
     );
     println!("{}", pairing.render_qr()?);
-    println!("Or paste this pairing code on the other device:\n\n{}\n", pairing.encode());
+    println!(
+        "Or paste this pairing code on the other device:\n\n{}\n",
+        pairing.encode()
+    );
     Ok(())
 }
-

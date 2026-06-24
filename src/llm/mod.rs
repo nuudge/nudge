@@ -90,6 +90,12 @@ pub struct Response {
 // is generic over the provider and spawned onto the tokio runtime, can prove
 // its future is Send. Implementors may still write `async fn`.
 pub trait Provider {
-    fn complete(&self, req: &Request<'_>) -> impl std::future::Future<Output = Result<Response>> + Send;
-    fn count_tokens(&self, req: &Request<'_>) -> impl std::future::Future<Output = Result<u64>> + Send;
+    fn complete(
+        &self,
+        req: &Request<'_>,
+    ) -> impl std::future::Future<Output = Result<Response>> + Send;
+    fn count_tokens(
+        &self,
+        req: &Request<'_>,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send;
 }
