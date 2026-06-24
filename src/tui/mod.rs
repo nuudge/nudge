@@ -844,11 +844,15 @@ impl App {
     }
 
     fn render(&mut self, f: &mut ratatui::Frame) {
-        // Dynamic input height — grow up to MAX_INPUT_LINES content rows, then
-        // scroll inside the input box. Single-line input keeps the box at 3
-        // rows so the log gets maximum real estate.
-        let input_lines: Vec<&str> = self.input.split('\n').collect();
-        let total_input_lines = input_lines.len();
+        // Dynamic input height — grow up to MAX_INPUT_LINES display rows, then
+        // scroll inside the input box. Rows are counted post-wrap (a long line
+        // occupies several rows), so the box grows as text wraps, not only on
+        // explicit newlines. Single-row input keeps the box at 3 rows so the
+        // log gets maximum real estate.
+        let input_inner_width = f.area().width.saturating_sub(2).max(1) as usize;
+        let (input_rows, cursor_row, cursor_col) =
+            wrap_input(&self.input, self.cursor, input_inner_width);
+        let total_input_lines = input_rows.len();
         let visible_input_lines = total_input_lines.min(MAX_INPUT_LINES).max(1);
         let input_height = (visible_input_lines as u16) + 2;
         let input_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES) as u16;
@@ -858,7 +862,6 @@ impl App {
         // conversation log stays above it (Min(0) — it just shrinks), so context is
         // kept rather than blown away by a full-screen takeover.
         let show_qr = self.mode == Mode::Background && self.pairing_qr.is_some();
-        let frame_inner_w = f.area().width.saturating_sub(2).max(1) as usize;
         let (log_constraint, bottom_height) = if show_qr {
             let qr_rows = self
                 .pairing_qr
@@ -868,7 +871,7 @@ impl App {
             let code_rows = self
                 .pairing_code
                 .as_ref()
-                .map(|c| c.chars().count().div_ceil(frame_inner_w))
+                .map(|c| c.chars().count().div_ceil(input_inner_width))
                 .unwrap_or(0);
             // borders(2) + qr + blank(1) + code + blank(1) + hint(1). The QR sits at
             // the top of the panel, so if the terminal is too short the hint/code
@@ -997,7 +1000,11 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title("paused"));
             f.render_widget(banner, input_area);
         } else {
-            let input = Paragraph::new(self.input.as_str())
+            // Pre-wrapped into display rows (see wrap_input), so the Paragraph
+            // needs no `Wrap` — and the cursor mapping below stays exact, which
+            // ratatui's word-wrap would not allow.
+            let input_body: Vec<Line> = input_rows.into_iter().map(Line::from).collect();
+            let input = Paragraph::new(input_body)
                 .scroll((input_scroll, 0))
                 .block(
                     Block::default().borders(Borders::ALL).title(
@@ -1006,23 +1013,12 @@ impl App {
                 );
             f.render_widget(input, input_area);
 
-            // Map the char cursor to a (row, col) within the input box,
-            // accounting for scroll within the input.
-            let mut col = self.cursor;
-            let mut row = total_input_lines - 1;
-            for (i, line) in input_lines.iter().enumerate() {
-                let len = line.chars().count();
-                if col <= len {
-                    row = i;
-                    break;
-                }
-                col -= len + 1; // line chars plus the '\n' separator
-            }
-            let cursor_row = (row as u16).saturating_sub(input_scroll);
-            let cursor_col = col as u16;
+            // cursor_row / cursor_col are display coordinates from wrap_input;
+            // subtract the in-box scroll to land on the visible row.
+            let cursor_row_vis = (cursor_row as u16).saturating_sub(input_scroll);
             f.set_cursor_position(Position {
-                x: input_area.x + 1 + cursor_col,
-                y: input_area.y + 1 + cursor_row,
+                x: input_area.x + 1 + cursor_col as u16,
+                y: input_area.y + 1 + cursor_row_vis,
             });
         }
 
@@ -1291,6 +1287,52 @@ fn emit_expanded_result(out: &mut Vec<Line<'static>>, content: &str, elbow_style
                 .add_modifier(Modifier::ITALIC),
         )));
     }
+}
+
+// Wrap the input buffer into display rows at `width` chars and locate the edit
+// cursor within them. Character-based wrap (not word wrap) so a row maps to an
+// exact cell range and the rendered cursor lands precisely. Each logical line
+// (split on '\n') yields at least one row, so blank lines still take space.
+// `cursor` is a char index into `input`; the returned (row, col) are display
+// coordinates. When the buffer ends on a row filled exactly to `width`, a
+// trailing empty row is added so the cursor has a cell to sit in.
+fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor_row = 0;
+    let mut cursor_col = 0;
+    let mut cursor_located = false;
+    let mut remaining = cursor; // chars still to consume to reach the cursor
+
+    for logical in input.split('\n') {
+        let chars: Vec<char> = logical.chars().collect();
+        let len = chars.len();
+        let line_start_row = rows.len();
+        if len == 0 {
+            rows.push(String::new());
+        } else {
+            let mut start = 0;
+            while start < len {
+                let end = (start + width).min(len);
+                rows.push(chars[start..end].iter().collect());
+                start = end;
+            }
+        }
+        if !cursor_located && remaining <= len {
+            cursor_row = line_start_row + remaining / width;
+            cursor_col = remaining % width;
+            cursor_located = true;
+        } else if !cursor_located {
+            remaining -= len + 1; // line chars plus the '\n' separator
+        }
+    }
+
+    // Cursor sits one row past the content (end of a width-filled final line, or
+    // an unexpected out-of-range index): give it a row to render in.
+    while cursor_row >= rows.len() {
+        rows.push(String::new());
+    }
+    (rows, cursor_row, cursor_col)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
