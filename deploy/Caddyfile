@@ -1,0 +1,14 @@
+# nudge relay — TLS termination via Caddy's automatic HTTPS.
+#
+# Replace relay.example.com with a domain whose DNS record points at THIS box.
+# On first start Caddy obtains a Let's Encrypt certificate for it over ACME
+# (ports 80 and 443 must be reachable from the internet) and auto-renews it.
+#
+# Caddy terminates TLS and reverse-proxies the connection — WebSocket upgrades
+# included, transparently — to the relay listening on loopback. The relay never
+# sees TLS and never touches a certificate; what it forwards is still the
+# application-layer-encrypted ciphertext, so the box stays ciphertext-blind.
+
+relay.example.com {
+	reverse_proxy 127.0.0.1:9000
+}

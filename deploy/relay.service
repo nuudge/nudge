@@ -1,0 +1,24 @@
+[Unit]
+Description=nudge ciphertext-blind WebSocket relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Build with `cargo build --release --bin relay` and install the binary at this
+# path (see deploy/README.md). The relay binds loopback only — Caddy is its
+# public face and forwards decrypted-at-TLS-but-still-E2E-encrypted traffic here.
+ExecStart=/usr/local/bin/nudge-relay --listen 127.0.0.1:9000
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the relay needs nothing but a loopback socket. DynamicUser runs it
+# as an ephemeral unprivileged account systemd creates and tears down per start.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

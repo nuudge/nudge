@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- A bare framework theme; Compose's MaterialTheme owns the actual styling. Using
+         the framework theme avoids pulling in the AppCompat / Material Components libs. -->
+    <style name="Theme.Nudge" parent="android:Theme.Material.NoActionBar" />
+</resources>
