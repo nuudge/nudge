@@ -2,27 +2,35 @@ stages:
   - lint
   - test
 
-default:
-  image: rust:latest
-  cache:
-    key: "$CI_COMMIT_REF_SLUG"
-    paths:
-      - .cargo/
-      - target/
-
 variables:
+  RUST_VERSION: "1.96.0"
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
   CARGO_TERM_COLOR: always
 
+.rust-cache: &rust-cache
+  key:
+    files:
+      - Cargo.lock
+  fallback_keys:
+    - rust-cache-
+  paths:
+    - .cargo/
+
 lint:
   stage: lint
+  image: rust:$RUST_VERSION
   before_script:
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
     - cargo clippy --all-targets -- -D warnings
+  cache:
+    <<: *rust-cache
 
 test:
   stage: test
+  image: rust:$RUST_VERSION
   script:
     - cargo test --all
+  cache:
+    <<: *rust-cache

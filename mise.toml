@@ -1,0 +1,22 @@
+[tools]
+rust = "1.96.0"
+
+[tasks.fmt]
+description = "Format code"
+run = [
+  "cargo fmt",
+  "cargo clippy --all-targets --fix --allow-dirty -- -D warnings",
+  "cargo fmt",
+]
+
+[tasks.lint]
+description = "Check formatting and run clippy"
+run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings"]
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test --all"
+
+[tasks.ci]
+description = "Run all CI checks"
+depends = ["lint", "test"]
