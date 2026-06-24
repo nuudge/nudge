@@ -1,13 +1,36 @@
 # nudge
 
-A Claude-Code-style coding agent for your terminal, written in Rust **from scratch** — no agent SDK, no framework, just the Anthropic Messages API over HTTP.
+Yet another coding agent — except this one doesn't sleep, doesn't quit, and follows you home. Written in Rust from scratch: no agent SDK, no framework, no abstraction tax, just the raw LLM API over HTTP. The loop is decoupled from the UI, so a session outlives any front-end — detach it, reattach from another terminal, or **drive it live from your phone** over an end-to-end-encrypted link.
 
-Built as a learning project: the goal is to understand what actually lives inside an agentic harness — the loop, the tool-use protocol, prompt-cache economics, session persistence, permission gating, and a TUI that makes agent activity legible. The code favors explicitness over abstraction so each mechanism is readable on its own.
+Every moving part is out in the open — the loop, the tool-use protocol, prompt-cache economics, session persistence, permission gating.
+
+No framework, no excessive abstraction, no 50-layer call stack to trace at 2am — just readable code, easy to see when and where it decides to `rm -rf` your weekend.
+
+## Components
+
+nudge is three parts over one session protocol — three different ways for it to reach you. The terminal agent is the whole product on its own; the rest just removes your remaining excuses.
+
+- **Terminal agent** — the core Rust binary: the agentic loop, the built-in tool surface, an MCP client, and a [ratatui](https://ratatui.rs) TUI.
+- **Remote control** — a session can run headless behind a daemon and be reached from elsewhere over an **end-to-end-encrypted, ciphertext-blind relay**; pairing is a single QR scan.
+- **Mobile app (Android)** — a native Kotlin + Jetpack Compose client that turns your phone into a live front-end for a running session (below).
+
+### Mobile app (Android)
+
+Work anywhere. Any time. Never stop. Scan the QR code the agent prints and your phone becomes a live controller for the running session — the office is now wherever you are, and it never closes:
+
+- **Pair in one scan** — point the camera at the agent's QR code (or paste it). No accounts, no setup, no escape.
+- **Watch it work, live** — streamed replies and thinking, every tool call and its result, in markdown; a glance line shows the model and git branch. Approve a refactor from the bus, review a stack trace at dinner, touch grass while it touches your codebase.
+- **Approve from anywhere** — when the agent wants to run a command or edit a file, the prompt finds you wherever you are; **allow or deny remotely**, the same gate as the terminal. It will wait. It is infinitely patient.
+- **Send and steer** — redirect it mid-task from your pocket.
+- **Come and go** — detach and reattach to the same session; the transcript replays on reconnect, and the agent keeps grinding while you're "away."
+- **Private by design** — end-to-end encrypted through a ciphertext-blind relay that only ever sees ciphertext. The rendezvous id is a 128-bit secret carried inside the QR code, so an unpaired device can neither find nor decrypt your session — and neither can the relay.
+
+The app speaks a small framed protocol shared — as a pure-JVM kit (`android/protocol/`) — with the agent and the relay, so the wire format has a single source of truth.
 
 ## Features
 
 - **Agentic loop** — the model plans, calls tools, observes results, and iterates until the task is done, bounded by an iteration budget that ends gracefully (the agent explains it hit the cap and asks how to proceed).
-- **Tool surface** — `Bash`, `Read`, `Edit` (modify + append modes), `CreateNew`, `Grep` (structured ripgrep), `Glob`, `TodoWrite`. Tool names and field shapes follow Claude Code's wire format where the same tool exists in both.
+- **Tool surface** — `Bash`, `Read`, `Edit` (modify + append modes), `CreateNew`, `Grep` (structured ripgrep), `Glob`, `TodoWrite`. Tool names and field shapes are wire-compatible with Claude Code where they overlap, so your muscle memory transfers — only the bill changes.
 - **TUI** (ratatui) — collapsed-by-default action display: each tool call is one compact group with a live status bullet (spinner → ok/error) and a one-line result row; `Ctrl-O` expands everything, including the model's thinking. Title bar shows session id, cwd, git branch, model, and platform.
 - **Permission gating** — shell-executing and file-mutating tools prompt before running; read-only tools auto-allow. For `Bash`, the model must state an *intent* ("count lines in all Rust files") shown as the action label, while the permission prompt always shows the raw command — you approve what runs, not the label.
 - **MCP client** — connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers declared in a project-local `.mcp.json`. Their tools are discovered at startup and merged into the model's tool list (namespaced `server__tool`), indistinguishable from built-ins. Permission follows each tool's `readOnlyHint` annotation — read-only tools auto-allow, the rest prompt. Both local **stdio** subprocesses and remote **Streamable HTTP** servers are supported, the latter with static-token, OAuth (dynamic registration), or OAuth (pre-registered client) auth. Servers load in three layers — always-on foundational tools, always-on user servers from `.mcp.json`, and a built-in **dormant** catalog the user loads/unloads mid-session (`/mcp load <name>`) to keep the default context lean.
@@ -21,7 +44,7 @@ Built as a learning project: the goal is to understand what actually lives insid
 Requires a recent Rust toolchain (edition 2024) and an Anthropic API key.
 
 ```bash
-git clone <this-repo> && cd nudge
+git clone https://gitlab.com/hongtao1207/nudge.git && cd nudge
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
 cargo run
 ```
@@ -32,7 +55,7 @@ cargo run
 
 ```bash
 cargo install --path .                 # from a local checkout
-cargo install --git <this-repo>        # straight from git
+cargo install --git https://gitlab.com/hongtao1207/nudge   # straight from git
 ```
 
 The installed binary reads `ANTHROPIC_API_KEY` from the environment (a `.env` in the current directory still works), so export it in your shell profile:
@@ -206,4 +229,8 @@ The `core` loop is generic over both the `Provider` and the `Backend`, so a diff
 
 ## Status
 
-A learning project under active development — interfaces and on-disk formats may change without notice. Driving a running session remotely (e.g. from a phone) is in progress. Issues and discussion welcome.
+Under active development — interfaces and on-disk formats change without notice or apology. The terminal agent, remote control, and Android app all cover their core flows; expect sharp edges. Open an issue and it might get fixed by the very thing that caused it.
+
+## License
+
+[MIT](LICENSE) © 2026 Hongtao Yang
