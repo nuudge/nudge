@@ -41,10 +41,11 @@ The app speaks a small framed protocol shared — as a pure-JVM kit (`android/pr
 
 ## Quick start
 
-Requires a recent Rust toolchain (edition 2024) and an Anthropic API key.
+Requires Rust (edition 2024) and an Anthropic API key. The repo ships a `mise.toml` — if you use [mise](https://mise.jdx.dev), `mise install` pins the exact toolchain. Otherwise any recent stable Rust works.
 
 ```bash
 git clone https://gitlab.com/hongtao1207/nudge.git && cd nudge
+mise install                                 # optional: pins Rust 1.96.0
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
 cargo run
 ```
@@ -72,6 +73,10 @@ The agent operates in whatever directory you launch it from:
 cd /path/to/your/project
 cargo run --manifest-path /path/to/nudge/Cargo.toml
 ```
+
+## Development
+
+The repo uses [mise](https://mise.jdx.dev) to pin the toolchain and provide dev tasks. After `mise install`, run `mise run` to list available tasks. `mise run ci` mirrors the GitLab CI pipeline exactly — run it before pushing.
 
 ## MCP servers
 
