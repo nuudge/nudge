@@ -15,7 +15,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
@@ -117,6 +117,16 @@ struct App {
     // A requested mode change, set by handlers and executed by the run loop
     // (which owns the SessionHost handle needed to attach/detach).
     pending_transition: Option<Mode>,
+    // The scannable pairing QR + paste-able code, present only with --relay armed.
+    // When set, /background renders the QR in-screen above the banner so a phone
+    // can attach; when None, /background is the plain frozen banner.
+    pairing_qr: Option<String>,
+    pairing_code: Option<String>,
+    // True for the in-process owner TUI (hosts the agent loop; can force-reclaim a
+    // session a guest holds; quitting ends it). False for a `--connect` guest
+    // (local socket or remote relay). Drives a header badge + the foreground
+    // failure message — purely cosmetic; the *capability* lives in `attach_force`.
+    is_owner: bool,
     quit: bool,
 }
 
@@ -128,6 +138,14 @@ pub struct UiConfig {
     pub session_id: String,
     pub model: String,
     pub thinking_display: String,
+    // Set only when launched with `--relay`: the scannable pairing QR and the
+    // paste-able `nudge:` code, shown on /background so a phone can attach. `None`
+    // for a plain local session (then /background is the in-screen frozen banner).
+    pub pairing_qr: Option<String>,
+    pub pairing_code: Option<String>,
+    // True for the in-process owner TUI; false for a `--connect` guest. Drives the
+    // header badge and the foreground-failure wording.
+    pub is_owner: bool,
 }
 
 impl App {
@@ -152,6 +170,9 @@ impl App {
             model_picker: None,
             mode: Mode::Foreground,
             pending_transition: None,
+            pairing_qr: cfg.pairing_qr,
+            pairing_code: cfg.pairing_code,
+            is_owner: cfg.is_owner,
             quit: false,
         }
     }
@@ -790,6 +811,38 @@ impl App {
         out
     }
 
+    // Build the /background pair-panel body: the scannable QR, the paste-able code
+    // wrapped to width, and an action hint. The QR is forced black-on-white so it
+    // scans regardless of the terminal theme — the Dense1x2 half-blocks encode dark
+    // modules as the glyph (`█`/`▀`/`▄`), which only reads as a valid QR when drawn
+    // dark-on-light; a light-on-dark terminal would otherwise invert it.
+    fn pair_panel_body(&self, inner_width: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        let qr_style = Style::default().fg(Color::Black).bg(Color::White);
+        if let Some(qr) = &self.pairing_qr {
+            for line in qr.lines() {
+                out.push(Line::from(Span::styled(line.to_string(), qr_style)));
+            }
+        }
+        out.push(Line::from(""));
+        if let Some(code) = &self.pairing_code {
+            // Pre-wrap the long code by hand so the Paragraph needs no `Wrap` — which
+            // would also mangle the fixed-width QR rows above.
+            let w = inner_width.max(1);
+            let chars: Vec<char> = code.chars().collect();
+            for chunk in chars.chunks(w) {
+                let s: String = chunk.iter().collect();
+                out.push(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray))));
+            }
+        }
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "Scan to control from your phone · Enter = foreground · Ctrl-C = quit",
+            Style::default().fg(Color::Yellow),
+        )));
+        out
+    }
+
     fn render(&mut self, f: &mut ratatui::Frame) {
         // Dynamic input height — grow up to MAX_INPUT_LINES content rows, then
         // scroll inside the input box. Single-line input keeps the box at 3
@@ -800,12 +853,37 @@ impl App {
         let input_height = (visible_input_lines as u16) + 2;
         let input_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES) as u16;
 
+        // On /background with --relay armed, the bottom area becomes a pair panel
+        // (QR + code + hint) instead of the input box, sized to fit the QR. The
+        // conversation log stays above it (Min(0) — it just shrinks), so context is
+        // kept rather than blown away by a full-screen takeover.
+        let show_qr = self.mode == Mode::Background && self.pairing_qr.is_some();
+        let frame_inner_w = f.area().width.saturating_sub(2).max(1) as usize;
+        let (log_constraint, bottom_height) = if show_qr {
+            let qr_rows = self
+                .pairing_qr
+                .as_ref()
+                .map(|q| q.lines().count())
+                .unwrap_or(0);
+            let code_rows = self
+                .pairing_code
+                .as_ref()
+                .map(|c| c.chars().count().div_ceil(frame_inner_w))
+                .unwrap_or(0);
+            // borders(2) + qr + blank(1) + code + blank(1) + hint(1). The QR sits at
+            // the top of the panel, so if the terminal is too short the hint/code
+            // clip first and the QR stays scannable.
+            (Constraint::Min(0), (qr_rows + code_rows + 5) as u16)
+        } else {
+            (Constraint::Min(3), input_height)
+        };
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
+                log_constraint,
                 Constraint::Length(1),
-                Constraint::Length(input_height),
+                Constraint::Length(bottom_height),
             ])
             .split(f.area());
 
@@ -840,10 +918,33 @@ impl App {
             Some(branch) => format!("git:{branch}"),
             None => "no git".into(),
         };
-        let title = format!(
-            "nudge · {} · {} · {git_tag} · {} · {}",
-            self.session_id, self.cwd_display, self.model, self.platform
-        );
+        // Leading role badge so it survives title clipping: `owner` = this terminal
+        // hosts the agent and can force-reclaim from a guest; `guest` = a --connect
+        // client (local socket or remote phone/TUI) that can drive but not reclaim.
+        let (badge, badge_style) = if self.is_owner {
+            (
+                " owner ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                " guest ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let title = Line::from(vec![
+            Span::styled(badge, badge_style),
+            Span::raw(format!(
+                " nudge · {} · {} · {git_tag} · {} · {}",
+                self.session_id, self.cwd_display, self.model, self.platform
+            )),
+        ]);
         let log = log_paragraph
             .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((self.scroll, 0));
@@ -878,7 +979,15 @@ impl App {
         let status = Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray));
         f.render_widget(status, status_area);
 
-        if self.mode == Mode::Background {
+        if show_qr {
+            // Relay armed: render the scannable QR + paste code in-screen above
+            // where the input box was. No alt-screen exit — the conversation stays
+            // visible above. No cursor (we're detached).
+            let body = self.pair_panel_body(input_area.width.saturating_sub(2) as usize);
+            let panel = Paragraph::new(body)
+                .block(Block::default().borders(Borders::ALL).title("pair a device"));
+            f.render_widget(panel, input_area);
+        } else if self.mode == Mode::Background {
             // Frozen banner instead of the input box; the log above stays as it
             // was at detach (no live updates while detached). No cursor.
             let banner = Paragraph::new(
@@ -1311,26 +1420,42 @@ async fn run_loop<H: SessionHandle>(
         if let Some(target) = app.pending_transition.take() {
             match target {
                 Mode::Background => {
+                    // Detaching fires the host's handoff hook on the first
+                    // /background — binding the local socket, or (relay armed)
+                    // spawning the relay dial-out so a phone can attach. The QR (if
+                    // armed) is rendered in-screen above the banner — no alt-screen
+                    // exit, so the conversation stays visible.
                     host.detach();
                     events = None;
                     ui_tx = None;
                     app.enter_background();
                 }
-                Mode::Foreground => match host.attach().await {
-                    Some(c) => {
-                        // Rebuild from the event stream: enter_foreground clears
-                        // the log, then the broker replays its full buffer
-                        // (seeded history + everything since) as events.
-                        app.enter_foreground();
-                        events = Some(c.events);
-                        ui_tx = Some(c.ui_tx);
+                Mode::Foreground => {
+                    // Force-takeover (no-op for a guest — `attach_force` defaults to
+                    // a plain attach off the in-process host): the local owner TUI is
+                    // the only front-end allowed to reclaim a session a remote
+                    // controller (e.g. a pocketed phone) is holding.
+                    match host.attach_force().await {
+                        Some(c) => {
+                            // Rebuild from the event stream: enter_foreground clears
+                            // the log, then the broker replays its full buffer
+                            // (seeded history + everything since) as events.
+                            app.enter_foreground();
+                            events = Some(c.events);
+                            ui_tx = Some(c.ui_tx);
+                        }
+                        None => {
+                            // Owner force only fails if the broker is gone; a guest's
+                            // non-forcing attach fails because another controller holds it.
+                            let why = if app.is_owner {
+                                "could not foreground — session has ended"
+                            } else {
+                                "could not foreground — another controller holds the session"
+                            };
+                            app.push(LogEntry::Warn(why.into()));
+                        }
                     }
-                    None => {
-                        app.push(LogEntry::Warn(
-                            "could not foreground — session is held elsewhere".into(),
-                        ));
-                    }
-                },
+                }
             }
         }
 
@@ -1345,15 +1470,12 @@ async fn run_loop<H: SessionHandle>(
     Ok(())
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
+// Enter the TUI's alternate screen + input modes. Factored out so the pair-screen
+// resume can re-enter it without duplicating the escape sequences. Raw mode is
+// owned separately (it stays on across a pair-screen suspend so the EventStream
+// keeps delivering keys), so it's not toggled here.
+fn enter_screen<W: Write>(w: &mut W) -> io::Result<()> {
+    execute!(w, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     // Opt into the kitty keyboard protocol so terminals that support it
     // (Kitty, WezTerm, Ghostty, foot, Alacritty ≥ 0.13, iTerm2 ≥ 3.5, …)
     // report Shift+Enter / Ctrl+Enter as distinct events instead of
@@ -1361,24 +1483,33 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // understand the CSI sequence silently ignore it, so failures here
     // are not fatal and we don't surface an error.
     let _ = execute!(
-        stdout,
+        w,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
         ),
     );
+    Ok(())
+}
+
+// Leave the alternate screen + input modes (the inverse of `enter_screen`). Used
+// both on final teardown and to drop to the plain-terminal pair screen.
+fn leave_screen<W: Write>(w: &mut W) -> io::Result<()> {
+    let _ = execute!(w, PopKeyboardEnhancementFlags);
+    execute!(w, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)?;
+    Ok(())
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    enter_screen(&mut stdout)?;
 
     // Restore terminal on panic so a bug doesn't leave the user's shell broken.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            PopKeyboardEnhancementFlags,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        let _ = leave_screen(&mut io::stdout());
         original_hook(info);
     }));
 
@@ -1388,13 +1519,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
+    leave_screen(terminal.backend_mut())?;
     terminal.show_cursor()?;
     Ok(())
 }

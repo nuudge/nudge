@@ -7,22 +7,25 @@
 // no extra gate: without the code a device can't find the room (the id is a
 // 128-bit secret) and couldn't decrypt it if it did (no key).
 //
-// The code is `nudge:<base64url(json)>` — an opaque token under a scheme the
-// Android client (8.4) can claim via an intent filter. JSON keeps it debuggable
-// (the roadmap's "JSON first" default), and base64url avoids any path/query
-// escaping. The key is the full 32 bytes (the QR carries the entropy), so
-// "derive the key" is identity for now; a short typeable code would slot a KDF in
-// here instead.
+// The code is `nudge:<base64url(payload)>` — an opaque token under a scheme the
+// Android client (8.4) can claim via an intent filter. The payload is a compact
+// binary blob, `[id: 16 bytes][key: 32 bytes][relay URL: UTF-8]`, base64url'd once.
+// We deliberately avoid JSON (keys + braces), hex (2× the id), and double-base64
+// (the key inside JSON, then the JSON re-encoded): every saved character shrinks
+// the QR, and the 32-byte E2E key already dominates its size (≈25 rows). The key is
+// the full 32 bytes (the QR carries the entropy), so "derive the key" is identity
+// for now; a short typeable code would slot a KDF in here instead.
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use dryoc::rng::copy_randombytes;
-use qrcode::QrCode;
 use qrcode::render::unicode;
-use serde::{Deserialize, Serialize};
+use qrcode::{EcLevel, QrCode};
 
 use super::encryption::Cipher;
+
+const KEY_BYTES: usize = 32;
 
 const SCHEME: &str = "nudge:";
 // 128 bits of rendezvous id: unguessable, so an unpaired device can't stumble onto
@@ -35,14 +38,6 @@ pub struct Pairing {
     pub relay_base: String,
     pub rendezvous_id: String,
     pub cipher: Cipher,
-}
-
-// The wire form of a pairing code: base64url-JSON inside the `nudge:` token.
-#[derive(Serialize, Deserialize)]
-struct Payload {
-    relay: String,
-    id: String,
-    k: String,
 }
 
 impl Pairing {
@@ -68,42 +63,57 @@ impl Pairing {
         )
     }
 
-    // Encode to the scannable pairing code.
+    // Encode to the scannable pairing code: `nudge:<base64url([id][key][relay])>`.
     pub fn encode(&self) -> String {
-        let payload = Payload {
-            relay: self.relay_base.clone(),
-            id: self.rendezvous_id.clone(),
-            k: URL_SAFE_NO_PAD.encode(self.cipher.key_bytes()),
-        };
-        let json = serde_json::to_vec(&payload).expect("Payload always serializes");
-        format!("{SCHEME}{}", URL_SAFE_NO_PAD.encode(json))
+        let mut bytes = hex_to_bytes(&self.rendezvous_id);
+        bytes.extend_from_slice(self.cipher.key_bytes());
+        bytes.extend_from_slice(self.relay_base.as_bytes());
+        format!("{SCHEME}{}", URL_SAFE_NO_PAD.encode(&bytes))
     }
 
-    // Decode a scanned/pasted pairing code back into a Pairing.
+    // Decode a scanned/pasted pairing code back into a Pairing. Layout is fixed:
+    // 16-byte rendezvous id, 32-byte key, then the relay URL as UTF-8 (variable,
+    // so it goes last — no length prefix needed).
     pub fn decode(code: &str) -> Result<Self> {
         let b64 = code.trim().strip_prefix(SCHEME).with_context(|| {
             format!("not a nudge pairing code (missing '{SCHEME}' prefix)")
         })?;
-        let json = URL_SAFE_NO_PAD
+        let bytes = URL_SAFE_NO_PAD
             .decode(b64)
             .context("pairing code is not valid base64url")?;
-        let payload: Payload =
-            serde_json::from_slice(&json).context("pairing code payload is not valid JSON")?;
-        let key = URL_SAFE_NO_PAD
-            .decode(&payload.k)
-            .context("pairing code key is not valid base64url")?;
+        if bytes.len() < RENDEZVOUS_ID_BYTES + KEY_BYTES {
+            anyhow::bail!("pairing code too short ({} bytes)", bytes.len());
+        }
+        let (id_bytes, rest) = bytes.split_at(RENDEZVOUS_ID_BYTES);
+        let (key, relay) = rest.split_at(KEY_BYTES);
+        let rendezvous_id = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let relay_base =
+            String::from_utf8(relay.to_vec()).context("pairing code relay URL is not UTF-8")?;
         Ok(Self {
-            relay_base: payload.relay,
-            rendezvous_id: payload.id,
-            cipher: Cipher::from_bytes(&key)?,
+            relay_base,
+            rendezvous_id,
+            cipher: Cipher::from_bytes(key)?,
         })
     }
 
-    // Render the pairing code as a terminal QR (two pixel rows per text line).
+    // Render the pairing code as a terminal QR (two pixel rows per text line). Uses
+    // the lowest error-correction level: the on-screen QR is rendered pixel-perfect
+    // (black-on-white in the TUI), so L's 7% recovery is ample and keeps it small.
     pub fn render_qr(&self) -> Result<String> {
-        let code = QrCode::new(self.encode()).context("building QR code")?;
+        let code = QrCode::with_error_correction_level(self.encode().as_bytes(), EcLevel::L)
+            .context("building QR code")?;
         Ok(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
     }
+}
+
+// The rendezvous id is stored as a 32-char hex string (it doubles as the relay URL
+// path segment), but the compact code carries its 16 raw bytes. `generate` always
+// produces valid hex, so a bad pair just contributes a zero byte rather than failing.
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("0"), 16).unwrap_or(0))
+        .collect()
 }
 
 #[cfg(test)]

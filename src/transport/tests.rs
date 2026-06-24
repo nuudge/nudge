@@ -114,6 +114,56 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
     let _ = std::fs::remove_file(&path);
 }
 
+// A local-TUI force-takeover boots a co-located guest, but the handoff server must
+// keep accepting so control can hand back — the regression guard for the `is_alive`
+// re-loop in `serve()`. Without it, one reclaim tears the socket down and a later
+// guest could never reattach. (This is what makes /background → phone → return-to-
+// desk → /background-again work; the relay loop carries the identical fix.)
+#[tokio::test]
+async fn handoff_server_survives_force_takeover() {
+    let path = unique_socket_path();
+    let bb = spawn_bare_broker(Vec::new());
+    let listener = bind_listener(&path).expect("bind handoff listener");
+    let serve = tokio::spawn(serve_handoff(listener, bb.handle.clone()));
+
+    let client = SocketClient::new(path.clone());
+
+    // A guest attaches over the socket and sees a buffered event.
+    let mut guest = client.attach().await.expect("guest attach");
+    bb.agent_tx
+        .send(AgentEvent::AssistantText { text: "hi".into() })
+        .await
+        .unwrap();
+    expect_text(&mut guest, "hi").await;
+
+    // The local TUI reclaims via a forcing attach, booting the guest. The guest's
+    // stream closes, surfacing as SessionEnded inside the server's `handle_conn`.
+    let _local = bb
+        .handle
+        .attach_force()
+        .await
+        .expect("local force-takeover binds");
+    assert!(
+        next_event(&mut guest).await.is_none(),
+        "force-takeover must close the booted guest's stream"
+    );
+
+    // Local steps aside so the single-attach lock is free again (Detach then the
+    // next Attach ride the same FIFO control channel — deterministic).
+    bb.handle.detach();
+
+    // The server survived the takeover: a fresh guest reattaches and replays the
+    // history. Without the is_alive re-loop, `serve` would have returned and this
+    // connect would be refused (attach_at fails loudly rather than hanging).
+    let mut guest2 = attach_at(&client, None).await;
+    expect_text(&mut guest2, "hi").await;
+
+    drop(guest2);
+    serve.abort();
+    drop(bb);
+    let _ = std::fs::remove_file(&path);
+}
+
 // A throwaway in-test relay: it accepts two WebSocket connections and pipes
 // messages between them verbatim, ignoring the rendezvous path (only one pair
 // exists here). Pairing-by-id, isolation, and the unpaired-waiter timeout are

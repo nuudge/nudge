@@ -31,6 +31,16 @@ pub trait SessionHandle {
     // lock) or the transport is gone. The future is `Send` so a server can drive
     // it from a spawned task.
     fn attach(&self) -> impl Future<Output = Option<Controller>> + Send;
+    // Bind a front-end, overriding the single-attach lock if one is already held
+    // (local-TUI force-takeover — boots the current holder so the physically
+    // present computer can reclaim a session a phone left attached). The default
+    // delegates to `attach` (no force): a *remote* client must never be able to
+    // force, so only the in-process `SessionHost` overrides this. `tui::run` calls
+    // it on every foreground, so the local host forces and any remote `--connect`
+    // TUI silently stays non-forcing.
+    fn attach_force(&self) -> impl Future<Output = Option<Controller>> + Send {
+        self.attach()
+    }
     // Yield the front-end without ending the session (pause-in-place, e.g.
     // /background). Fire-and-forget: the loop keeps running headless and buffering;
     // a later `attach` replays the full history.
@@ -163,6 +173,12 @@ impl SessionHandle for SessionHost {
         self.broker_handle().attach().await
     }
 
+    // The in-process host is the only `SessionHandle` that actually forces — it's
+    // the local TUI, the one front-end allowed to boot a remote holder.
+    async fn attach_force(&self) -> Option<Controller> {
+        self.broker_handle().attach_force().await
+    }
+
     fn detach(&self) {
         // The first /background enables handoff: fire the injected hook once (it
         // binds the listener + spawns the accept loop). Kept thereafter — no
@@ -192,13 +208,17 @@ impl BrokerHandle {
     pub fn notice(&self, text: String) {
         let _ = self.ctl_tx.send(HostCommand::Notice { text });
     }
-}
 
-impl SessionHandle for BrokerHandle {
-    // Returns `None` if another controller already holds the session (single-attach
-    // mutual exclusion). On success the controller's event stream begins with a
-    // replay of the full history, then live events.
-    async fn attach(&self) -> Option<Controller> {
+    // Whether the broker task is still running (its receiver hasn't dropped). The
+    // co-located serve loops use this to tell a force-takeover (broker alive — keep
+    // serving so control can hand back) from a host shutdown (broker gone — stop).
+    pub fn is_alive(&self) -> bool {
+        !self.ctl_tx.is_closed()
+    }
+
+    // Shared body of attach / attach_force. `force` overrides the single-attach
+    // lock (boots the current holder); without it a second attach is refused.
+    async fn attach_inner(&self, force: bool) -> Option<Controller> {
         let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -207,7 +227,7 @@ impl SessionHandle for BrokerHandle {
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                force: false,
+                force,
                 ack: ack_tx,
             })
             .is_err()
@@ -221,6 +241,21 @@ impl SessionHandle for BrokerHandle {
             }),
             _ => None, // busy, or broker gone
         }
+    }
+}
+
+impl SessionHandle for BrokerHandle {
+    // Returns `None` if another controller already holds the session (single-attach
+    // mutual exclusion). On success the controller's event stream begins with a
+    // replay of the full history, then live events.
+    async fn attach(&self) -> Option<Controller> {
+        self.attach_inner(false).await
+    }
+
+    // Boot the current holder and bind. Only ever reached via `SessionHost`
+    // (the local TUI) — the daemon attaches remote clients with plain `attach`.
+    async fn attach_force(&self) -> Option<Controller> {
+        self.attach_inner(true).await
     }
 
     // Sent on the same control channel as attach, so a detach immediately followed
