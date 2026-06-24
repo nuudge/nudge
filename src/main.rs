@@ -79,7 +79,9 @@ struct Cli {
     #[arg(long, value_name = "path", conflicts_with = "relay")]
     socket: Option<PathBuf>,
 
-    /// Host (--daemon) or attach (--connect) over a WebSocket relay; E2E encrypted. Pass --pair or --key.
+    /// Relay over a WebSocket (E2E encrypted). In normal mode it arms remote
+    /// pairing — /background then shows a QR for a phone to scan. With --daemon /
+    /// --connect it hosts / attaches over the relay (pass --pair or --key).
     #[arg(long, value_name = "ws-url")]
     relay: Option<String>,
 
@@ -136,10 +138,15 @@ async fn main() -> Result<()> {
     };
 
     let thinking_display = cli.thinking.as_display();
-    let ui_cfg = tui::UiConfig {
+    let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
         model: DEFAULT_MODEL.into(),
         thinking_display: thinking_display.clone(),
+        // Filled in the in-process branch below when --relay arms remote pairing.
+        pairing_qr: None,
+        pairing_code: None,
+        // This process hosts the agent loop: it's the owner TUI (can force-reclaim).
+        is_owner: true,
     };
     let cfg = AgentConfig {
         model: DEFAULT_MODEL.into(),
@@ -231,24 +238,47 @@ async fn main() -> Result<()> {
     } else {
         // Local TUI driving the loop in-process. The TUI holds `&host` so it can
         // re-attach after /background; it owns the initial foreground controller.
-        // Lazy handoff: the first /background fires this hook, which binds the
-        // socket once and spawns the accept loop so another client can take over
-        // while the local TUI is backgrounded. Wiring the socket here (not in
-        // `core`) keeps `core` below the transport layer. Bound once and kept for
-        // the process lifetime; the file is removed on clean exit.
-        let path = resolve_socket_path(cli.socket)?;
-        let handoff = host.broker_handle();
-        let handoff_path = path.clone();
-        host.set_handoff_hook(move || match transport::bind_listener(&handoff_path) {
-            Ok(listener) => {
-                handoff.notice(format!(
-                    "Session handoff enabled — attach from another client with: nudge --connect --socket {}",
-                    handoff_path.display()
+        // The first /background fires the handoff hook (lazy, once). Wiring it here
+        // (not in `core`) keeps `core` below the transport layer. The hook's
+        // transport is chosen by whether --relay is armed — never both, so the
+        // background action is unambiguous:
+        //   --relay: dial OUT to the relay so a phone attaches; the QR is shown in
+        //            the TUI's pair screen. No local socket bound.
+        //   else:    bind a local Unix socket so another terminal can take over.
+        let handoff_socket = if let Some(base) = cli.relay {
+            // Regenerate the pairing each launch (no persistence): the device
+            // re-scans after a restart. The QR/code go to the TUI, which surfaces
+            // them on /background; the dial-out only opens once backgrounded.
+            let pairing = transport::Pairing::generate(base);
+            ui_cfg.pairing_qr = Some(pairing.render_qr()?);
+            ui_cfg.pairing_code = Some(pairing.encode());
+            let dial_url = pairing.dial_url();
+            let cipher = pairing.cipher;
+            let handoff = host.broker_handle();
+            host.set_handoff_hook(move || {
+                tokio::spawn(transport::serve_relay_handoff(
+                    dial_url.clone(),
+                    cipher.clone(),
+                    handoff.clone(),
                 ));
-                tokio::spawn(transport::serve_handoff(listener, handoff.clone()));
-            }
-            Err(e) => handoff.notice(format!("Handoff unavailable: {e:#}")),
-        });
+            });
+            None
+        } else {
+            let path = resolve_socket_path(cli.socket)?;
+            let handoff = host.broker_handle();
+            let handoff_path = path.clone();
+            host.set_handoff_hook(move || match transport::bind_listener(&handoff_path) {
+                Ok(listener) => {
+                    handoff.notice(format!(
+                        "Session handoff enabled — attach from another client with: nudge --connect --socket {}",
+                        handoff_path.display()
+                    ));
+                    tokio::spawn(transport::serve_handoff(listener, handoff.clone()));
+                }
+                Err(e) => handoff.notice(format!("Handoff unavailable: {e:#}")),
+            });
+            Some(path)
+        };
 
         let controller = host
             .attach()
@@ -257,8 +287,10 @@ async fn main() -> Result<()> {
         let tui_result = tui::run(&host, ui_cfg, controller).await;
         // TUI exited → end the session explicitly (loop outlives the front-end).
         let _ = host.shutdown().await;
-        // Remove the handoff socket if it was ever bound (harmless if not).
-        let _ = std::fs::remove_file(&path);
+        // Remove the handoff socket if one was bound (the relay path binds none).
+        if let Some(path) = handoff_socket {
+            let _ = std::fs::remove_file(&path);
+        }
         tui_result
     }
 }
@@ -273,6 +305,12 @@ async fn run_connect(cli: Cli) -> Result<()> {
         session_id: "(connecting…)".into(),
         model: DEFAULT_MODEL.into(),
         thinking_display: cli.thinking.as_display(),
+        // A --connect client never hosts a relay, so it shows no pairing QR.
+        pairing_qr: None,
+        pairing_code: None,
+        // A --connect client is a guest: it attaches to a daemon it doesn't host
+        // and (per attach_force's default) cannot force-reclaim.
+        is_owner: false,
     };
     // Use each client's `connect` rather than the silent `SessionHandle::attach` for
     // this first attach: it runs before the TUI owns the screen, so a connection

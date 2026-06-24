@@ -88,6 +88,17 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle, mode: ServeMode) 
                 }
             }
             ConnOutcome::SessionEnded => {
+                // A local-TUI force-takeover (reclaim) closes the booted client's
+                // stream and surfaces here as SessionEnded, but the broker is still
+                // alive — keep accepting so control can hand back. Only a real host
+                // shutdown (broker gone) ends the loop. Standalone --daemon never
+                // force-takes-over, so there this is always a genuine shutdown.
+                if broker.is_alive() {
+                    if log {
+                        eprintln!("[daemon] controller reclaimed locally; still serving");
+                    }
+                    continue;
+                }
                 if log {
                     eprintln!("[daemon] session ended; shutting down");
                 }
@@ -123,6 +134,26 @@ pub async fn run_relay_daemon(
     broker: BrokerHandle,
 ) -> Result<()> {
     eprintln!("[daemon] hosting over relay at {relay_url}");
+    relay_dial_loop(relay_url, cipher, broker, true).await;
+    Ok(())
+}
+
+// Co-located relay handoff: spawned on a normal in-process session's first
+// /background when --relay is armed (the relay counterpart of `serve_handoff`).
+// Runs SILENTLY — it shares the process with the local TUI, so any stderr write
+// would corrupt the alternate screen. Connection status is invisible by design;
+// the phone's own UI shows it. The session is never ended by this loop — only by
+// the local owner quitting (which tears the process down).
+pub async fn serve_relay_handoff(relay_url: String, cipher: Cipher, broker: BrokerHandle) {
+    relay_dial_loop(relay_url, cipher, broker, false).await;
+}
+
+// Dial OUT to the relay (the only direction that crosses NAT), pair with a
+// controller, and bridge it to the broker; re-dial when the controller leaves so
+// the next one can attach. `log` is off when co-located with a TUI (silent) and on
+// for the standalone --daemon. Ends only when the broker is gone (host shutdown); a
+// local force-takeover keeps it dialing so a device can attach again after reclaim.
+async fn relay_dial_loop(relay_url: String, cipher: Cipher, broker: BrokerHandle, log: bool) {
     loop {
         match connect_async(relay_url.as_str()).await {
             Ok((ws, _resp)) => {
@@ -133,19 +164,27 @@ pub async fn run_relay_daemon(
                     // Controller left (Quit, clean detach, dropped socket, or the
                     // relay timed out an unpaired wait): re-dial for the next one.
                     ConnOutcome::Disconnected => continue,
-                    // The host itself was shut down (process stopping): stop re-dialing.
-                    ConnOutcome::SessionEnded => break,
+                    // Host shut down (broker gone → stop) OR a local force-takeover
+                    // booted the controller (broker alive → re-dial so a device can
+                    // attach again once control hands back).
+                    ConnOutcome::SessionEnded => {
+                        if broker.is_alive() {
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
             // Relay unreachable (down / restarting): the session stays alive
             // headless; back off and retry rather than spinning on the dial.
             Err(e) => {
-                eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
+                if log {
+                    eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
+                }
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     }
-    Ok(())
 }
 
 // Co-located handoff accept loop (spawned on the local TUI's first /background).
