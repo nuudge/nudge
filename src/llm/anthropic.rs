@@ -25,7 +25,13 @@ impl AnthropicProvider {
     // and the floating history breakpoint on the messages. Both `complete` and
     // `count_tokens` build on this; the per-call fields (max_tokens, thinking)
     // differ because the count_tokens endpoint rejects `max_tokens`.
-    fn wire_parts(req: &Request<'_>) -> (Vec<serde_json::Value>, Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    fn wire_parts(
+        req: &Request<'_>,
+    ) -> (
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+        Vec<serde_json::Value>,
+    ) {
         let system: Vec<serde_json::Value> = req
             .system
             .iter()
@@ -46,7 +52,11 @@ impl AnthropicProvider {
             obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
         }
 
-        (system, tools, messages_with_floating_breakpoint(req.messages))
+        (
+            system,
+            tools,
+            messages_with_floating_breakpoint(req.messages),
+        )
     }
 }
 

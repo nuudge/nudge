@@ -315,11 +315,11 @@ impl Renderer {
                 }
             }
             TagEnd::TableRow => {
-                if let Some(t) = &mut self.table {
-                    if !t.in_head {
-                        let row = std::mem::take(&mut t.cur_row);
-                        t.rows.push(row);
-                    }
+                if let Some(t) = &mut self.table
+                    && !t.in_head
+                {
+                    let row = std::mem::take(&mut t.cur_row);
+                    t.rows.push(row);
                 }
             }
             TagEnd::Table => {

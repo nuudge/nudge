@@ -183,10 +183,10 @@ impl SessionHandle for SessionHost {
         // The first /background enables handoff: fire the injected hook once (it
         // binds the listener + spawns the accept loop). Kept thereafter — no
         // unbind on foreground, so a later /background is a plain detach.
-        if !self.detached_once.swap(true, Ordering::SeqCst) {
-            if let Some(hook) = &self.handoff_hook {
-                hook();
-            }
+        if !self.detached_once.swap(true, Ordering::SeqCst)
+            && let Some(hook) = &self.handoff_hook
+        {
+            hook();
         }
         self.broker_handle().detach();
     }
@@ -566,7 +566,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(resp_rx.await.unwrap(), true);
+        assert!(resp_rx.await.unwrap());
         match a_events.recv().await {
             Some(ControllerEvent::PermissionResolved { tool_name, allow }) => {
                 assert_eq!(tool_name, "Bash");

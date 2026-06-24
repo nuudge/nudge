@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use rmcp::transport::{
     StreamableHttpClientTransport,
     auth::{
-        AuthClient, AuthError, AuthorizationManager, CredentialStore, OAuthClientConfig, OAuthState,
-        OAuthTokenResponse, StoredCredentials,
+        AuthClient, AuthError, AuthorizationManager, CredentialStore, OAuthClientConfig,
+        OAuthState, OAuthTokenResponse, StoredCredentials,
     },
     streamable_http_client::StreamableHttpClientTransportConfig,
 };

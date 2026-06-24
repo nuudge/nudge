@@ -58,7 +58,11 @@ impl Session {
                 )
             })?;
             let msg: Message = serde_json::from_value(msg_value.clone()).with_context(|| {
-                format!("invalid message on line {} of {}", i + 1, log_path.display())
+                format!(
+                    "invalid message on line {} of {}",
+                    i + 1,
+                    log_path.display()
+                )
             })?;
             messages.push(msg);
         }

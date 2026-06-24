@@ -53,13 +53,31 @@ pub fn schemas() -> Vec<Value> {
 // `schemas()` so the two tool lists stay in lockstep.
 pub fn roster() -> String {
     [
-        ("Read", "read a text file (line-numbered; supports offset/limit line ranges)"),
-        ("Edit", "modify an existing file (replace a unique match, or append at EOF)"),
+        (
+            "Read",
+            "read a text file (line-numbered; supports offset/limit line ranges)",
+        ),
+        (
+            "Edit",
+            "modify an existing file (replace a unique match, or append at EOF)",
+        ),
         ("CreateNew", "create a new file; fails if it already exists"),
-        ("Grep", "search file contents (ripgrep; normalized output, gitignore-aware)"),
-        ("Glob", "list files matching a glob pattern (gitignore-aware)"),
-        ("Bash", "run shell commands; the fallback for anything without a dedicated tool"),
-        ("TodoWrite", "maintain a structured task list for multi-step work"),
+        (
+            "Grep",
+            "search file contents (ripgrep; normalized output, gitignore-aware)",
+        ),
+        (
+            "Glob",
+            "list files matching a glob pattern (gitignore-aware)",
+        ),
+        (
+            "Bash",
+            "run shell commands; the fallback for anything without a dedicated tool",
+        ),
+        (
+            "TodoWrite",
+            "maintain a structured task list for multi-step work",
+        ),
     ]
     .iter()
     .map(|(name, snippet)| format!("- {name}: {snippet}"))

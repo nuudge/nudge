@@ -153,7 +153,11 @@ mod tests {
 
     #[test]
     fn over_cap_elides_middle_keeping_both_ends() {
-        let s = format!("{}{}", "A".repeat(MAX_OUTPUT_BYTES), "Z".repeat(MAX_OUTPUT_BYTES));
+        let s = format!(
+            "{}{}",
+            "A".repeat(MAX_OUTPUT_BYTES),
+            "Z".repeat(MAX_OUTPUT_BYTES)
+        );
         let out = cap_output(&s);
         assert!(out.len() < s.len());
         assert!(out.starts_with("AAAA"));

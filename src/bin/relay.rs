@@ -86,7 +86,11 @@ async fn run(listener: TcpListener, pair_timeout: Duration) -> Result<()> {
 // fixed by tungstenite's `Callback` trait, not ours to shrink — and we only ever
 // return `Ok`, so the large-error lint doesn't apply here.
 #[allow(clippy::result_large_err)]
-async fn handle_conn(stream: TcpStream, rendezvous: Rendezvous, pair_timeout: Duration) -> Result<()> {
+async fn handle_conn(
+    stream: TcpStream,
+    rendezvous: Rendezvous,
+    pair_timeout: Duration,
+) -> Result<()> {
     // Capture the rendezvous id from the upgrade request path during the WS
     // handshake. The path is the only plaintext the relay ever sees — a room
     // number, not secret content (the pairing key that seeds E2E never comes here).
@@ -245,9 +249,9 @@ mod tests {
             .await
             .expect("relay never closed the lonely waiter");
         match res {
-            None => {}                                    // stream ended
+            None => {} // stream ended
             Some(Ok(m)) => assert!(m.is_close(), "expected close, got {m:?}"),
-            Some(Err(_)) => {}                            // reset is acceptable too
+            Some(Err(_)) => {} // reset is acceptable too
         }
     }
 }

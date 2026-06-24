@@ -130,17 +130,29 @@ pub fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
         Some(b) if !b.trim().is_empty() => b.trim().to_string(),
         _ => format!("(detached at {head})"),
     };
-    let upstream = git(cwd, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let upstream = git(
+        cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
     let recent_commits = git(cwd, &["log", "-5", "--oneline", "--no-decorate"])
         .map(|s| s.lines().map(str::to_string).collect())
         .unwrap_or_default();
-    Some(GitInfo { branch, head, upstream, recent_commits })
+    Some(GitInfo {
+        branch,
+        head,
+        upstream,
+        recent_commits,
+    })
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").current_dir(cwd).args(args).output().ok()?;
+    let out = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

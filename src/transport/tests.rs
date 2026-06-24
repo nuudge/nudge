@@ -213,7 +213,11 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
 
     let cipher = Cipher::generate();
     let bb = spawn_bare_broker(Vec::new());
-    let daemon = tokio::spawn(run_relay_daemon(url.clone(), cipher.clone(), bb.handle.clone()));
+    let daemon = tokio::spawn(run_relay_daemon(
+        url.clone(),
+        cipher.clone(),
+        bb.handle.clone(),
+    ));
 
     let client = RelayClient::new(url.clone(), cipher.clone());
     let mut a = client.attach().await.expect("relay attach");
@@ -228,7 +232,9 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
     // A user message goes client→daemon→broker; the broker echoes it back over the
     // relay, proving both directions of the command path through the codec.
     a.ui_tx
-        .send(UiEvent::UserMessage { text: "drive".into() })
+        .send(UiEvent::UserMessage {
+            text: "drive".into(),
+        })
         .await
         .unwrap();
     match next_event(&mut a).await {
@@ -307,19 +313,27 @@ async fn relay_sees_only_ciphertext() {
     let cipher = Cipher::generate();
 
     let bb = spawn_bare_broker(Vec::new());
-    let daemon = tokio::spawn(run_relay_daemon(url.clone(), cipher.clone(), bb.handle.clone()));
+    let daemon = tokio::spawn(run_relay_daemon(
+        url.clone(),
+        cipher.clone(),
+        bb.handle.clone(),
+    ));
 
     let client = RelayClient::new(url.clone(), cipher.clone());
     let mut a = client.attach().await.expect("relay attach");
 
     // Send the marker each way: a loop event out, a user message in (echoed back).
     bb.agent_tx
-        .send(AgentEvent::AssistantText { text: MARKER.into() })
+        .send(AgentEvent::AssistantText {
+            text: MARKER.into(),
+        })
         .await
         .unwrap();
     expect_text(&mut a, MARKER).await;
     a.ui_tx
-        .send(UiEvent::UserMessage { text: MARKER.into() })
+        .send(UiEvent::UserMessage {
+            text: MARKER.into(),
+        })
         .await
         .unwrap();
     match next_event(&mut a).await {

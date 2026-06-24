@@ -145,13 +145,13 @@ fn entry_to_spec(name: String, e: ServerEntry) -> Result<ServerSpec> {
     // `url` wins if both are set; otherwise fall back to stdio `command`.
     let transport = if let Some(url) = e.url {
         let auth = if e.auth.as_deref() == Some("oauth") {
-            let client_secret = match &e.client_secret_env {
-                Some(var) => Some(
-                    std::env::var(var)
-                        .map_err(|_| anyhow!("server '{name}': client_secret_env `{var}` not set"))?,
-                ),
-                None => None,
-            };
+            let client_secret =
+                match &e.client_secret_env {
+                    Some(var) => Some(std::env::var(var).map_err(|_| {
+                        anyhow!("server '{name}': client_secret_env `{var}` not set")
+                    })?),
+                    None => None,
+                };
             HttpAuth::OAuth {
                 scopes: e.scopes,
                 client_id: e.client_id,
@@ -297,7 +297,11 @@ impl McpRegistry {
     /// Connect a dormant server by name. Errors if the name is unknown to the
     /// catalog or already connected. `notify` carries the OAuth authorize URL
     /// out to the TUI when an interactive auth flow is triggered mid-session.
-    pub async fn load(&mut self, name: &str, notify: Option<&mpsc::Sender<AgentEvent>>) -> Result<usize> {
+    pub async fn load(
+        &mut self,
+        name: &str,
+        notify: Option<&mpsc::Sender<AgentEvent>>,
+    ) -> Result<usize> {
         if self.servers.contains_key(name) {
             return Err(anyhow!("server '{name}' is already loaded"));
         }
