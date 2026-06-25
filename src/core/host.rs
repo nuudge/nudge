@@ -280,11 +280,13 @@ fn translate(
             cwd,
             git_branch,
             session_id,
+            session_name,
         } => ControllerEvent::SessionInfo {
             model,
             cwd,
             git_branch,
             session_id,
+            session_name,
         },
         AgentEvent::Usage {
             in_tokens,

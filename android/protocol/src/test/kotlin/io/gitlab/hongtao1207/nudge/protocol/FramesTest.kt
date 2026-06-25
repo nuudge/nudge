@@ -35,6 +35,16 @@ class FramesTest {
             """{"Command":{"PermissionResponse":{"tool_use_id":"t1","allow":true}}}""",
             enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.PermissionResponse("t1", true))),
         )
+        // RenameSession mirrors Rust's Option<String>: a name verbatim, or null to let
+        // the daemon derive one. serde emits the `name` key either way (not omitted).
+        assertEquals(
+            """{"Command":{"RenameSession":{"name":"auth-fix"}}}""",
+            enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.RenameSession("auth-fix"))),
+        )
+        assertEquals(
+            """{"Command":{"RenameSession":{"name":null}}}""",
+            enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.RenameSession(null))),
+        )
     }
 
     @Test
@@ -105,6 +115,8 @@ class FramesTest {
             ClientFrame.Detach,
             ClientFrame.Command(UiEvent.UserMessage("go")),
             ClientFrame.Command(UiEvent.SetModel("claude-opus-4-8")),
+            ClientFrame.Command(UiEvent.RenameSession("my-name")),
+            ClientFrame.Command(UiEvent.RenameSession(null)),
             ClientFrame.Command(UiEvent.ListServers),
             ClientFrame.Command(UiEvent.Quit),
         )

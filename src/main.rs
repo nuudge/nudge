@@ -63,9 +63,14 @@ impl Thinking {
 #[derive(Parser)]
 #[command(name = "nudge", version)]
 struct Cli {
-    /// Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl.
-    #[arg(long, value_name = "id")]
+    /// Resume a previous session by id or name from ~/.nudge/projects/<cwd>/.
+    /// A name (set via /session-rename) is resolved to its session id.
+    #[arg(long, value_name = "id-or-name")]
     resume: Option<String>,
+
+    /// List this project's saved sessions (name, id, branch, size, last used) and exit.
+    #[arg(long)]
+    list: bool,
 
     /// Thinking display.
     #[arg(long, default_value = "summarized", value_name = "mode")]
@@ -105,6 +110,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // --list is a standalone read-only action: print this project's sessions and exit,
+    // touching no session and needing no API key.
+    if cli.list {
+        return print_sessions();
+    }
+
     // --connect owns no session: it just attaches a TUI to a running daemon, so it
     // needs neither an API key nor any of the session setup below.
     if cli.connect {
@@ -124,6 +135,7 @@ async fn main() -> Result<()> {
     let thinking_display = cli.thinking.as_display();
     let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
+        session_name: session.name.clone(),
         model: DEFAULT_MODEL.into(),
         thinking_display: thinking_display.clone(),
         // Filled in the in-process branch below when --relay arms remote pairing.
@@ -177,6 +189,7 @@ async fn main() -> Result<()> {
             cwd: session.cwd_display(),
             git_branch: backend.git_branch(),
             session_id: session.id.clone(),
+            session_name: session.name.clone(),
         },
     );
     let mut host =
@@ -280,6 +293,7 @@ async fn run_connect(cli: Cli) -> Result<()> {
     // overwrites session id / model / cwd / branch with the daemon's real context.
     let ui_cfg = tui::UiConfig {
         session_id: "(connecting…)".into(),
+        session_name: None,
         model: DEFAULT_MODEL.into(),
         thinking_display: cli.thinking.as_display(),
         // A --connect client never hosts a relay, so it shows no pairing QR.
@@ -315,6 +329,52 @@ async fn run_connect(cli: Cli) -> Result<()> {
         tui::run(&client, ui_cfg, controller, None).await
     } else {
         bail!("--connect needs --pair-code <code> (relay) or --socket <path> (local debug daemon)")
+    }
+}
+
+// `--list`: print the current project's saved sessions, most-recent-first, so the
+// user can pick one to `--resume` by name instead of squinting at uuids. Nameless
+// sessions still appear (their id is the only handle). Read-only; no API key needed.
+fn print_sessions() -> Result<()> {
+    let sessions = coding::list_sessions()?;
+    if sessions.is_empty() {
+        println!("No saved sessions for this directory.");
+        return Ok(());
+    }
+    println!(
+        "{:<28}  {:<36}  {:<16}  {:>8}  LAST USED",
+        "NAME", "ID", "BRANCH", "SIZE"
+    );
+    for s in &sessions {
+        let when = chrono::DateTime::<chrono::Local>::from(s.modified).format("%Y-%m-%d %H:%M");
+        println!(
+            "{:<28}  {:<36}  {:<16}  {:>8}  {}",
+            s.name.as_deref().unwrap_or("(unnamed)"),
+            s.id,
+            s.branch.as_deref().unwrap_or("-"),
+            human_size(s.size),
+            when,
+        );
+    }
+    println!("\nResume with: nudge --resume <name-or-id>");
+    Ok(())
+}
+
+// Format a byte count as a short human-readable string (e.g. `1.2K`, `3.4M`) for the
+// `--list` SIZE column. Bytes under 1K stay as a plain count so tiny transcripts read
+// exactly rather than rounding to `0.0K`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "K", "M", "G"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
     }
 }
 
