@@ -23,7 +23,7 @@ lint:
     - rustup component add rustfmt clippy
   script:
     - cargo fmt --all -- --check
-    - cargo clippy --all-targets -- -D warnings
+    - cargo clippy --workspace --all-targets -- -D warnings
   cache:
     <<: *rust-cache
 

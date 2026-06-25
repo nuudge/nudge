@@ -4,14 +4,13 @@ rust = "1.96.0"
 [tasks.fmt]
 description = "Format code"
 run = [
-  "cargo fmt",
-  "cargo clippy --all-targets --fix --allow-dirty -- -D warnings",
-  "cargo fmt",
+  "cargo clippy --workspace --all-targets --fix --allow-dirty -- -D warnings",
+  "cargo fmt --all",
 ]
 
 [tasks.lint]
 description = "Check formatting and run clippy"
-run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings"]
+run = ["cargo fmt --all -- --check", "cargo clippy --workspace --all-targets -- -D warnings"]
 
 [tasks.test]
 description = "Run tests"
