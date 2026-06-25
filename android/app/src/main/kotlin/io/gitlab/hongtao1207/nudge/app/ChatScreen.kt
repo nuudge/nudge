@@ -185,12 +185,14 @@ private fun StatusIndicator(connection: Connection) {
 }
 
 // Collapsible session context. The glance line (model · branch) is always shown and
-// costs one thin line; tapping it reveals the full cwd + session id (with copy), which
-// are reference info you rarely need at a glance on a phone.
+// costs one thin line; tapping it reveals the full cwd + session label (with copy), which
+// are reference info you rarely need at a glance on a phone. The label is the human name
+// once renamed, else the uuid — both are valid `--resume` references.
 @Composable
 private fun ContextBar(info: SessionContext) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
+    val sessionLabel = info.sessionName ?: info.sessionId
     Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
             Row(
@@ -220,7 +222,7 @@ private fun ContextBar(info: SessionContext) {
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = info.sessionId,
+                        text = sessionLabel,
                         style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -228,7 +230,7 @@ private fun ContextBar(info: SessionContext) {
                         modifier = Modifier.weight(1f),
                     )
                     TextButton(
-                        onClick = { clipboard.setText(AnnotatedString(info.sessionId)) },
+                        onClick = { clipboard.setText(AnnotatedString(sessionLabel)) },
                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                     ) {
                         Text("Copy", style = MaterialTheme.typography.labelMedium)
