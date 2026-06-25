@@ -32,11 +32,12 @@ outside the end-to-end encryption, it sees neither your traffic nor your keys.
 On the box (or build locally for the box's architecture and copy it over):
 
 ```sh
-cargo build --release --bin relay
+cargo build --release -p relay
 sudo install -m 755 target/release/relay /usr/local/bin/nudge-relay
 ```
 
-The relay shares no code with the agent, so you only need this repo to build it.
+The relay is its own workspace crate, so `-p relay` compiles only its small
+dependency tree — not the agent's (ratatui, the MCP client, the HTTP/TLS stack).
 
 ## 2. Install Caddy
 
@@ -101,7 +102,6 @@ can. Treat it as a secret.
   box, so it is never directly exposed to the internet.
 - **No state, no logs of content.** The relay holds two connections open and
   copies bytes; it keeps no transcript and could not read one if it tried.
-- **Lifting it elsewhere.** The relay is self-contained (`src/bin/relay.rs`); if
-  you'd rather run it from its own repository, copy that file and a minimal
-  `Cargo.toml` — it pulls in only `tokio`, `tokio-tungstenite`, `clap`, `anyhow`,
-  and `futures`.
+- **Lifting it elsewhere.** The relay is its own self-contained crate (`relay/`);
+  if you'd rather run it from a separate repository, copy that directory — it
+  pulls in only `tokio`, `tokio-tungstenite`, `clap`, `anyhow`, and `futures`.

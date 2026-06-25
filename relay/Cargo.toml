@@ -1,0 +1,21 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+description = "Ciphertext-blind WebSocket rendezvous relay for nudge."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "relay"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately minimal — the relay shares no code with the agent, so it stays
+# off the agent's heavy tree (ratatui, rmcp, reqwest/rustls, dryoc, …). Plaintext
+# ws:// only, so tokio-tungstenite needs no TLS feature.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = { workspace = true }   # inherits "0.24", no TLS features
+futures = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

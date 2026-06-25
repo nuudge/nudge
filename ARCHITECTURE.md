@@ -32,7 +32,7 @@ graph TD
   subgraph external [external processes]
     api["Anthropic API"]
     mcpsrv["MCP servers<br/>(child / HTTP)"]
-    relay["relay binary<br/>(src/bin/relay.rs)<br/>ciphertext-blind WS relay"]
+    relay["relay binary<br/>(relay/src/main.rs)<br/>ciphertext-blind WS relay"]
   end
 
   llm -. https .-> api
