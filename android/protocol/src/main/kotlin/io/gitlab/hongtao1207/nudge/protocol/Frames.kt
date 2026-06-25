@@ -179,6 +179,12 @@ sealed class UiEvent {
     @Serializable
     data class SetModel(val model: String) : UiEvent()
 
+    // Rename the session. name = null asks the daemon to derive one (git branch +
+    // short id, else an LLM-suggested summary); a value is used verbatim. Mirrors the
+    // Rust UiEvent::RenameSession { name: Option<String> }.
+    @Serializable
+    data class RenameSession(val name: String?) : UiEvent()
+
     @Serializable
     data class LoadServer(val name: String) : UiEvent()
 
@@ -204,6 +210,7 @@ object UiEventSerializer : KSerializer<UiEvent> {
         when (value) {
             is UiEvent.UserMessage -> emitTagged(j, "UserMessage", UiEvent.UserMessage.serializer(), value)
             is UiEvent.SetModel -> emitTagged(j, "SetModel", UiEvent.SetModel.serializer(), value)
+            is UiEvent.RenameSession -> emitTagged(j, "RenameSession", UiEvent.RenameSession.serializer(), value)
             is UiEvent.LoadServer -> emitTagged(j, "LoadServer", UiEvent.LoadServer.serializer(), value)
             is UiEvent.UnloadServer -> emitTagged(j, "UnloadServer", UiEvent.UnloadServer.serializer(), value)
             UiEvent.ListServers -> emitTag(j, "ListServers")
@@ -219,6 +226,7 @@ object UiEventSerializer : KSerializer<UiEvent> {
         return when (tag) {
             "UserMessage" -> dec(UiEvent.UserMessage.serializer())
             "SetModel" -> dec(UiEvent.SetModel.serializer())
+            "RenameSession" -> dec(UiEvent.RenameSession.serializer())
             "LoadServer" -> dec(UiEvent.LoadServer.serializer())
             "UnloadServer" -> dec(UiEvent.UnloadServer.serializer())
             "ListServers" -> UiEvent.ListServers

@@ -104,10 +104,66 @@ pub fn open_new() -> Result<Session> {
     Session::create(cwd, dir)
 }
 
-pub fn open_resume(id: &str) -> Result<Resumed> {
+// Resume by either a session uuid or a human name: a name is resolved to its id
+// against this project's index before opening (see `session::resolve_reference`).
+pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let dir = project_dir(&cwd)?;
-    Session::open(id, cwd, dir)
+    let id = crate::core::session::resolve_reference(&dir, reference);
+    Session::open(&id, cwd, dir)
+}
+
+// One row for `nudge --list`: a session in the current project, with its name
+// (from the index) if it's been renamed. `modified` is the transcript file's mtime,
+// used to sort most-recent-first so the list reads like a recency-ordered history.
+// `size` is the transcript's byte length, a rough proxy for how much history it holds.
+pub struct SessionListing {
+    pub id: String,
+    pub name: Option<String>,
+    pub branch: Option<String>,
+    pub modified: std::time::SystemTime,
+    pub size: u64,
+}
+
+// Enumerate the current project's sessions: every `<id>.jsonl` transcript in the
+// cwd-keyed dir, joined with the name index. Returns most-recently-modified first.
+// An empty/missing project dir yields an empty list (no sessions here yet).
+pub fn list_sessions() -> Result<Vec<SessionListing>> {
+    use crate::core::session::read_index;
+    let cwd = std::env::current_dir().context("could not determine cwd")?;
+    let dir = project_dir(&cwd)?;
+    let index = read_index(&dir.join("index.json"));
+
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(out), // no sessions recorded for this project yet
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let fs_meta = entry.metadata().ok();
+        let modified = fs_meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size = fs_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let meta = index.get(id);
+        out.push(SessionListing {
+            id: id.to_string(),
+            name: meta.map(|e| e.name.clone()),
+            branch: meta.and_then(|e| e.branch.clone()),
+            modified,
+            size,
+        });
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    Ok(out)
 }
 
 fn project_dir(cwd: &Path) -> Result<PathBuf> {

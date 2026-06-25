@@ -95,6 +95,9 @@ struct App {
     // The id the Session was created with — the same value the user passes
     // to --resume. Handed in at startup, not re-derived from artifacts.
     session_id: String,
+    // The human label set via /session-rename, None when the session is nameless.
+    // Shown in place of the uuid in the header. Updated by SessionInfo events.
+    session_name: Option<String>,
     // The thinking display mode the agent was launched with. Shown in the
     // status line so the user can't forget which mode is active — particularly
     // useful when "omitted" is set and no thinking entries appear.
@@ -140,6 +143,7 @@ struct App {
 // that first event arrives. thinking_display is purely a client-side launch flag.
 pub struct UiConfig {
     pub session_id: String,
+    pub session_name: Option<String>,
     pub model: String,
     pub thinking_display: String,
     // Set only when launched with `--relay`: the scannable pairing QR and the
@@ -160,6 +164,7 @@ impl App {
             cursor: 0,
             status: String::new(),
             session_id: cfg.session_id,
+            session_name: cfg.session_name,
             thinking_display: cfg.thinking_display,
             model: cfg.model,
             // Filled by the daemon's SessionInfo (first event on attach); blank until then.
@@ -350,11 +355,13 @@ impl App {
                 cwd,
                 git_branch,
                 session_id,
+                session_name,
             } => {
                 self.model = model;
                 self.cwd_display = cwd;
                 self.git_branch = git_branch;
                 self.session_id = session_id;
+                self.session_name = session_name;
             }
         }
     }
@@ -616,6 +623,15 @@ impl App {
                 if let Some(event) = event {
                     let _ = ui_tx.try_send(event);
                 }
+            }
+            // Rename the session. With an argument it's the explicit name; bare, the
+            // daemon derives one (git branch + short id in a repo, else an LLM-suggested
+            // summary). The final label arrives back as a Notice + SessionInfo, so the
+            // header updates without the TUI guessing the derived name locally.
+            Some("/session-rename") => {
+                let arg = cmd["/session-rename".len()..].trim();
+                let name = (!arg.is_empty()).then(|| arg.to_string());
+                let _ = ui_tx.try_send(UiEvent::RenameSession { name });
             }
             // Detach and run the agent headless; the run loop performs the actual
             // detach (it holds the SessionHost). Reattach with Enter.
@@ -995,11 +1011,13 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )
         };
+        // Prefer the human name; fall back to the uuid for a still-nameless session.
+        let session_label = self.session_name.as_deref().unwrap_or(&self.session_id);
         let title = Line::from(vec![
             Span::styled(badge, badge_style),
             Span::raw(format!(
                 " nudge · {} · {} · {git_tag} · {} · {}",
-                self.session_id, self.cwd_display, self.model, self.platform
+                session_label, self.cwd_display, self.model, self.platform
             )),
         ]);
         let log = log_paragraph

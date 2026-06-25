@@ -179,6 +179,8 @@ nudge [OPTIONS]
 OPTIONS:
     --resume <id>        Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl
                          (the id is shown in the TUI title bar)
+    --list               List this project's saved sessions (name, id, branch,
+                         transcript size, last used), most-recent-first, then exit
     --thinking <mode>    Thinking display: summarized (default) or omitted
     --daemon             Run the session headless (no TUI); hosts over $NUDGE_RELAY,
                          or a local Unix socket with --socket
@@ -211,6 +213,18 @@ You can also start a session with no TUI at all: `nudge --daemon` hosts it headl
 | mouse wheel / `PgUp` `PgDn` / `Home` `End` | scroll / jump / resume tail-follow |
 | `y` / `n` / `Esc` | answer permission prompt |
 | `Ctrl-C` (or `Ctrl-D` on empty input) | quit |
+
+### Slash commands
+
+Type these as a single-line message starting with `/` (multi-line input that happens to start with `/`, e.g. a pasted path, still goes to the model):
+
+| Command | Action |
+|---|---|
+| `/model` | open the model picker |
+| `/mcp` | list loaded MCP servers and the dormant ones available to load |
+| `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
+| `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
+| `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR — reattach with `Enter` |
 
 ## How it works
 

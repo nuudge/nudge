@@ -17,6 +17,9 @@ pub enum AgentEvent {
         cwd: String,
         git_branch: Option<String>,
         session_id: String,
+        // The human label set via /session-rename, or None if the session is
+        // still nameless. Controllers prefer it over `session_id` in the header.
+        session_name: Option<String>,
     },
     Usage {
         in_tokens: u64,
@@ -88,6 +91,9 @@ pub enum ControllerEvent {
         cwd: String,
         git_branch: Option<String>,
         session_id: String,
+        // Human label set via /session-rename (None when nameless). Rendered in
+        // place of the uuid in the header so a resumed session is recognizable.
+        session_name: Option<String>,
     },
     Usage {
         in_tokens: u64,
@@ -155,6 +161,11 @@ pub enum UiEvent {
     // Switch the API model. Applied at the next turn boundary — requests
     // already in flight finish on the old model.
     SetModel { model: String },
+    // Rename the session. `name: Some` is the explicit name; `None` asks the loop
+    // to derive one (git branch + short id in a repo, else an LLM-suggested
+    // summary). Handled at a turn boundary, where it persists the label and
+    // re-emits SessionInfo so every controller's header updates.
+    RenameSession { name: Option<String> },
     // Connect a dormant MCP server by name (from the built-in catalog).
     LoadServer { name: String },
     // Disconnect a previously-loaded dormant server by name.

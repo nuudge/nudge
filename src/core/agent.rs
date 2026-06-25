@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::events::{AgentEvent, UiEvent};
 use crate::core::session::Session;
-use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
+use crate::llm::{ContentBlock, Message, Provider, Request, Response, SystemBlock};
 
 pub struct AgentConfig {
     pub model: String,
@@ -60,7 +60,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
     mut cfg: AgentConfig,
     provider: P,
     mut backend: B,
-    session: Session,
+    mut session: Session,
     initial_messages: Vec<Message>,
     mut ui_rx: mpsc::Receiver<UiEvent>,
     agent_tx: mpsc::Sender<AgentEvent>,
@@ -75,10 +75,15 @@ pub async fn run_agent<P: Provider, B: Backend>(
     // current length is itself a valid snapshot.
     let mut last_good_snapshot: usize = messages.len();
 
-    // Last (model, git_branch) pushed as a SessionInfo, primed from the startup values
-    // (which match main.rs's seed) so we only re-emit when one actually changes — a
-    // `/model` switch or a mid-session `git checkout` — rather than once per turn.
-    let mut last_session_ctx = (cfg.model.clone(), backend.git_branch());
+    // Last (model, git_branch, name) pushed as a SessionInfo, primed from the startup
+    // values (which match main.rs's seed) so we only re-emit when one actually changes —
+    // a `/model` switch, a mid-session `git checkout`, or a `/session-rename` — rather
+    // than once per turn.
+    let mut last_session_ctx = (
+        cfg.model.clone(),
+        backend.git_branch(),
+        session.name.clone(),
+    );
 
     // OUTER loop: one iteration per user turn.
     loop {
@@ -92,6 +97,56 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         &cfg.model,
                         backend.git_branch(),
                         &session,
+                        &mut last_session_ctx,
+                    )
+                    .await;
+                }
+                Some(UiEvent::RenameSession { name: requested }) => {
+                    let branch = backend.git_branch();
+                    let name = match requested {
+                        // Tier 1: explicit name, used verbatim (trimmed).
+                        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+                        // Tier 2: inside a git repo, branch + a short id so two
+                        // sessions on the same branch don't share a label.
+                        _ => match &branch {
+                            Some(b) => format!("{}-{}", b, short_id(&session.id)),
+                            // Tier 3: no repo — ask the model for a short title from
+                            // the conversation, falling back to the cwd's name. The
+                            // `complete` future is `Send` (trait-guaranteed), so it's
+                            // awaited inline here rather than via a `&P`-capturing
+                            // helper, which would make the whole loop future non-Send.
+                            None => match title_prompt(&messages) {
+                                Some(prompt) => {
+                                    let probe = [Message {
+                                        role: "user".into(),
+                                        content: vec![ContentBlock::Text { text: prompt }],
+                                    }];
+                                    let req = Request {
+                                        model: &cfg.model,
+                                        max_tokens: 1024,
+                                        thinking_display: "omitted",
+                                        system: Vec::new(),
+                                        tools: Vec::new(),
+                                        tool_cache_boundary: None,
+                                        messages: &probe,
+                                    };
+                                    provider
+                                        .complete(&req)
+                                        .await
+                                        .ok()
+                                        .and_then(|r| title_from_response(&r))
+                                        .unwrap_or_else(|| fallback_name(&session))
+                                }
+                                None => fallback_name(&session),
+                            },
+                        },
+                    };
+                    finalize_rename(
+                        name,
+                        branch,
+                        &cfg,
+                        &mut session,
+                        &agent_tx,
                         &mut last_session_ctx,
                     )
                     .await;
@@ -272,21 +327,21 @@ pub async fn run_agent<P: Provider, B: Backend>(
     }
 }
 
-// Re-read the volatile context (model, git branch) and emit a SessionInfo only if it
-// changed since the last emit, so every controller's header tracks the daemon without
-// flooding the replay buffer with an identical event each turn. cwd/session-id are
-// fixed for the session. git_branch() re-runs git, so call this at turn boundaries.
-// `branch` is read by the caller *before* the await (so no `&Backend` is held across
-// it — that would force a `B: Sync` bound on the whole loop). model is borrowed; the
-// rest are owned/Send.
+// Re-read the volatile context (model, git branch, name) and emit a SessionInfo only
+// if it changed since the last emit, so every controller's header tracks the daemon
+// without flooding the replay buffer with an identical event each turn. cwd/session-id
+// are fixed for the session. git_branch() re-runs git, so call this at turn boundaries;
+// the name changes only on /session-rename, which also routes through here. `branch` is
+// read by the caller *before* the await (so no `&Backend` is held across it — that would
+// force a `B: Sync` bound on the whole loop). model is borrowed; the rest are owned/Send.
 async fn emit_session_info_if_changed(
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
     branch: Option<String>,
     session: &Session,
-    last: &mut (String, Option<String>),
+    last: &mut (String, Option<String>, Option<String>),
 ) {
-    let current = (model.to_string(), branch);
+    let current = (model.to_string(), branch, session.name.clone());
     if current == *last {
         return;
     }
@@ -297,8 +352,132 @@ async fn emit_session_info_if_changed(
             cwd: session.cwd_display(),
             git_branch: current.1,
             session_id: session.id.clone(),
+            session_name: current.2,
         })
         .await;
+}
+
+// Persist a resolved session label and broadcast the change: write it to the index,
+// emit a Notice (so the user — and the TUI, which can't know a daemon-derived name
+// synchronously — sees the final label), then re-emit SessionInfo via the change-
+// detecting helper, which now sees the new name and updates every controller's header.
+async fn finalize_rename(
+    name: String,
+    branch: Option<String>,
+    cfg: &AgentConfig,
+    session: &mut Session,
+    tx: &mpsc::Sender<AgentEvent>,
+    last_ctx: &mut (String, Option<String>, Option<String>),
+) {
+    match session.set_name(name.clone(), branch.clone()) {
+        Ok(()) => {
+            let _ = tx
+                .send(AgentEvent::Notice {
+                    text: format!("session renamed to '{name}'"),
+                })
+                .await;
+            emit_session_info_if_changed(tx, &cfg.model, branch, session, last_ctx).await;
+        }
+        Err(e) => {
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: format!("rename failed: {e:#}"),
+                })
+                .await;
+        }
+    }
+}
+
+// First 8 chars of the uuid — enough to disambiguate same-branch sessions in a label
+// while staying short. Guarded against an unexpectedly short id.
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+// Tier-3 fallback when the model can't suggest a title (empty conversation or API
+// error): the working directory's own name, else a short id.
+fn fallback_name(session: &Session) -> String {
+    session
+        .cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(sanitize_title)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| short_id(&session.id).to_string())
+}
+
+// Build the tier-3 title request prompt from the conversation start. None when nothing
+// has been said yet (a brand-new session renamed before the first turn) — the caller
+// then falls back. The caller issues the actual `provider.complete` so the loop awaits
+// the trait's `Send` future directly (a helper capturing `&P` would break `Send`).
+fn title_prompt(messages: &[Message]) -> Option<String> {
+    let digest = conversation_digest(messages)?;
+    Some(format!(
+        "Below is the start of a coding session.\n\n{digest}\n\nReply with ONLY a short, lowercase, kebab-case title (3-6 words joined by hyphens) describing the task. No quotes, no punctuation, no explanation."
+    ))
+}
+
+// Extract a clean kebab-case title from the model's title response: first non-empty
+// text block, normalized. None when the response carries no usable text.
+fn title_from_response(resp: &Response) -> Option<String> {
+    let raw = resp.content.iter().find_map(|b| match b {
+        ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    })?;
+    let title = sanitize_title(raw);
+    (!title.is_empty()).then_some(title)
+}
+
+// A bounded plain-text digest of the conversation start (user + assistant text only),
+// capped so the title request stays cheap on long sessions. None when no text has been
+// exchanged yet (a brand-new session renamed before the first turn).
+fn conversation_digest(messages: &[Message]) -> Option<String> {
+    const CAP: usize = 1500;
+    let mut out = String::new();
+    for m in messages {
+        for block in &m.content {
+            if let ContentBlock::Text { text } = block
+                && !text.trim().is_empty()
+            {
+                out.push_str(text.trim());
+                out.push('\n');
+            }
+        }
+        if out.len() >= CAP {
+            break;
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(CAP).collect())
+    }
+}
+
+// Normalize arbitrary text into a clean kebab-case label: lowercase alphanumerics,
+// every other run collapsed to a single hyphen, trimmed of leading/trailing hyphens
+// and capped in length. Used for both the model's suggestion and the cwd fallback.
+fn sanitize_title(raw: &str) -> String {
+    const MAX_LEN: usize = 60;
+    let mut out = String::new();
+    let mut pending_hyphen = false;
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_hyphen && !out.is_empty() {
+                out.push('-');
+            }
+            pending_hyphen = false;
+            out.push(c.to_ascii_lowercase());
+        } else {
+            pending_hyphen = true;
+        }
+    }
+    // `out` is all ASCII (alphanumerics + hyphens), so a byte truncation is char-safe.
+    // Trim any hyphen the cut left dangling.
+    out.truncate(MAX_LEN);
+    out.trim_end_matches('-').to_string()
 }
 
 // Execute every tool call in the assistant turn: emit start/result events,
@@ -394,4 +573,79 @@ async fn dispatch_tools<B: Backend>(
     }
 
     (tool_results, denied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    #[test]
+    fn sanitize_title_kebabs_and_trims() {
+        assert_eq!(
+            sanitize_title("Fix the Auth Retry Logic!"),
+            "fix-the-auth-retry-logic"
+        );
+        // Leading/trailing/duplicate separators collapse to single hyphens.
+        assert_eq!(sanitize_title("  --Hello,  World--  "), "hello-world");
+        // Already-kebab input is preserved.
+        assert_eq!(sanitize_title("add-user-login"), "add-user-login");
+        // No alphanumerics → empty (caller falls back).
+        assert_eq!(sanitize_title("!!! ??? ..."), "");
+    }
+
+    #[test]
+    fn sanitize_title_caps_length() {
+        let long = "word ".repeat(40);
+        assert!(sanitize_title(&long).len() <= 60);
+    }
+
+    #[test]
+    fn title_from_response_normalizes_first_text() {
+        let resp = Response {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::Text {
+                    text: "  Add User Login Flow  ".into(),
+                },
+            ],
+            stop_reason: "end_turn".into(),
+            usage: Default::default(),
+        };
+        assert_eq!(
+            title_from_response(&resp).as_deref(),
+            Some("add-user-login-flow")
+        );
+    }
+
+    #[test]
+    fn title_prompt_none_without_text() {
+        assert!(title_prompt(&[]).is_none());
+        // A turn carrying only non-text content has nothing to summarize.
+        let toolish = Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: "t".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            }],
+        };
+        assert!(title_prompt(&[toolish]).is_none());
+    }
+
+    #[test]
+    fn title_prompt_embeds_conversation_digest() {
+        let prompt = title_prompt(&[user("Please refactor the parser")]).unwrap();
+        assert!(prompt.contains("Please refactor the parser"));
+        assert!(prompt.contains("kebab-case"));
+    }
 }
