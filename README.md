@@ -1,3 +1,5 @@
+[[_TOC_]]
+
 # nudge
 
 Yet another coding agent — except this one doesn't sleep, doesn't quit, and follows you home. Written in Rust from scratch: no agent SDK, no framework, no abstraction tax, just the raw LLM API over HTTP. The loop is decoupled from the UI, so a session outlives any front-end — detach it, reattach from another terminal, or **drive it live from your phone** over an end-to-end-encrypted link.
