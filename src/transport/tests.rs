@@ -1,17 +1,18 @@
 // End-to-end transport test: a real `SocketClient` driving a real broker over a
-// real Unix socket via the co-located handoff server (`serve_handoff`). The broker
-// has no agent loop behind it — events are injected directly (see `spawn_bare_broker`)
-// — so this exercises only the transport seam: framing, the attach handshake, seq
-// assignment + `after_seq` filtering, and the co-located guest-quit-as-detach rule.
-// Broker-internal invariants (single-attach lock, force-takeover, permission
+// real Unix socket via the standalone daemon (`run_daemon`, the `--daemon --socket`
+// debug host). The broker has no agent loop behind it — events are injected directly
+// (see `spawn_bare_broker`) — so this exercises only the transport seam: framing, the
+// attach handshake, seq assignment + `after_seq` filtering, and the guest-quit-as-detach
+// rule. Broker-internal invariants (single-attach lock, force-takeover, permission
 // correlation) are covered by the host unit tests; wire framing by the wire tests.
 use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::time::timeout;
 
+use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
-use super::{Cipher, RelayClient, SocketClient, bind_listener, run_relay_daemon, serve_handoff};
+use super::{RelayClient, SocketClient, bind_listener, run_daemon, run_relay_daemon};
 use crate::core::host::spawn_bare_broker;
 use crate::core::{AgentEvent, Controller, ControllerEvent, SessionHandle, UiEvent};
 
@@ -52,8 +53,8 @@ async fn expect_text(ctrl: &mut Controller, want: &str) {
 async fn socket_round_trip_replay_resume_and_guest_quit() {
     let path = unique_socket_path();
     let bb = spawn_bare_broker(Vec::new());
-    let listener = bind_listener(&path).expect("bind handoff listener");
-    let serve = tokio::spawn(serve_handoff(listener, bb.handle.clone()));
+    let listener = bind_listener(&path).expect("bind daemon listener");
+    let serve = tokio::spawn(run_daemon(listener, path.clone(), bb.handle.clone()));
 
     let client = SocketClient::new(path.clone());
 
@@ -91,8 +92,8 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
         .unwrap();
     expect_text(&mut b, "three").await;
 
-    // Co-located guest quit is a detach, not a kill: B's connection ends, but the
-    // session survives.
+    // A guest quit is a detach, not a kill: B's connection ends, but the session
+    // survives.
     b.ui_tx.send(UiEvent::Quit).await.unwrap();
     assert!(
         next_event(&mut b).await.is_none(),
@@ -106,59 +107,8 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
     expect_text(&mut c, "two").await;
     expect_text(&mut c, "three").await;
 
-    // Tear down the accept loop + broker and remove the socket file (the launching
-    // process owns cleanup; serve_handoff deliberately doesn't).
+    // Tear down the accept loop + broker and remove the socket file.
     drop(c);
-    serve.abort();
-    drop(bb);
-    let _ = std::fs::remove_file(&path);
-}
-
-// A local-TUI force-takeover boots a co-located guest, but the handoff server must
-// keep accepting so control can hand back — the regression guard for the `is_alive`
-// re-loop in `serve()`. Without it, one reclaim tears the socket down and a later
-// guest could never reattach. (This is what makes /background → phone → return-to-
-// desk → /background-again work; the relay loop carries the identical fix.)
-#[tokio::test]
-async fn handoff_server_survives_force_takeover() {
-    let path = unique_socket_path();
-    let bb = spawn_bare_broker(Vec::new());
-    let listener = bind_listener(&path).expect("bind handoff listener");
-    let serve = tokio::spawn(serve_handoff(listener, bb.handle.clone()));
-
-    let client = SocketClient::new(path.clone());
-
-    // A guest attaches over the socket and sees a buffered event.
-    let mut guest = client.attach().await.expect("guest attach");
-    bb.agent_tx
-        .send(AgentEvent::AssistantText { text: "hi".into() })
-        .await
-        .unwrap();
-    expect_text(&mut guest, "hi").await;
-
-    // The local TUI reclaims via a forcing attach, booting the guest. The guest's
-    // stream closes, surfacing as SessionEnded inside the server's `handle_conn`.
-    let _local = bb
-        .handle
-        .attach_force()
-        .await
-        .expect("local force-takeover binds");
-    assert!(
-        next_event(&mut guest).await.is_none(),
-        "force-takeover must close the booted guest's stream"
-    );
-
-    // Local steps aside so the single-attach lock is free again (Detach then the
-    // next Attach ride the same FIFO control channel — deterministic).
-    bb.handle.detach();
-
-    // The server survived the takeover: a fresh guest reattaches and replays the
-    // history. Without the is_alive re-loop, `serve` would have returned and this
-    // connect would be refused (attach_at fails loudly rather than hanging).
-    let mut guest2 = attach_at(&client, None).await;
-    expect_text(&mut guest2, "hi").await;
-
-    drop(guest2);
     serve.abort();
     drop(bb);
     let _ = std::fs::remove_file(&path);

@@ -98,12 +98,12 @@ graph TD
   tuirun --> sh{SessionHandle}
 
   sh --> inproc["SessionHost<br/>(local TUI / daemon host)<br/>direct channels to broker"]
-  sh --> sock["SocketClient<br/>(--connect)<br/>local Unix socket"]
-  sh --> relayc["RelayClient<br/>(--connect --relay/--pair-code)<br/>E2E-encrypted WebSocket"]
+  sh --> sock["SocketClient<br/>(--connect --socket)<br/>local Unix socket (debug)"]
+  sh --> relayc["RelayClient<br/>(--connect --pair-code)<br/>E2E-encrypted WebSocket"]
 
-  sock -. "newline-JSON frames" .-> daemon["transport daemon<br/>(--daemon)"]
+  sock -. "newline-JSON frames" .-> daemon["transport daemon<br/>(--daemon --socket)"]
   relayc -. "sealed Ws frames" .-> relaybox["relay binary"]
-  relaybox -. "sealed Ws frames" .-> daemonr["transport relay daemon<br/>(--daemon --relay)"]
+  relaybox -. "sealed Ws frames" .-> daemonr["transport relay daemon<br/>(--daemon / $NUDGE_RELAY)"]
   daemon --> brokerd["broker_handle()"]
   daemonr --> brokerd
 ```
@@ -128,29 +128,29 @@ device.
 
 ## The `/background` handoff hook
 
-`SessionHost::set_handoff_hook` registers a closure that fires **once**, lazily,
-on the first `/background` command. The hook is wired in `main.rs` (not `core`)
-to keep `core` below the transport layer. Which transport the hook opens depends
-on the CLI flags at startup:
-
-- **`--relay <url>` (normal mode)** — the hook dials OUT to the relay so a phone
-  can attach. A `Pairing` (room id + E2E key) is generated at startup; the QR
-  and pairing code are surfaced in the TUI's pair screen on `/background`. No
-  local socket is bound.
-- **default (no `--relay`)** — the hook binds a local Unix socket
-  (`~/.nudge/daemon.sock` by default) and emits a notice with the
-  `nudge --connect` command needed to attach from another terminal.
+`SessionHost::set_handoff_hook` registers a closure that fires on every
+`/background`, lazily. The hook is wired in `main.rs` (not `core`) to keep `core`
+below the transport layer. It is installed only when `$NUDGE_RELAY` is set: a
+`Pairing` (room id + E2E key) is generated at startup, and on `/background` the
+hook dials OUT to the relay so a phone can attach, reporting its progress
+(`connecting` → `connected` → `failed`) back to the TUI's pair screen. The QR and
+pairing code are surfaced once connected. The hook dedupes its own re-dialing, so
+firing each time just lets a failed dial be retried by backgrounding again. With
+no relay configured, `/background` still pauses the session — it just shows no QR.
+Local Unix-socket handoff is no longer co-located with a session; the socket
+transport survives only as the standalone `--daemon --socket` / `--connect --socket`
+debug path.
 
 ## Run modes (selected in `main.rs`)
 
 | Invocation                                   | Topology                                                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `nudge`                                      | In-process `SessionHost` + local TUI. First `/background` lazily binds a Unix socket for handoff. |
-| `nudge --relay <url>`                        | In-process `SessionHost` + local TUI. First `/background` dials out to relay; TUI shows a QR.   |
-| `nudge --daemon`                             | Headless host bound to a Unix socket; clients attach with `--connect`.                            |
-| `nudge --daemon --relay <url> [--pair]`      | Headless host dials **out** to the relay; `--pair` mints a room + key and prints a QR.            |
-| `nudge --connect [--socket\|--relay\|--pair-code]` | Front-end only (`SocketClient`/`RelayClient`); owns no loop.                              |
-| `nudge --gen-key`, `nudge --print-prompt`    | Standalone one-shot actions, then exit.                                                           |
+| `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and shows a QR (if set). |
+| `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR.           |
+| `nudge --connect --pair-code <code>`         | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
+| `nudge --daemon --socket <path>`             | Headless host bound to a local Unix socket (debugging the transport without a relay).             |
+| `nudge --connect --socket <path>`            | Front-end only (`SocketClient`) over a local Unix socket (debug).                                 |
+| `nudge --print-prompt`                       | Standalone one-shot action, then exit.                                                            |
 
 ## The coding agent (`coding/`)
 

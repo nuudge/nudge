@@ -5,4 +5,4 @@ pub mod session;
 
 pub use agent::{AgentConfig, Backend};
 pub use events::{AgentEvent, ControllerEvent, UiEvent};
-pub use host::{BrokerHandle, Controller, SessionHandle, SessionHost};
+pub use host::{BrokerHandle, Controller, HandoffStatus, SessionHandle, SessionHost};

@@ -80,13 +80,20 @@ ss -ltnp | grep 9000        # should show 127.0.0.1:9000
 
 ## 5. Connect through it
 
-Host a session on your computer and show a pairing QR:
+Point nudge at the relay once, in your environment (or `.env`):
 
 ```sh
-nudge --daemon --relay wss://relay.example.com --pair
+export NUDGE_RELAY=wss://relay.example.com
 ```
 
-Then attach from another device with the pairing code it printed:
+Host a headless session and show a pairing QR:
+
+```sh
+nudge --daemon
+```
+
+…or just start nudge normally and run `/background` — the same QR appears in the
+TUI's pair screen. Either way, attach from another device with the pairing code:
 
 ```sh
 nudge --connect --pair-code 'nudge:...'

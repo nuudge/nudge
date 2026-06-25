@@ -8,12 +8,10 @@
 // libsodium-compatible classic API. The wire layout per frame is
 // `nonce(24) ‖ MAC(16) ‖ ciphertext` — i.e. a fresh random nonce prepended to the
 // `crypto_secretbox_easy` output — so the Android lazysodium client can interop in
-// 8.4. The key is provided either as a raw key file (`--key`) or carried in a QR
-// pairing code (see `pairing`); both produce the same `Cipher`.
+// 8.4. The key is carried in a QR pairing code (see `pairing`) that produces the
+// `Cipher` on both ends.
 
-use std::path::Path;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dryoc::classic::crypto_secretbox::{
     Key, Nonce, crypto_secretbox_easy, crypto_secretbox_keygen, crypto_secretbox_open_easy,
 };
@@ -54,31 +52,6 @@ impl Cipher {
     // secret has no public accessor to leak through.
     pub(crate) fn key_bytes(&self) -> &[u8; CRYPTO_SECRETBOX_KEYBYTES] {
         &self.key
-    }
-
-    // Load a raw 32-byte key file (written by `save`). Errors clearly on a
-    // wrong-sized file so a truncated/garbage key surfaces at startup.
-    pub fn load(path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading relay key {}", path.display()))?;
-        let key: Key = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "relay key {} must be exactly {CRYPTO_SECRETBOX_KEYBYTES} bytes, found {}",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        Ok(Self { key })
-    }
-
-    // Write the raw key with owner-only (0600) permissions — it is a secret.
-    pub fn save(&self, path: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, self.key)
-            .with_context(|| format!("writing relay key {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
-        Ok(())
     }
 
     // Seal one frame: fresh nonce ‖ secretbox. The buffers are sized exactly, so

@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
 };
-use crate::core::{BrokerHandle, SessionHandle, UiEvent};
+use crate::core::{BrokerHandle, HandoffStatus, SessionHandle, UiEvent};
 
 // How one client connection ended — decides what the accept loop does next.
 enum ConnOutcome {
@@ -20,20 +21,6 @@ enum ConnOutcome {
     // A client quit the session (or the loop ended on its own). The daemon stops
     // and the caller shuts the host down.
     SessionEnded,
-}
-
-// Where the accept loop runs relative to the session owner. This now governs only
-// stderr behaviour: a standalone process has no TUI and logs freely; a co-located
-// loop shares the process with the owner's TUI, so it must stay SILENT — any stderr
-// write corrupts the alternate screen and desyncs ratatui's diff. (Quit semantics
-// are no longer mode-dependent: a controller's Quit is always just a detach — see
-// `handle_conn`. A daemon ends only when its own process is stopped.)
-enum ServeMode {
-    // The accept loop is the whole process (the `--daemon` server): no local TUI.
-    Standalone,
-    // The accept loop is bolted onto an interactive process that already has a
-    // local owner-TUI (spawned on /background). Clients arriving here are guests.
-    CoLocated,
 }
 
 // Bind the listener without clobbering a live daemon. A leftover socket file from
@@ -60,18 +47,14 @@ pub fn bind_listener(path: &Path) -> Result<UnixListener> {
 // handling connections one at a time makes a foreground reattach race-free — the
 // previous connection's `detach` completes (on `handle_conn` returning) before the
 // next connection's `attach` runs, so the second never sees a stale single-attach
-// lock.
-async fn serve(listener: &UnixListener, broker: &BrokerHandle, mode: ServeMode) {
-    // A `CoLocated` loop shares the screen with the owner's TUI, so it must stay
-    // silent (any stderr write would corrupt it); a `Standalone` daemon logs freely.
-    let log = matches!(mode, ServeMode::Standalone);
+// lock. Only the standalone `--daemon --socket` debug host reaches here (the local
+// session's handoff is relay-only), so it logs freely — there's no TUI to corrupt.
+async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
     loop {
         let (stream, _addr) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
-                if log {
-                    eprintln!("[daemon] accept error: {e:#}");
-                }
+                eprintln!("[daemon] accept error: {e:#}");
                 continue;
             }
         };
@@ -83,38 +66,25 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle, mode: ServeMode) 
         let writer = LineWriter(write_half);
         match handle_conn(reader, writer, broker).await {
             ConnOutcome::Disconnected => {
-                if log {
-                    eprintln!("[daemon] client disconnected; session still running");
-                }
+                eprintln!("[daemon] client disconnected; session still running");
             }
+            // The controller's stream closed, which for a standalone daemon means
+            // the host itself is shutting down (no force-takeover here).
             ConnOutcome::SessionEnded => {
-                // A local-TUI force-takeover (reclaim) closes the booted client's
-                // stream and surfaces here as SessionEnded, but the broker is still
-                // alive — keep accepting so control can hand back. Only a real host
-                // shutdown (broker gone) ends the loop. Standalone --daemon never
-                // force-takes-over, so there this is always a genuine shutdown.
-                if broker.is_alive() {
-                    if log {
-                        eprintln!("[daemon] controller reclaimed locally; still serving");
-                    }
-                    continue;
-                }
-                if log {
-                    eprintln!("[daemon] session ended; shutting down");
-                }
+                eprintln!("[daemon] session ended; shutting down");
                 break;
             }
         }
     }
 }
 
-// Standalone headless daemon (the `--daemon` process). No TUI, so it logs freely.
-// A controller's Quit no longer ends the session (it's a detach); the daemon runs
-// until its process is stopped (the caller turns that into a graceful host
-// shutdown), so this owns socket-file cleanup.
+// Standalone headless daemon (the `--daemon --socket` debug host). No TUI, so it
+// logs freely. A controller's Quit no longer ends the session (it's a detach); the
+// daemon runs until its process is stopped (the caller turns that into a graceful
+// host shutdown), so this owns socket-file cleanup.
 pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHandle) -> Result<()> {
     eprintln!("[daemon] listening on {}", path.display());
-    serve(&listener, &broker, ServeMode::Standalone).await;
+    serve(&listener, &broker).await;
     // The listener doesn't unlink the socket file on drop; do it so the next
     // daemon binds cleanly.
     let _ = std::fs::remove_file(&path);
@@ -134,29 +104,45 @@ pub async fn run_relay_daemon(
     broker: BrokerHandle,
 ) -> Result<()> {
     eprintln!("[daemon] hosting over relay at {relay_url}");
-    relay_dial_loop(relay_url, cipher, broker, true).await;
+    relay_dial_loop(relay_url, cipher, broker, None).await;
     Ok(())
 }
 
-// Co-located relay handoff: spawned on a normal in-process session's first
-// /background when --relay is armed (the relay counterpart of `serve_handoff`).
-// Runs SILENTLY — it shares the process with the local TUI, so any stderr write
-// would corrupt the alternate screen. Connection status is invisible by design;
-// the phone's own UI shows it. The session is never ended by this loop — only by
-// the local owner quitting (which tears the process down).
-pub async fn serve_relay_handoff(relay_url: String, cipher: Cipher, broker: BrokerHandle) {
-    relay_dial_loop(relay_url, cipher, broker, false).await;
+// Co-located relay handoff: spawned on a normal in-process session's /background to
+// arm phone pairing. It shares the process with the local TUI, so it never writes
+// stderr — instead it reports progress over `status`, which the TUI renders on the
+// background pair screen. The session is never ended by this loop, only by the local
+// owner quitting (which tears the process down).
+pub async fn serve_relay_handoff(
+    relay_url: String,
+    cipher: Cipher,
+    broker: BrokerHandle,
+    status: mpsc::Sender<HandoffStatus>,
+) {
+    relay_dial_loop(relay_url, cipher, broker, Some(status)).await;
 }
 
 // Dial OUT to the relay (the only direction that crosses NAT), pair with a
 // controller, and bridge it to the broker; re-dial when the controller leaves so
-// the next one can attach. `log` is off when co-located with a TUI (silent) and on
-// for the standalone --daemon. Ends only when the broker is gone (host shutdown); a
-// local force-takeover keeps it dialing so a device can attach again after reclaim.
-async fn relay_dial_loop(relay_url: String, cipher: Cipher, broker: BrokerHandle, log: bool) {
+// the next one can attach. `status` distinguishes the two callers: `None` is the
+// standalone `--daemon` (logs to stderr, retries forever on an unreachable relay);
+// `Some(tx)` is the co-located in-process handoff (silent, reports progress to the
+// TUI, and does NOT retry a failed dial — the user re-/background to try again).
+async fn relay_dial_loop(
+    relay_url: String,
+    cipher: Cipher,
+    broker: BrokerHandle,
+    status: Option<mpsc::Sender<HandoffStatus>>,
+) {
     loop {
+        if let Some(s) = &status {
+            let _ = s.send(HandoffStatus::Connecting).await;
+        }
         match connect_async(relay_url.as_str()).await {
             Ok((ws, _resp)) => {
+                if let Some(s) = &status {
+                    let _ = s.send(HandoffStatus::Connected).await;
+                }
                 let (sink, stream) = ws.split();
                 let reader = WsReader::new(stream, cipher.clone());
                 let writer = WsWriter::new(sink, cipher.clone());
@@ -175,24 +161,22 @@ async fn relay_dial_loop(relay_url: String, cipher: Cipher, broker: BrokerHandle
                     }
                 }
             }
-            // Relay unreachable (down / restarting): the session stays alive
-            // headless; back off and retry rather than spinning on the dial.
-            Err(e) => {
-                if log {
-                    eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
+            Err(e) => match &status {
+                // Co-located: surface the failure to the TUI and stop. Handoff is
+                // unavailable until the next /background fires a fresh dial.
+                Some(s) => {
+                    let _ = s.send(HandoffStatus::Failed(format!("{e}"))).await;
+                    break;
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+                // Standalone daemon: the session stays alive headless; back off and
+                // retry rather than spinning on the dial.
+                None => {
+                    eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            },
         }
     }
-}
-
-// Co-located handoff accept loop (spawned on the local TUI's first /background).
-// Runs SILENTLY (shares the process with the local TUI) and a guest Quit is only a
-// detach — the launching process owns the session lifecycle and the socket file,
-// so this neither ends the session on a guest Quit nor cleans up the socket.
-pub async fn serve_handoff(listener: UnixListener, broker: BrokerHandle) {
-    serve(&listener, &broker, ServeMode::CoLocated).await;
 }
 
 async fn handle_conn<R, W>(mut reader: R, mut writer: W, broker: &BrokerHandle) -> ConnOutcome
