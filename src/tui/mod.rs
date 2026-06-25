@@ -746,7 +746,7 @@ impl App {
                             } else {
                                 Style::default().fg(Color::DarkGray)
                             };
-                            if self.expanded {
+                            if self.expanded || tools::always_expand(name) {
                                 emit_expanded_result(&mut out, &outcome.content, elbow_style);
                             } else {
                                 // Errors are always previewed — the message is
