@@ -118,6 +118,14 @@ pub fn preview_output(name: &str) -> bool {
     !matches!(name, "Read" | "Grep" | "Glob")
 }
 
+// Whether the tool's result should always render fully expanded, ignoring the
+// global collapse toggle (Ctrl-O). TodoWrite's output *is* the surfaced plan —
+// the whole point is for the user to see it — and the list is short, so it
+// should never hide behind the collapsed line-count view.
+pub fn always_expand(name: &str) -> bool {
+    matches!(name, "TodoWrite")
+}
+
 // Display-side path shortening: the schemas require absolute paths, but in
 // collapsed headers an absolute path makes every entry start with the same
 // long cwd prefix — and right-truncation then cuts off exactly the part
