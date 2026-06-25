@@ -2,6 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
 
 use crate::core::{AgentConfig, Backend, SessionHandle};
 
@@ -27,6 +30,9 @@ pub const MODELS: &[(&str, &str)] = &[
 const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const MAX_TOKENS: u32 = 16384;
 const MAX_ITERATIONS: usize = 25;
+// Buffer for relay-dial status updates flowing from the handoff task to the TUI.
+// A handful of state flips at a time; the TUI drains it in its select loop.
+const HANDOFF_STATUS_CAP: usize = 8;
 /// Thinking display mode.
 #[derive(Clone, ValueEnum)]
 enum Thinking {
@@ -49,9 +55,11 @@ impl Thinking {
 
 /// A Claude-Code-style coding agent for your terminal.
 ///
-/// With no mode flag it runs an interactive TUI in-process. `--daemon` hosts the
-/// session headless (a `--connect` client drives it), over a Unix socket by
-/// default or a relay with `--relay`.
+/// With no mode flag it runs an interactive TUI in-process; /background then dials
+/// the relay from $NUDGE_RELAY and shows a QR for a phone to attach. `--daemon` hosts
+/// the session headless over that relay (a `--connect --pair-code` client attaches).
+/// `--daemon --socket` / `--connect --socket` host / attach over a local Unix socket
+/// instead — kept for debugging the transport without a relay.
 #[derive(Parser)]
 #[command(name = "nudge", version)]
 struct Cli {
@@ -67,38 +75,27 @@ struct Cli {
     #[arg(long)]
     print_prompt: bool,
 
-    /// Host the session headless behind a socket; clients attach with --connect.
+    /// Host the session headless; clients attach with --connect. Uses $NUDGE_RELAY,
+    /// or a local Unix socket when --socket is given.
     #[arg(long, group = "run_mode")]
     daemon: bool,
 
-    /// Attach a TUI to a running --daemon instead of starting a local session.
+    /// Attach a TUI to a running --daemon (with --pair-code, or --socket for a local one).
     #[arg(long, group = "run_mode")]
     connect: bool,
 
-    /// Socket path for --daemon / --connect (default: ~/.nudge/daemon.sock).
-    #[arg(long, value_name = "path", conflicts_with = "relay")]
+    /// Host / attach over a local Unix socket at this path instead of the relay
+    /// (debugging: exercise the transport without a relay).
+    #[arg(long, value_name = "path")]
     socket: Option<PathBuf>,
 
-    /// Relay over a WebSocket (E2E encrypted). In normal mode it arms remote
-    /// pairing — /background then shows a QR for a phone to scan. With --daemon /
-    /// --connect it hosts / attaches over the relay (pass --pair or --key).
-    #[arg(long, value_name = "ws-url")]
-    relay: Option<String>,
-
-    /// Pre-shared E2E key file for the relay path; load the same key on both ends.
-    #[arg(long, value_name = "path")]
-    key: Option<PathBuf>,
-
-    /// Write a fresh relay key to --key <path> and exit.
-    #[arg(long, requires = "key", conflicts_with_all = ["daemon", "connect", "relay", "socket"])]
-    gen_key: bool,
-
-    /// (--daemon --relay <base-url>) Mint a fresh room + E2E key and show a QR to pair a device.
-    #[arg(long, requires = "relay", conflicts_with = "connect")]
-    pair: bool,
-
-    /// (--connect) Attach using a pairing code scanned from the daemon's QR; self-contained.
-    #[arg(long, value_name = "code", requires = "connect", conflicts_with_all = ["relay", "socket", "key"])]
+    /// (--connect) Attach using a pairing code scanned from the host's QR; self-contained.
+    #[arg(
+        long,
+        value_name = "code",
+        requires = "connect",
+        conflicts_with = "socket"
+    )]
     pair_code: Option<String>,
 }
 
@@ -107,19 +104,6 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-
-    // --gen-key is a standalone action: write a fresh relay key and exit, touching
-    // no session and needing no API key. (clap guarantees --key is present.) Pair
-    // both devices off this one file (8.3 replaces it with QR-derived keys).
-    if cli.gen_key {
-        let path = cli.key.expect("clap enforces --gen-key requires --key");
-        transport::Cipher::generate().save(&path)?;
-        println!(
-            "Wrote a new relay key to {} — keep it secret; load the same file on both ends.",
-            path.display()
-        );
-        return Ok(());
-    }
 
     // --connect owns no session: it just attaches a TUI to a running daemon, so it
     // needs neither an API key nor any of the session setup below.
@@ -198,33 +182,33 @@ async fn main() -> Result<()> {
     let mut host =
         core::SessionHost::spawn(cfg, provider, backend, session, initial_messages, seed);
 
-    // Headless daemon vs local in-process TUI (--connect returned earlier). Over the
-    // relay the daemon dials OUT (--relay); otherwise it binds a local Unix socket.
-    // Either way it runs until a controller quits the session, then shuts down.
+    // The relay base URL for phone handoff (and the relay daemon). Optional: a plain
+    // local session without it still runs and backgrounds — just no phone handoff.
+    let relay = env::var("NUDGE_RELAY").ok();
+
+    // Headless daemon vs local in-process TUI (--connect returned earlier). The
+    // daemon dials OUT to the relay by default, or binds a local Unix socket with
+    // --socket. Either way it runs until an explicit signal, then shuts down.
     if cli.daemon {
         let broker = host.broker_handle();
         // The long-running daemon. A controller quitting/leaving never ends it, so
         // the only way out is an explicit process signal — we race the two and, on a
         // signal, fall through to a graceful host shutdown below.
         let run = async move {
-            match cli.relay {
-                Some(base) => {
-                    // --pair mints a fresh room + key and prints a QR for a device to
-                    // scan; otherwise the relay path is keyed by an explicit --key file.
-                    let (url, cipher) = if cli.pair {
-                        let pairing = transport::Pairing::generate(base);
-                        print_pairing(&pairing)?;
-                        (pairing.dial_url(), pairing.cipher)
-                    } else {
-                        (base, require_relay_key(cli.key)?)
-                    };
-                    transport::run_relay_daemon(url, cipher, broker).await
-                }
-                None => {
-                    let path = resolve_socket_path(cli.socket)?;
-                    let listener = transport::bind_listener(&path)?;
-                    transport::run_daemon(listener, path, broker).await
-                }
+            if let Some(path) = cli.socket {
+                // Local debug daemon: bind a Unix socket; clients attach with
+                // --connect --socket <path>.
+                let listener = transport::bind_listener(&path)?;
+                transport::run_daemon(listener, path, broker).await
+            } else {
+                // Relay daemon: mint a fresh room + key, print a QR to pair a device,
+                // and dial OUT to the relay (the only direction that crosses NAT).
+                let base = relay.context(
+                    "set NUDGE_RELAY to host over a relay, or pass --socket <path> for a local debug daemon",
+                )?;
+                let pairing = transport::Pairing::generate(base);
+                print_pairing(&pairing)?;
+                transport::run_relay_daemon(pairing.dial_url(), pairing.cipher, broker).await
             }
         };
         let daemon_result = tokio::select! {
@@ -239,14 +223,11 @@ async fn main() -> Result<()> {
     } else {
         // Local TUI driving the loop in-process. The TUI holds `&host` so it can
         // re-attach after /background; it owns the initial foreground controller.
-        // The first /background fires the handoff hook (lazy, once). Wiring it here
-        // (not in `core`) keeps `core` below the transport layer. The hook's
-        // transport is chosen by whether --relay is armed — never both, so the
-        // background action is unambiguous:
-        //   --relay: dial OUT to the relay so a phone attaches; the QR is shown in
-        //            the TUI's pair screen. No local socket bound.
-        //   else:    bind a local Unix socket so another terminal can take over.
-        let handoff_socket = if let Some(base) = cli.relay {
+        // When NUDGE_RELAY is set, /background fires the handoff hook to dial the
+        // relay (lazy) so a phone can attach; wiring it here (not in `core`) keeps
+        // `core` below the transport layer. The dial reports progress to the TUI over
+        // `status_rx`. With no relay configured, /background just pauses in place.
+        let handoff_rx = if let Some(base) = relay {
             // Regenerate the pairing each launch (no persistence): the device
             // re-scans after a restart. The QR/code go to the TUI, which surfaces
             // them on /background; the dial-out only opens once backgrounded.
@@ -255,43 +236,38 @@ async fn main() -> Result<()> {
             ui_cfg.pairing_code = Some(pairing.encode());
             let dial_url = pairing.dial_url();
             let cipher = pairing.cipher;
-            let handoff = host.broker_handle();
+            let broker = host.broker_handle();
+            let (status_tx, status_rx) = mpsc::channel::<core::HandoffStatus>(HANDOFF_STATUS_CAP);
+            // Dedupe re-dials: while one dial is live this is a no-op, so re-entering
+            // /background does nothing; once a failed dial clears it, the next
+            // /background fires a fresh one (the user's way to retry).
+            let dialing = Arc::new(AtomicBool::new(false));
             host.set_handoff_hook(move || {
-                tokio::spawn(transport::serve_relay_handoff(
-                    dial_url.clone(),
-                    cipher.clone(),
-                    handoff.clone(),
-                ));
-            });
-            None
-        } else {
-            let path = resolve_socket_path(cli.socket)?;
-            let handoff = host.broker_handle();
-            let handoff_path = path.clone();
-            host.set_handoff_hook(move || match transport::bind_listener(&handoff_path) {
-                Ok(listener) => {
-                    handoff.notice(format!(
-                        "Session handoff enabled — attach from another client with: nudge --connect --socket {}",
-                        handoff_path.display()
-                    ));
-                    tokio::spawn(transport::serve_handoff(listener, handoff.clone()));
+                if dialing.swap(true, Ordering::SeqCst) {
+                    return;
                 }
-                Err(e) => handoff.notice(format!("Handoff unavailable: {e:#}")),
+                let dialing = dialing.clone();
+                let dial_url = dial_url.clone();
+                let cipher = cipher.clone();
+                let broker = broker.clone();
+                let status_tx = status_tx.clone();
+                tokio::spawn(async move {
+                    transport::serve_relay_handoff(dial_url, cipher, broker, status_tx).await;
+                    dialing.store(false, Ordering::SeqCst);
+                });
             });
-            Some(path)
+            Some(status_rx)
+        } else {
+            None
         };
 
         let controller = host
             .attach()
             .await
             .expect("initial attach on a fresh session cannot be busy");
-        let tui_result = tui::run(&host, ui_cfg, controller).await;
+        let tui_result = tui::run(&host, ui_cfg, controller, handoff_rx).await;
         // TUI exited → end the session explicitly (loop outlives the front-end).
         let _ = host.shutdown().await;
-        // Remove the handoff socket if one was bound (the relay path binds none).
-        if let Some(path) = handoff_socket {
-            let _ = std::fs::remove_file(&path);
-        }
         tui_result
     }
 }
@@ -319,24 +295,16 @@ async fn run_connect(cli: Cli) -> Result<()> {
     // (no daemon / relay unreachable); `None` = up but the session is held elsewhere.
     if let Some(code) = cli.pair_code {
         // A scanned pairing code is self-contained: it carries the relay URL, room
-        // id, and E2E key, so it needs neither --relay nor --key.
+        // id, and E2E key, so it needs no other flags.
         let pairing = transport::Pairing::decode(&code)?;
         let client = transport::RelayClient::new(pairing.dial_url(), pairing.cipher);
         let controller = match client.connect(None).await? {
             Some(c) => c,
             None => bail!("could not attach: the relay session is held by another client"),
         };
-        tui::run(&client, ui_cfg, controller).await
-    } else if let Some(url) = cli.relay {
-        let cipher = require_relay_key(cli.key)?;
-        let client = transport::RelayClient::new(url, cipher);
-        let controller = match client.connect(None).await? {
-            Some(c) => c,
-            None => bail!("could not attach: the relay session is held by another client"),
-        };
-        tui::run(&client, ui_cfg, controller).await
-    } else {
-        let path = resolve_socket_path(cli.socket)?;
+        tui::run(&client, ui_cfg, controller, None).await
+    } else if let Some(path) = cli.socket {
+        // Local debug daemon over a Unix socket (--daemon --socket on the other end).
         let client = transport::SocketClient::new(path);
         let controller = match client.connect(None).await? {
             Some(c) => c,
@@ -344,31 +312,10 @@ async fn run_connect(cli: Cli) -> Result<()> {
                 bail!("could not attach: the daemon is busy (another client holds the session)")
             }
         };
-        tui::run(&client, ui_cfg, controller).await
+        tui::run(&client, ui_cfg, controller, None).await
+    } else {
+        bail!("--connect needs --pair-code <code> (relay) or --socket <path> (local debug daemon)")
     }
-}
-
-// Resolve the daemon socket path: an explicit --socket wins, else a fixed default
-// under ~/.nudge/ (whose parent is created if absent). One default path
-// means one daemon per user; run multiple with distinct --socket values.
-fn resolve_socket_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(p);
-    }
-    let home = env::var("HOME").context("HOME env var not set")?;
-    let dir = PathBuf::from(home).join(".nudge");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir.join("daemon.sock"))
-}
-
-// Load the relay's pre-shared E2E key. Used on the --relay path when --pair is not
-// given: the relayed path is always encrypted (only the trusted local socket runs
-// plaintext), so a missing key is a hard error with a how-to-fix hint.
-fn require_relay_key(key_path: Option<PathBuf>) -> Result<transport::Cipher> {
-    let path = key_path.context(
-        "--relay needs either --pair (generate a code) or --key <path> (create one with: nudge --gen-key --key <path>)",
-    )?;
-    transport::Cipher::load(&path)
 }
 
 // Resolve when the process is asked to stop (Ctrl-C or SIGTERM). A daemon is ended

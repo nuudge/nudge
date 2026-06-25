@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -18,6 +17,20 @@ const CHANNEL_CAPACITY: usize = 64;
 pub struct Controller {
     pub events: mpsc::Receiver<ControllerEvent>,
     pub ui_tx: mpsc::Sender<UiEvent>,
+}
+
+// Progress of the co-located relay dial that arms phone handoff on /background.
+// Produced by the dial task (wired in the composition root, so `core` still names
+// no transport) and consumed by the TUI to render the background pair screen.
+#[derive(Clone, Debug)]
+pub enum HandoffStatus {
+    // Dialing the relay; the QR isn't useful yet.
+    Connecting,
+    // On the relay, waiting for a device — the QR is now scannable.
+    Connected,
+    // The dial failed (relay unset/unreachable); handoff is unavailable until the
+    // next /background retries. Carries a short reason for the screen.
+    Failed(String),
 }
 
 // A handle to a running session, abstracted over the transport the front-end
@@ -66,12 +79,6 @@ enum HostCommand {
     },
     // Detach the current front-end without ending the session (pause-in-place).
     Detach,
-    // Inject a system Notice into the transcript: buffered (so later attaches
-    // replay it) and forwarded to the current front-end. Used to surface
-    // out-of-band status — e.g. that local handoff is now enabled.
-    Notice {
-        text: String,
-    },
     // End the session: the broker forwards a final UiEvent::Quit to the loop.
     Quit,
 }
@@ -85,13 +92,14 @@ pub struct SessionHost {
     agent_task: JoinHandle<Result<()>>,
     broker_task: JoinHandle<()>,
     ctl_tx: mpsc::UnboundedSender<HostCommand>,
-    // Fired once, on the first detach (the first /background), to enable local
-    // handoff: bind a socket listener so another front-end can take over. The
-    // composition root injects it (see `set_handoff_hook`) so this module never
-    // names the socket transport — `core` stays a layer below `transport`. `None`
-    // in headless/daemon and remote modes, where there's nothing to hand off.
+    // Fired on every detach (every /background) to arm handoff: dial the relay so
+    // a phone can attach. The composition root injects it (see `set_handoff_hook`)
+    // so this module never names the transport — `core` stays a layer below
+    // `transport`. The hook itself guards against re-dialing while one is already
+    // live, so firing it each time just lets a failed dial be retried by
+    // backgrounding again. `None` when no relay is configured (nothing to arm) and
+    // in headless/daemon and remote modes.
     handoff_hook: Option<Box<dyn Fn() + Send + Sync>>,
-    detached_once: AtomicBool,
 }
 
 impl SessionHost {
@@ -136,7 +144,6 @@ impl SessionHost {
             broker_task,
             ctl_tx,
             handoff_hook: None,
-            detached_once: AtomicBool::new(false),
         }
     }
 
@@ -149,10 +156,11 @@ impl SessionHost {
         }
     }
 
-    // Install the enabler fired once on the first `detach` (first /background).
-    // Supplied by the composition root so `core` carries no socket/transport
-    // knowledge; in practice it binds the handoff listener and spawns its accept
-    // loop. Not set in daemon (already listening) or remote (`SocketClient`) modes.
+    // Install the enabler fired on every `detach` (every /background). Supplied by
+    // the composition root so `core` carries no transport knowledge; in practice it
+    // dials the relay so a phone can attach. The hook dedupes its own re-dialing, so
+    // firing each time just retries after a failed dial. Not set when no relay is
+    // configured, nor in daemon / remote (`SocketClient`) modes.
     pub fn set_handoff_hook(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.handoff_hook = Some(Box::new(hook));
     }
@@ -180,12 +188,10 @@ impl SessionHandle for SessionHost {
     }
 
     fn detach(&self) {
-        // The first /background enables handoff: fire the injected hook once (it
-        // binds the listener + spawns the accept loop). Kept thereafter — no
-        // unbind on foreground, so a later /background is a plain detach.
-        if !self.detached_once.swap(true, Ordering::SeqCst)
-            && let Some(hook) = &self.handoff_hook
-        {
+        // Each /background arms handoff by firing the injected hook (it dials the
+        // relay). The hook no-ops while a dial is already live, so firing every time
+        // just lets a failed dial be retried by backgrounding again.
+        if let Some(hook) = &self.handoff_hook {
             hook();
         }
         self.broker_handle().detach();
@@ -203,15 +209,9 @@ pub struct BrokerHandle {
 }
 
 impl BrokerHandle {
-    // Inject a system Notice into the transcript (buffered + forwarded to the
-    // attached front-end). Used to surface out-of-band status such as handoff.
-    pub fn notice(&self, text: String) {
-        let _ = self.ctl_tx.send(HostCommand::Notice { text });
-    }
-
     // Whether the broker task is still running (its receiver hasn't dropped). The
-    // co-located serve loops use this to tell a force-takeover (broker alive — keep
-    // serving so control can hand back) from a host shutdown (broker gone — stop).
+    // relay dial loop uses this to tell a force-takeover (broker alive — keep dialing
+    // so a device can attach again) from a host shutdown (broker gone — stop).
     pub fn is_alive(&self) -> bool {
         !self.ctl_tx.is_closed()
     }
@@ -385,13 +385,6 @@ async fn broker(
                     Some(HostCommand::Detach) => attached = None,
                     // Buffer + forward a system Notice, exactly like a translated
                     // loop Notice, so it survives into later attach-replays.
-                    Some(HostCommand::Notice { text }) => {
-                        let ev = ControllerEvent::Notice { text };
-                        buffer.push(ev.clone());
-                        if let Some(c) = attached.as_ref() {
-                            let _ = c.event_tx.send(ev).await;
-                        }
-                    }
                     Some(HostCommand::Quit) | None => {
                         let _ = loop_ui_tx.send(UiEvent::Quit).await;
                         return;

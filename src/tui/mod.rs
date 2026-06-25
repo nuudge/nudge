@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
 use crate::coding::tools;
-use crate::core::{Controller, ControllerEvent, SessionHandle, UiEvent};
+use crate::core::{Controller, ControllerEvent, HandoffStatus, SessionHandle, UiEvent};
 
 mod markdown;
 
@@ -117,11 +117,15 @@ struct App {
     // A requested mode change, set by handlers and executed by the run loop
     // (which owns the SessionHost handle needed to attach/detach).
     pending_transition: Option<Mode>,
-    // The scannable pairing QR + paste-able code, present only with --relay armed.
-    // When set, /background renders the QR in-screen above the banner so a phone
-    // can attach; when None, /background is the plain frozen banner.
+    // The scannable pairing QR + paste-able code, present only when NUDGE_RELAY is
+    // set (the owner TUI). When set, /background renders the QR in-screen above the
+    // banner so a phone can attach; when None, /background is the plain frozen banner.
     pairing_qr: Option<String>,
     pairing_code: Option<String>,
+    // Progress of the relay dial that arms phone handoff, streamed from the dial task
+    // on /background. `None` until the first update arrives (rendered as "connecting").
+    // Only meaningful for the owner TUI with a relay configured.
+    handoff_status: Option<HandoffStatus>,
     // True for the in-process owner TUI (hosts the agent loop; can force-reclaim a
     // session a guest holds; quitting ends it). False for a `--connect` guest
     // (local socket or remote relay). Drives a header badge + the foreground
@@ -172,6 +176,7 @@ impl App {
             pending_transition: None,
             pairing_qr: cfg.pairing_qr,
             pairing_code: cfg.pairing_code,
+            handoff_status: None,
             is_owner: cfg.is_owner,
             quit: false,
         }
@@ -846,6 +851,46 @@ impl App {
         out
     }
 
+    // The non-QR background panel: shown while detached when there's no scannable QR
+    // to display — the relay is still dialing or failed, no relay is configured, or
+    // this is a guest. Mirrors the four background states the layout sizes for.
+    fn background_banner_body(&self) -> Vec<Line<'static>> {
+        let hint = Line::from(Span::styled(
+            "Enter = foreground · Ctrl-C = quit",
+            Style::default().fg(Color::Yellow),
+        ));
+        if self.pairing_qr.is_some() {
+            // Owner with a relay configured: report the dial's progress.
+            let msg = match &self.handoff_status {
+                Some(HandoffStatus::Failed(e)) => Line::from(Span::styled(
+                    format!("relay unreachable — phone handoff unavailable ({e})"),
+                    Style::default().fg(Color::Red),
+                )),
+                // Connecting, or no update yet. (Connected renders the QR panel, not this.)
+                _ => Line::from(Span::styled(
+                    "connecting to relay…",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            };
+            vec![msg, hint]
+        } else if self.is_owner {
+            // Owner without a relay: backgrounding still pauses, but no phone handoff.
+            vec![
+                Line::from(Span::styled(
+                    "backgrounded — phone handoff off (set NUDGE_RELAY to enable it)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                hint,
+            ]
+        } else {
+            // A --connect guest: detaching just pauses the local view.
+            vec![Line::from(Span::styled(
+                "⏸  backgrounded — Enter to foreground · Ctrl-C to quit",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        }
+    }
+
     fn render(&mut self, f: &mut ratatui::Frame) {
         // Dynamic input height — grow up to MAX_INPUT_LINES display rows, then
         // scroll inside the input box. Rows are counted post-wrap (a long line
@@ -860,11 +905,14 @@ impl App {
         let input_height = (visible_input_lines as u16) + 2;
         let input_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES) as u16;
 
-        // On /background with --relay armed, the bottom area becomes a pair panel
-        // (QR + code + hint) instead of the input box, sized to fit the QR. The
-        // conversation log stays above it (Min(0) — it just shrinks), so context is
-        // kept rather than blown away by a full-screen takeover.
-        let show_qr = self.mode == Mode::Background && self.pairing_qr.is_some();
+        // Once the relay dial connects, /background swaps the input box for a pair
+        // panel (QR + code + hint), sized to fit the QR. The conversation log stays
+        // above it (Min(0) — it just shrinks), so context is kept rather than blown
+        // away by a full-screen takeover. Before connect / on failure / with no relay,
+        // a short banner takes its place instead (see background_banner_body).
+        let show_qr = self.mode == Mode::Background
+            && self.pairing_qr.is_some()
+            && matches!(self.handoff_status, Some(HandoffStatus::Connected));
         let (log_constraint, bottom_height) = if show_qr {
             let qr_rows = self
                 .pairing_qr
@@ -880,6 +928,9 @@ impl App {
             // the top of the panel, so if the terminal is too short the hint/code
             // clip first and the QR stays scannable.
             (Constraint::Min(0), (qr_rows + code_rows + 5) as u16)
+        } else if self.mode == Mode::Background {
+            // Short banner: a message line + the foreground/quit hint, inside borders.
+            (Constraint::Min(3), 4)
         } else {
             (Constraint::Min(3), input_height)
         };
@@ -997,13 +1048,11 @@ impl App {
             );
             f.render_widget(panel, input_area);
         } else if self.mode == Mode::Background {
-            // Frozen banner instead of the input box; the log above stays as it
-            // was at detach (no live updates while detached). No cursor.
-            let banner = Paragraph::new(
-                "⏸  backgrounded — agent running headless · Enter to foreground · Ctrl-C to quit",
-            )
-            .style(Style::default().fg(Color::Yellow))
-            .block(Block::default().borders(Borders::ALL).title("paused"));
+            // No QR to show yet (dialing / failed / no relay / guest): a short banner
+            // replaces the input box; the log above stays frozen as at detach.
+            let banner = Paragraph::new(self.background_banner_body())
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title("paused"));
             f.render_widget(banner, input_area);
         } else {
             // Pre-wrapped into display rows (see wrap_input), so the Paragraph
@@ -1361,9 +1410,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-pub async fn run<H: SessionHandle>(host: &H, cfg: UiConfig, initial: Controller) -> Result<()> {
+pub async fn run<H: SessionHandle>(
+    host: &H,
+    cfg: UiConfig,
+    initial: Controller,
+    handoff_rx: Option<mpsc::Receiver<HandoffStatus>>,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, host, cfg, initial).await;
+    let result = run_loop(&mut terminal, host, cfg, initial, handoff_rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -1380,11 +1434,21 @@ async fn recv_events(
     }
 }
 
+// Same shape as `recv_events` for the relay-dial status stream: never resolves when
+// there's no relay configured (the `None` arm), so the `select!` branch is inert.
+async fn recv_handoff(rx: &mut Option<mpsc::Receiver<HandoffStatus>>) -> Option<HandoffStatus> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn run_loop<H: SessionHandle>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     host: &H,
     cfg: UiConfig,
     initial: Controller,
+    mut handoff_rx: Option<mpsc::Receiver<HandoffStatus>>,
 ) -> Result<()> {
     let mut app = App::new(cfg);
     // No front-end-side transcript replay: the host seeds its buffer with the
@@ -1423,6 +1487,18 @@ async fn run_loop<H: SessionHandle>(
                         }
                     }
                     None => break, // foreground stream closed (loop/session ended)
+                }
+            }
+            maybe_status = recv_handoff(&mut handoff_rx) => {
+                match maybe_status {
+                    // The dial task reports its progress; the background screen shows it.
+                    Some(status) => app.handoff_status = Some(status),
+                    // All senders dropped (shouldn't happen while the host lives): stop
+                    // polling so the branch doesn't spin on a closed channel.
+                    None => {
+                        handoff_rx = None;
+                        redraw = false;
+                    }
                 }
             }
             maybe_input = input_stream.next() => {

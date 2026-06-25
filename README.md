@@ -35,7 +35,7 @@ The app speaks a small framed protocol shared — as a pure-JVM kit (`android/pr
 - **Permission gating** — shell-executing and file-mutating tools prompt before running; read-only tools auto-allow. For `Bash`, the model must state an *intent* ("count lines in all Rust files") shown as the action label, while the permission prompt always shows the raw command — you approve what runs, not the label.
 - **MCP client** — connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers declared in a project-local `.mcp.json`. Their tools are discovered at startup and merged into the model's tool list (namespaced `server__tool`), indistinguishable from built-ins. Permission follows each tool's `readOnlyHint` annotation — read-only tools auto-allow, the rest prompt. Both local **stdio** subprocesses and remote **Streamable HTTP** servers are supported, the latter with static-token, OAuth (dynamic registration), or OAuth (pre-registered client) auth. Servers load in three layers — always-on foundational tools, always-on user servers from `.mcp.json`, and a built-in **dormant** catalog the user loads/unloads mid-session (`/mcp load <name>`) to keep the default context lean.
 - **Sessions** — every conversation is appended to a JSONL log under `~/.nudge/projects/<flattened-cwd>/<uuid>.jsonl`; `--resume <id>` restores it, with strict truncation of any incomplete trailing turn.
-- **Detachable, multi-process sessions** — the agent loop is decoupled from the UI, so a session outlives its front-end. `/background` detaches the TUI while the agent keeps working; reattach later and the full history replays. A session can also run headless behind a local socket (`--daemon`) and be driven from another terminal (`--connect`).
+- **Detachable sessions + phone handoff** — the agent loop is decoupled from the UI, so a session outlives its front-end. `/background` detaches the TUI while the agent keeps working; reattach later and the full history replays. With `NUDGE_RELAY` set, `/background` also dials an end-to-end-encrypted relay and shows a pairing QR, so you can take over the live session from your phone (or from any other terminal running `nudge --connect --pair-code`). A session can also run fully headless (`--daemon`).
 - **Prompt caching** — layered `cache_control` breakpoints on the system prompt plus a floating breakpoint that walks forward along the chat history. At ~100-message depth this cuts billed input ~7× and shortens time-to-first-token accordingly.
 - **Adaptive thinking** — the model decides when to reason; `--thinking omitted` hides the reasoning text for faster first tokens at the same cost.
 
@@ -180,20 +180,26 @@ OPTIONS:
     --resume <id>        Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl
                          (the id is shown in the TUI title bar)
     --thinking <mode>    Thinking display: summarized (default) or omitted
-    --daemon             Run the session headless behind a local Unix socket (no
-                         TUI); attach to it from another terminal with --connect
-    --connect            Attach a TUI to a running --daemon (or a backgrounded
-                         session) over its socket
-    --socket <path>      Socket path for --daemon / --connect
-                         (default: ~/.nudge/daemon.sock)
+    --daemon             Run the session headless (no TUI); hosts over $NUDGE_RELAY,
+                         or a local Unix socket with --socket
+    --connect            Attach a TUI to a running --daemon (with --pair-code, or
+                         --socket for a local one)
+    --pair-code <code>   (--connect) Attach using a pairing code from the host's QR
+    --socket <path>      Host/attach over a local Unix socket instead of the relay
+                         (for debugging the transport without a relay)
     -h, --help           Show help
 ```
 
-### Detaching and multi-process
+Set `NUDGE_RELAY` (e.g. in `.env`) to a relay WebSocket URL to enable phone handoff:
+`NUDGE_RELAY=wss://relay.example.com`.
 
-The session outlives its front-end. Inside the TUI, `/background` detaches it — the agent keeps running and buffering output — and pressing `Enter` reattaches, replaying the full history. While a session is backgrounded, another terminal can take over the *live* session with `nudge --connect`.
+### Detaching and phone handoff
 
-You can also start a session with no TUI at all: `nudge --daemon` hosts it headless behind a local socket, and `nudge --connect` attaches a TUI to it from elsewhere on the same machine. Both ends meet over a Unix socket (default `~/.nudge/daemon.sock`; override with `--socket`). For now a backgrounded or daemon session lives only as long as its launching process — surviving a closed terminal is planned.
+The session outlives its front-end. Inside the TUI, `/background` detaches it — the agent keeps running and buffering output — and pressing `Enter` reattaches, replaying the full history.
+
+When `NUDGE_RELAY` is set, `/background` dials the relay and shows a pairing QR; scan it (or paste the code into `nudge --connect --pair-code <code>`) to drive the *live* session from your phone or another machine. If no relay is configured, `/background` still pauses the session — it just shows no QR.
+
+You can also start a session with no TUI at all: `nudge --daemon` hosts it headless over the relay, and `nudge --connect --pair-code <code>` attaches a front-end. For debugging the transport without a relay, `--daemon --socket <path>` and `--connect --socket <path>` host/attach over a local Unix socket instead. For now a backgrounded or daemon session lives only as long as its launching process — surviving a closed terminal is planned.
 
 ### TUI controls
 
