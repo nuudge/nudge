@@ -119,25 +119,34 @@ class FramesTest {
     fun sessionInfoDecodesAndRoundTrips() {
         // Exact bytes serde emits for ControllerEvent::SessionInfo (snake_case keys; the
         // header is the only consumer, so a drift here would break the phone silently).
-        val withBranch = WireJson.decodeFromString(
+        // A renamed session carries session_name; the header prefers it over the uuid.
+        val named = WireJson.decodeFromString(
             ServerFrame.serializer(),
-            """{"Event":{"seq":0,"event":{"SessionInfo":{"model":"claude-opus-4-8","cwd":"~/proj","git_branch":"main","session_id":"7f3a"}}}}""",
+            """{"Event":{"seq":0,"event":{"SessionInfo":{"model":"claude-opus-4-8","cwd":"~/proj","git_branch":"main","session_id":"7f3a","session_name":"auth-fix"}}}}""",
         )
         assertEquals(
-            ServerFrame.Event(0, ControllerEvent.SessionInfo("claude-opus-4-8", "~/proj", "main", "7f3a")),
-            withBranch,
+            ServerFrame.Event(0, ControllerEvent.SessionInfo("claude-opus-4-8", "~/proj", "main", "7f3a", "auth-fix")),
+            named,
         )
 
-        // git_branch is an Option<String> in Rust → null when the cwd isn't a git repo.
-        val noBranch = WireJson.decodeFromString(
+        // git_branch and session_name are Option<String> in Rust → null when absent (no
+        // git repo / never renamed). serde emits the keys as null, not omitted.
+        val bare = WireJson.decodeFromString(
+            ControllerEvent.serializer(),
+            """{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id","session_name":null}}""",
+        )
+        assertEquals(ControllerEvent.SessionInfo("m", "/tmp", null, "id", null), bare)
+
+        // A pre-field daemon (no session_name key) still decodes — the property defaults to null.
+        val legacy = WireJson.decodeFromString(
             ControllerEvent.serializer(),
             """{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id"}}""",
         )
-        assertEquals(ControllerEvent.SessionInfo("m", "/tmp", null, "id"), noBranch)
+        assertEquals(ControllerEvent.SessionInfo("m", "/tmp", null, "id", null), legacy)
 
         for (e in listOf(
-            ControllerEvent.SessionInfo("m", "/tmp", "dev", "id"),
-            ControllerEvent.SessionInfo("m", "/tmp", null, "id"),
+            ControllerEvent.SessionInfo("m", "/tmp", "dev", "id", "my-label"),
+            ControllerEvent.SessionInfo("m", "/tmp", null, "id", null),
         )) {
             val json = enc(ControllerEvent.serializer(), e)
             assertEquals(e, WireJson.decodeFromString(ControllerEvent.serializer(), json), "round-trip changed $e")

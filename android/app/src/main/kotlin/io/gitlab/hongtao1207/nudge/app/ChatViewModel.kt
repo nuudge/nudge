@@ -39,12 +39,14 @@ data class ChatLine(
 data class PendingPermission(val toolUseId: String, val toolName: String, val summary: String)
 
 // Static session context for the header, from the daemon's SessionInfo event (replayed
-// first on attach). gitBranch is null when the cwd isn't a git repo.
+// first on attach). gitBranch is null when the cwd isn't a git repo. sessionName is the
+// human label (null until renamed); the header shows it in place of the uuid.
 data class SessionContext(
     val model: String,
     val cwd: String,
     val gitBranch: String?,
     val sessionId: String,
+    val sessionName: String?,
 )
 
 data class ChatUiState(
@@ -282,7 +284,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 is ControllerEvent.SessionInfo -> _state.update {
                     it.copy(
-                        sessionInfo = SessionContext(event.model, event.cwd, event.gitBranch, event.sessionId),
+                        sessionInfo = SessionContext(
+                            event.model,
+                            event.cwd,
+                            event.gitBranch,
+                            event.sessionId,
+                            event.sessionName,
+                        ),
                     )
                 }
                 is ControllerEvent.Usage -> Unit // not surfaced in the UI yet
