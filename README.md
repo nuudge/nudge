@@ -27,19 +27,11 @@ Work anywhere. Any time. Never stop. Scan the QR code the agent prints and your 
 
 The app speaks a small framed protocol shared — as a pure-JVM kit (`android/protocol/`) — with the agent and the relay, so the wire format has a single source of truth.
 
-## Features
-
-- **Agentic loop** — the model plans, calls tools, observes results, and iterates until the task is done, bounded by an iteration budget that ends gracefully (the agent explains it hit the cap and asks how to proceed).
-- **Tool surface** — `Bash`, `Read`, `Edit` (modify + append modes), `CreateNew`, `Grep` (structured ripgrep), `Glob`, `TodoWrite`. Tool names and field shapes are wire-compatible with Claude Code where they overlap, so your muscle memory transfers — only the bill changes.
-- **TUI** (ratatui) — collapsed-by-default action display: each tool call is one compact group with a live status bullet (spinner → ok/error) and a one-line result row; `Ctrl-O` expands everything, including the model's thinking. Title bar shows session id, cwd, git branch, model, and platform.
-- **Permission gating** — shell-executing and file-mutating tools prompt before running; read-only tools auto-allow. For `Bash`, the model must state an *intent* ("count lines in all Rust files") shown as the action label, while the permission prompt always shows the raw command — you approve what runs, not the label.
-- **MCP client** — connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers declared in a project-local `.mcp.json`. Their tools are discovered at startup and merged into the model's tool list (namespaced `server__tool`), indistinguishable from built-ins. Permission follows each tool's `readOnlyHint` annotation — read-only tools auto-allow, the rest prompt. Both local **stdio** subprocesses and remote **Streamable HTTP** servers are supported, the latter with static-token, OAuth (dynamic registration), or OAuth (pre-registered client) auth. Servers load in three layers — always-on foundational tools, always-on user servers from `.mcp.json`, and a built-in **dormant** catalog the user loads/unloads mid-session (`/mcp load <name>`) to keep the default context lean.
-- **Sessions** — every conversation is appended to a JSONL log under `~/.nudge/projects/<flattened-cwd>/<uuid>.jsonl`; `--resume <id>` restores it, with strict truncation of any incomplete trailing turn.
-- **Detachable sessions + phone handoff** — the agent loop is decoupled from the UI, so a session outlives its front-end. `/background` detaches the TUI while the agent keeps working; reattach later and the full history replays. With `NUDGE_RELAY` set, `/background` also dials an end-to-end-encrypted relay and shows a pairing QR, so you can take over the live session from your phone (or from any other terminal running `nudge --connect --pair-code`). A session can also run fully headless (`--daemon`).
-- **Prompt caching** — layered `cache_control` breakpoints on the system prompt plus a floating breakpoint that walks forward along the chat history. At ~100-message depth this cuts billed input ~7× and shortens time-to-first-token accordingly.
-- **Adaptive thinking** — the model decides when to reason; `--thinking omitted` hides the reasoning text for faster first tokens at the same cost.
-
 ## Quick start
+
+nudge is three components: the **terminal agent** (the whole product on its own), an optional **relay** (the public meeting point that enables phone handoff and cross-machine attach), and the optional **Android app**. Build whichever you need — the agent stands alone.
+
+### The agent
 
 Requires Rust (edition 2024) and an Anthropic API key. The repo ships a `mise.toml` — if you use [mise](https://mise.jdx.dev), `mise install` pins the exact toolchain. Otherwise any recent stable Rust works.
 
@@ -50,9 +42,7 @@ echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
 cargo run
 ```
 
-### Install the binary
-
-`cargo install` builds an optimized `nudge` binary into `~/.cargo/bin` so you can run it from any directory:
+**Install the binary.** `cargo install` builds an optimized `nudge` binary into `~/.cargo/bin` so you can run it from any directory:
 
 ```bash
 cargo install --path .                 # from a local checkout
@@ -66,13 +56,120 @@ export ANTHROPIC_API_KEY=sk-ant-...
 nudge
 ```
 
-
 The agent operates in whatever directory you launch it from:
 
 ```bash
 cd /path/to/your/project
 cargo run --manifest-path /path/to/nudge/Cargo.toml
 ```
+
+### The relay (optional — enables phone handoff)
+
+Phone handoff and cross-machine attach route through a **relay**: a publicly reachable box both devices dial out to, so they meet even when both sit behind NAT. It's ciphertext-blind — every frame is end-to-end encrypted before it leaves your device, so the relay only ever forwards opaque bytes and could not read your session if it tried. You have two ways to get one:
+
+- **Use mine.** If you trust my relay box, point nudge at the relay I run — set it in `.env` or your shell:
+  ```bash
+  NUDGE_RELAY=wss://35.244.115.57.sslip.io
+  ```
+  The relay can't read your traffic, it's end-to-end encrypted. But you're still trusting my machine to be online and that I'm true to my words. For truly sensitive workloads, run your own.
+
+- **Run your own.** The relay is a separate workspace crate, so it builds without dragging in the agent's dependency tree:
+  ```bash
+  cargo build --release -p relay      # → target/release/relay
+  ```
+  That binary is a plain `ws://` loopback pipe. To expose it on the public internet you front it with TLS (a domain + reverse proxy); the full walk-through — Caddy for automatic HTTPS, a hardened systemd unit, and an optional `Makefile` that stands up a GCP box end-to-end — is in [`deploy/README.md`](deploy/README.md). Then point nudge at it:
+  ```bash
+  NUDGE_RELAY=wss://your-relay.example.com
+  ```
+
+Without a relay, `/background` still detaches the session locally and `--socket` attaches another terminal on the same machine — you just don't get phone or off-box handoff.
+
+### The Android app (optional)
+
+Requires the **Android SDK** and a **JDK** (the build targets JDK 21; minimum device API is 26 / Android 8.0). The easiest path is to open the `android/` directory in **Android Studio**, which provisions the SDK and runs the app on a device or emulator for you.
+
+From the command line, point Gradle at your SDK and assemble a debug APK:
+
+```bash
+cd android
+echo "sdk.dir=$ANDROID_HOME" > local.properties   # or export ANDROID_HOME / ANDROID_SDK_ROOT
+./gradlew :app:assembleDebug                       # first run downloads Gradle + deps
+```
+
+The APK lands at `android/app/build/outputs/apk/debug/app-debug.apk`; install it on a connected device with:
+
+```bash
+adb install android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Launch the app and scan the QR the agent shows on `/background` (or `--daemon`) to drive the live session. QR scanning uses Google Play Services; on a device without it, paste the pairing code into the app's text field instead.
+
+## Usage
+
+```
+nudge [OPTIONS]
+
+OPTIONS:
+    --resume <id>        Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl
+                         (the id is shown in the TUI title bar)
+    --list               List this project's saved sessions (name, id, branch,
+                         transcript size, last used), most-recent-first, then exit
+    --thinking <mode>    Thinking display: summarized (default) or omitted
+    --daemon             Run the session headless (no TUI); hosts over $NUDGE_RELAY,
+                         or a local Unix socket with --socket
+    --connect            Attach a TUI to a running --daemon (with --pair-code, or
+                         --socket for a local one)
+    --pair-code <code>   (--connect) Attach using a pairing code from the host's QR
+    --socket <path>      Host/attach over a local Unix socket instead of the relay
+                         (for debugging the transport without a relay)
+    -h, --help           Show help
+```
+
+Set `NUDGE_RELAY` (e.g. in `.env`) to a relay WebSocket URL to enable phone handoff:
+`NUDGE_RELAY=wss://relay.example.com`.
+
+### Detaching and phone handoff
+
+The session outlives its front-end. Inside the TUI, `/background` detaches it — the agent keeps running and buffering output — and pressing `Enter` reattaches, replaying the full history.
+
+When `NUDGE_RELAY` is set, `/background` dials the relay and shows a pairing QR; scan it (or paste the code into `nudge --connect --pair-code <code>`) to drive the *live* session from your phone or another machine. If no relay is configured, `/background` still pauses the session — it just shows no QR.
+
+You can also start a session with no TUI at all: `nudge --daemon` hosts it headless over the relay, and `nudge --connect --pair-code <code>` attaches a front-end. For debugging the transport without a relay, `--daemon --socket <path>` and `--connect --socket <path>` host/attach over a local Unix socket instead. For now a backgrounded or daemon session lives only as long as its launching process — surviving a closed terminal is planned.
+
+### TUI controls
+
+| Key | Action |
+|---|---|
+| `Enter` | send message |
+| `Alt+Enter` / `Ctrl+Enter` / trailing `\` + `Enter` | insert newline (paste keeps newlines) |
+| `Ctrl-O` | expand / collapse tool results and thinking |
+| mouse wheel / `PgUp` `PgDn` / `Home` `End` | scroll / jump / resume tail-follow |
+| `y` / `n` / `Esc` | answer permission prompt |
+| `Ctrl-C` (or `Ctrl-D` on empty input) | quit |
+
+### Slash commands
+
+Type these as a single-line message starting with `/` (multi-line input that happens to start with `/`, e.g. a pasted path, still goes to the model):
+
+| Command | Action |
+|---|---|
+| `/model` | open the model picker |
+| `/mcp` | list loaded MCP servers and the dormant ones available to load |
+| `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
+| `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
+| `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR — reattach with `Enter` |
+
+## Features
+
+- **Agentic loop** — the model plans, calls tools, observes results, and iterates until the task is done, bounded by an iteration budget that ends gracefully (the agent explains it hit the cap and asks how to proceed).
+- **Tool surface** — `Bash`, `Read`, `Edit` (modify + append modes), `CreateNew`, `Grep` (structured ripgrep), `Glob`, `TodoWrite`. Tool names and field shapes are wire-compatible with Claude Code where they overlap, so your muscle memory transfers — only the bill changes.
+- **TUI** (ratatui) — collapsed-by-default action display: each tool call is one compact group with a live status bullet (spinner → ok/error) and a one-line result row; `Ctrl-O` expands everything, including the model's thinking. Title bar shows session id, cwd, git branch, model, and platform.
+- **Permission gating** — shell-executing and file-mutating tools prompt before running; read-only tools auto-allow. For `Bash`, the model must state an *intent* ("count lines in all Rust files") shown as the action label, while the permission prompt always shows the raw command — you approve what runs, not the label.
+- **MCP client** — connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers declared in a project-local `.mcp.json`. Their tools are discovered at startup and merged into the model's tool list (namespaced `server__tool`), indistinguishable from built-ins. Permission follows each tool's `readOnlyHint` annotation — read-only tools auto-allow, the rest prompt. Both local **stdio** subprocesses and remote **Streamable HTTP** servers are supported, the latter with static-token, OAuth (dynamic registration), or OAuth (pre-registered client) auth. Servers load in three layers — always-on foundational tools, always-on user servers from `.mcp.json`, and a built-in **dormant** catalog the user loads/unloads mid-session (`/mcp load <name>`) to keep the default context lean.
+- **Sessions** — every conversation is appended to a JSONL log under `~/.nudge/projects/<flattened-cwd>/<uuid>.jsonl`; `--resume <id>` restores it, with strict truncation of any incomplete trailing turn.
+- **Detachable sessions + phone handoff** — the agent loop is decoupled from the UI, so a session outlives its front-end. `/background` detaches the TUI while the agent keeps working; reattach later and the full history replays. With `NUDGE_RELAY` set, `/background` also dials an end-to-end-encrypted relay and shows a pairing QR, so you can take over the live session from your phone (or from any other terminal running `nudge --connect --pair-code`). A session can also run fully headless (`--daemon`).
+- **Prompt caching** — layered `cache_control` breakpoints on the system prompt plus a floating breakpoint that walks forward along the chat history. At ~100-message depth this cuts billed input ~7× and shortens time-to-first-token accordingly.
+- **Adaptive thinking** — the model decides when to reason; `--thinking omitted` hides the reasoning text for faster first tokens at the same cost.
 
 ## Development
 
@@ -170,61 +267,6 @@ Each entry under `mcpServers` is one server. The transport is inferred: a `url` 
 `gitlab` uses OAuth with dynamic client registration (no `client_id` — the agent registers itself at runtime). `gmail` uses OAuth with a pre-registered client, which requires a Google Cloud OAuth client (client id + secret, with `http://127.0.0.1:8765/callback` as a registered redirect URI).
 
 Servers are launched/connected at startup; their tools appear as `server__tool`. A failed server is logged and skipped, and a missing or malformed `.mcp.json` is non-fatal — the agent just runs with its built-in tools. Keep `.mcp.json` out of version control if it holds credentials.
-
-## Usage
-
-```
-nudge [OPTIONS]
-
-OPTIONS:
-    --resume <id>        Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl
-                         (the id is shown in the TUI title bar)
-    --list               List this project's saved sessions (name, id, branch,
-                         transcript size, last used), most-recent-first, then exit
-    --thinking <mode>    Thinking display: summarized (default) or omitted
-    --daemon             Run the session headless (no TUI); hosts over $NUDGE_RELAY,
-                         or a local Unix socket with --socket
-    --connect            Attach a TUI to a running --daemon (with --pair-code, or
-                         --socket for a local one)
-    --pair-code <code>   (--connect) Attach using a pairing code from the host's QR
-    --socket <path>      Host/attach over a local Unix socket instead of the relay
-                         (for debugging the transport without a relay)
-    -h, --help           Show help
-```
-
-Set `NUDGE_RELAY` (e.g. in `.env`) to a relay WebSocket URL to enable phone handoff:
-`NUDGE_RELAY=wss://relay.example.com`.
-
-### Detaching and phone handoff
-
-The session outlives its front-end. Inside the TUI, `/background` detaches it — the agent keeps running and buffering output — and pressing `Enter` reattaches, replaying the full history.
-
-When `NUDGE_RELAY` is set, `/background` dials the relay and shows a pairing QR; scan it (or paste the code into `nudge --connect --pair-code <code>`) to drive the *live* session from your phone or another machine. If no relay is configured, `/background` still pauses the session — it just shows no QR.
-
-You can also start a session with no TUI at all: `nudge --daemon` hosts it headless over the relay, and `nudge --connect --pair-code <code>` attaches a front-end. For debugging the transport without a relay, `--daemon --socket <path>` and `--connect --socket <path>` host/attach over a local Unix socket instead. For now a backgrounded or daemon session lives only as long as its launching process — surviving a closed terminal is planned.
-
-### TUI controls
-
-| Key | Action |
-|---|---|
-| `Enter` | send message |
-| `Alt+Enter` / `Ctrl+Enter` / trailing `\` + `Enter` | insert newline (paste keeps newlines) |
-| `Ctrl-O` | expand / collapse tool results and thinking |
-| mouse wheel / `PgUp` `PgDn` / `Home` `End` | scroll / jump / resume tail-follow |
-| `y` / `n` / `Esc` | answer permission prompt |
-| `Ctrl-C` (or `Ctrl-D` on empty input) | quit |
-
-### Slash commands
-
-Type these as a single-line message starting with `/` (multi-line input that happens to start with `/`, e.g. a pasted path, still goes to the model):
-
-| Command | Action |
-|---|---|
-| `/model` | open the model picker |
-| `/mcp` | list loaded MCP servers and the dormant ones available to load |
-| `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
-| `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
-| `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR — reattach with `Enter` |
 
 ## How it works
 
