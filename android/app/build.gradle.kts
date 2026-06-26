@@ -1,9 +1,19 @@
 // 8.4-b Android client: a Compose chat UI on top of the :protocol kit (8.4-a).
 // AGP 9.x ships built-in Kotlin (KGP 2.2.10), so no kotlin-android plugin is applied
 // here; only the Compose compiler plugin (its version must match the built-in Kotlin).
+import java.util.Properties
+
 plugins {
     id("com.android.application") version "9.2.0"
     id("org.jetbrains.kotlin.plugin.compose") version "2.2.10"
+}
+
+// Release signing is driven by an untracked keystore.properties at the android/ root
+// (storeFile, storePassword, keyAlias, keyPassword). Absent it, release builds stay
+// unsigned — so debug builds and fresh checkouts work with no setup.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -32,9 +42,23 @@ android {
         jniLibs.useLegacyPackaging = true
     }
 
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 }
