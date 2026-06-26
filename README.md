@@ -172,6 +172,17 @@ Type these as a single-line message starting with `/` (multi-line input that hap
 - **Prompt caching** — layered `cache_control` breakpoints on the system prompt plus a floating breakpoint that walks forward along the chat history. At ~100-message depth this cuts billed input ~7× and shortens time-to-first-token accordingly.
 - **Adaptive thinking** — the model decides when to reason; `--thinking omitted` hides the reasoning text for faster first tokens at the same cost.
 
+### Not yet supported
+
+A few capabilities common to mature coding agents are deliberately absent today, called out here to set expectations. All are on the roadmap and under active development:
+
+- **Skills** — reusable, model-invokable capability bundles (à la Claude Code skills). Not yet supported.
+- **Sub-agents** — spawning child agents to parallelize or isolate sub-tasks; the loop runs a single agent for now.
+- **Web access** — no built-in web fetch or search tool, so the agent can't browse the internet on its own (you can wire one up via an MCP server in the meantime).
+- **Image input** — input is text-only; pasting screenshots, diagrams, or other images isn't supported yet.
+- **Automatic context compaction** — there's prompt caching but no auto-summarization when the context window fills. A long task instead stops gracefully at the iteration budget and hands back to you, rather than compacting history to keep going.
+
+
 ## Development
 
 The repo ships a `mise.toml` of dev tasks (`mise run` lists them); `mise run ci` mirrors the GitLab CI pipeline exactly — run it before pushing. Install the Rust toolchain with [rustup](https://rustup.rs); mise is a task runner only and does not manage it.
