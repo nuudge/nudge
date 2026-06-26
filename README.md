@@ -87,23 +87,34 @@ Without a relay, `/background` still detaches the session locally and `--socket`
 
 ### The Android app (optional)
 
-Requires the **Android SDK** and a **JDK** (the build targets JDK 21; minimum device API is 26 / Android 8.0). The easiest path is to open the `android/` directory in **Android Studio**, which provisions the SDK and runs the app on a device or emulator for you.
+Minimum device API is 26 (Android 8.0). Install the prebuilt APK if you trust me, or build your own from source — then launch and pair as described at the bottom.
 
-From the command line, point Gradle at your SDK and assemble a debug APK:
+- **Install the prebuilt APK (optional).** I publish a signed release APK to the project's package registry, so you can skip the Android toolchain entirely. This is purely a matter of trust: the APK is signed with my release key, and installing it means trusting that key and that I built it honestly:
 
-```bash
-cd android
-echo "sdk.dir=$ANDROID_HOME" > local.properties   # or export ANDROID_HOME / ANDROID_SDK_ROOT
-./gradlew :app:assembleDebug                       # first run downloads Gradle + deps
-```
+   ```bash
+   # browse available versions at https://gitlab.com/hongtao1207/nudge/-/packages
+   curl -fL -o nudge.apk \
+     "https://gitlab.com/api/v4/projects/83699725/packages/generic/nudge-android/0.1/nudge.apk"
+   adb install nudge.apk    # or copy nudge.apk to your phone and tap it (enable "install unknown apps")
+   ```
 
-The APK lands at `android/app/build/outputs/apk/debug/app-debug.apk`; install it on a connected device with:
+- **Do not trust me? Build your own.** Requires the **Android SDK** and a **JDK** (the build targets JDK 21). The easiest path is to open the `android/` directory in **Android Studio**, which provisions the SDK and runs the app on a device or emulator for you.
 
-```bash
-adb install android/app/build/outputs/apk/debug/app-debug.apk
-```
+   From the command line, point Gradle at your SDK and assemble a debug APK:
 
-Launch the app and scan the QR the agent shows on `/background` (or `--daemon`) to drive the live session. QR scanning uses Google Play Services; on a device without it, paste the pairing code into the app's text field instead.
+   ```bash
+   cd android
+   echo "sdk.dir=$ANDROID_HOME" > local.properties   # or export ANDROID_HOME / ANDROID_SDK_ROOT
+   ./gradlew :app:assembleDebug                       # first run downloads Gradle + deps
+   ```
+
+   The APK lands at `android/app/build/outputs/apk/debug/app-debug.apk`; install it on a connected device with:
+   
+   ```bash
+   adb install android/app/build/outputs/apk/debug/app-debug.apk
+   ```
+
+   Launch the app and scan the QR the agent shows on `/background` (or `--daemon`) to drive the live session. QR scanning uses Google Play Services; on a device without it, paste the pairing code into the app's text field instead.
 
 ## Usage
 

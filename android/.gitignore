@@ -4,3 +4,8 @@ local.properties
 *.iml
 .idea/
 .kotlin/
+
+# Release signing — keystore and its passwords must never be committed.
+*.jks
+*.keystore
+keystore.properties
