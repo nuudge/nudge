@@ -50,7 +50,15 @@ cargo install --path .                 # from a local checkout
 cargo install --git https://gitlab.com/hongtao1207/nudge   # straight from git
 ```
 
-The installed binary reads `ANTHROPIC_API_KEY` from the environment (a `.env` in the current directory still works), so export it in your shell profile:
+The installed binary reads `ANTHROPIC_API_KEY` from the environment. To avoid setting it per project, put it in a global config at `~/.nudge/config.env`:
+
+```bash
+mkdir -p ~/.nudge
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
+nudge
+```
+
+A `.env` in the current directory still works and takes precedence over the global config, and an exported shell variable overrides both:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -68,7 +76,7 @@ cargo run --manifest-path /path/to/nudge/Cargo.toml
 
 Phone handoff and cross-machine attach route through a **relay**: a publicly reachable box both devices dial out to, so they meet even when both sit behind NAT. It's ciphertext-blind — every frame is end-to-end encrypted before it leaves your device, so the relay only ever forwards opaque bytes and could not read your session if it tried. You have two ways to get one:
 
-- **Use mine.** If you trust my relay box, point nudge at the relay I run — set it in `.env` or your shell:
+- **Use mine.** If you trust my relay box, point nudge at the relay I run — set it in `~/.nudge/config.env`, a project `.env`, or your shell:
   ```bash
   NUDGE_RELAY=wss://35.244.115.57.sslip.io
   ```
@@ -137,7 +145,7 @@ OPTIONS:
     -h, --help           Show help
 ```
 
-Set `NUDGE_RELAY` (e.g. in `.env`) to a relay WebSocket URL to enable phone handoff:
+Set `NUDGE_RELAY` (e.g. in `~/.nudge/config.env`) to a relay WebSocket URL to enable phone handoff:
 `NUDGE_RELAY=wss://relay.example.com`.
 
 ### Detaching and phone handoff

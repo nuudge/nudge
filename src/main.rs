@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,10 +8,13 @@ use tokio::sync::mpsc;
 use crate::core::{AgentConfig, Backend, SessionHandle};
 
 mod coding;
+mod config;
 mod core;
 mod llm;
 mod transport;
 mod tui;
+
+use crate::config::Config;
 
 // (display label, API model id). The TUI's /model picker renders labels;
 // the id is what goes on the wire. The list is exactly the models that
@@ -106,7 +108,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _ = dotenvy::dotenv();
+    config::load_dotenv();
 
     let cli = Cli::parse();
 
@@ -122,7 +124,7 @@ async fn main() -> Result<()> {
         return run_connect(cli).await;
     }
 
-    let api_key = env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
+    let config = Config::from_env()?;
 
     let (session, initial_messages, dropped) = match &cli.resume {
         None => (coding::open_new()?, Vec::new(), 0),
@@ -150,7 +152,7 @@ async fn main() -> Result<()> {
         max_iterations: MAX_ITERATIONS,
         thinking_display,
     };
-    let provider = llm::AnthropicProvider::new(api_key);
+    let provider = llm::AnthropicProvider::new(config.anthropic_api_key);
 
     // Connect to MCP servers declared in the project-local `.mcp.json` before
     // the TUI takes the screen, so connection logs print cleanly to stderr.
@@ -197,7 +199,7 @@ async fn main() -> Result<()> {
 
     // The relay base URL for phone handoff (and the relay daemon). Optional: a plain
     // local session without it still runs and backgrounds — just no phone handoff.
-    let relay = env::var("NUDGE_RELAY").ok();
+    let relay = config.relay;
 
     // Headless daemon vs local in-process TUI (--connect returned earlier). The
     // daemon dials OUT to the relay by default, or binds a local Unix socket with
