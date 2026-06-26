@@ -35,11 +35,10 @@ nudge is three components: the **terminal agent** (the whole product on its own)
 
 ### The agent
 
-Requires Rust (edition 2024) and an Anthropic API key. The repo ships a `mise.toml` — if you use [mise](https://mise.jdx.dev), `mise install` pins the exact toolchain. Otherwise any recent stable Rust works.
+Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API key. CI builds on Rust 1.96.0; recent stable usually works too.
 
 ```bash
 git clone https://gitlab.com/hongtao1207/nudge.git && cd nudge
-mise install                                 # optional: pins Rust 1.96.0
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
 cargo run
 ```
@@ -175,7 +174,9 @@ Type these as a single-line message starting with `/` (multi-line input that hap
 
 ## Development
 
-The repo uses [mise](https://mise.jdx.dev) to pin the toolchain and provide dev tasks. After `mise install`, run `mise run` to list available tasks. `mise run ci` mirrors the GitLab CI pipeline exactly — run it before pushing.
+The repo ships a `mise.toml` of dev tasks (`mise run` lists them); `mise run ci` mirrors the GitLab CI pipeline exactly — run it before pushing. Install the Rust toolchain with [rustup](https://rustup.rs); mise is a task runner only and does not manage it.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full toolchain setup, local checks, and merge-request workflow.
 
 ## MCP servers
 
