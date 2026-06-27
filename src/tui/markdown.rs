@@ -1,17 +1,12 @@
-//! Renders assistant message text (CommonMark) into styled ratatui lines.
-//!
-//! pulldown-cmark owns the spec-compliance tarpit (nested emphasis, escaping,
-//! list parsing); this module owns only the event→Span mapping, which is the
-//! project-specific part. The output is a `Vec<Line<'static>>` ready to drop
-//! into the log paragraph — `render_log` wraps it and adds the `*`/`  ` turn
-//! prefix, so nothing here knows about turn markers or viewport width.
+//! CommonMark → styled ratatui lines. pulldown-cmark handles parsing; this module
+//! owns only the event→Span mapping. Output is ready for the log paragraph —
+//! `render_log` adds the turn prefix, so nothing here knows about markers or width.
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-// Inline-code and code-block accent. Kept distinct from the assistant body
-// (terminal default fg) so code reads as code at a glance.
+// Code accent, kept distinct from body text.
 const CODE_FG: Color = Color::Yellow;
 const HEADING_FG: Color = Color::Cyan;
 const QUOTE_FG: Color = Color::DarkGray;
@@ -24,23 +19,18 @@ struct Renderer {
     italic: u32,
     strike: u32,
     in_code_block: bool,
-    // Heading level while inside a heading, drives a bold+colored line style.
     heading: Option<HeadingLevel>,
     // One entry per open list: Some(next_number) for ordered, None for bullet.
     lists: Vec<Option<u64>>,
     in_quote: u32,
-    // Marker (bullet / "1.") to emit at the next line start, set on Item start
-    // and consumed by the first inline span so loose lists (which wrap items in
-    // a paragraph) still get their marker.
+    // Marker emitted at the next line start; deferred so loose lists (item wrapped
+    // in a paragraph) still get it.
     pending_marker: Option<String>,
-    // Some(..) while inside a table. Tables need every row before column widths
-    // can be computed, so cell text is buffered here and the whole grid is
-    // emitted on the closing tag. Inline styling inside cells is flattened to
-    // plain text — keeps the alignment math simple, which matters more here.
+    // Buffered: column widths need every row, so cells accumulate and the grid emits
+    // on the closing tag. Cell styling is flattened to plain text.
     table: Option<Table>,
 }
 
-// Buffered table being accumulated between Tag::Table and TagEnd::Table.
 struct Table {
     aligns: Vec<Alignment>,
     header: Vec<String>,
@@ -67,8 +57,6 @@ impl Renderer {
         }
     }
 
-    // Leading indent for new lines in the current block: two spaces per list
-    // nesting level, prefixed by a quote bar when inside a blockquote.
     fn line_prefix(&self) -> String {
         let mut p = String::new();
         for _ in 0..self.in_quote {
@@ -103,9 +91,8 @@ impl Renderer {
         s
     }
 
-    // Ensures the current line has its leading indent / quote bar / list marker
-    // before any content span is pushed. Idempotent within a line: only fires
-    // when `cur` is empty.
+    // Emit the line's indent/quote-bar/marker before the first content span.
+    // Idempotent: only fires when `cur` is empty.
     fn ensure_line_start(&mut self) {
         if !self.cur.is_empty() {
             return;
@@ -133,9 +120,7 @@ impl Renderer {
         self.cur.push(Span::styled(text, style));
     }
 
-    // Flush the in-progress spans as one output line. Pushes an (indented)
-    // empty line when there's nothing buffered, which is how paragraph and
-    // block breaks become visible blank rows.
+    // Flush spans as a line; an empty buffer becomes a blank row (paragraph/block break).
     fn flush(&mut self) {
         if self.cur.is_empty() {
             self.out.push(Line::from(""));
@@ -144,8 +129,7 @@ impl Renderer {
         }
     }
 
-    // Flush only if a line is in progress — used at block boundaries where we
-    // don't want to manufacture a blank row.
+    // Flush only if a line is in progress (no manufactured blank row).
     fn flush_soft(&mut self) {
         if !self.cur.is_empty() {
             self.out.push(Line::from(std::mem::take(&mut self.cur)));
@@ -173,9 +157,8 @@ impl Renderer {
                     self.push_span(sanitize(&t), Style::default().fg(CODE_FG));
                 }
             }
-            // Soft break = source newline inside a paragraph; render as a space
-            // and let the outer Paragraph re-wrap to the viewport. Hard break =
-            // explicit line break, so flush.
+            // Soft break (source newline in a paragraph) → space; the outer Paragraph
+            // re-wraps. Hard break → flush.
             Event::SoftBreak => {
                 if let Some(table) = &mut self.table {
                     table.cur_cell.push(' ');
@@ -196,7 +179,7 @@ impl Renderer {
                 let mark = if done { "[x] " } else { "[ ] " };
                 self.push_span(mark.into(), Style::default().fg(HEADING_FG));
             }
-            // HTML and math: render the raw text rather than dropping it.
+            // Render raw HTML/math text rather than dropping it.
             Event::Html(t) | Event::InlineHtml(t) => {
                 let style = self.inline_style();
                 self.push_span(sanitize(&t), style);
@@ -229,8 +212,7 @@ impl Renderer {
             }
             Tag::Item => {
                 self.flush_soft();
-                // Compute the marker from the innermost list, advancing the
-                // ordered counter so siblings number correctly.
+                // Marker from the innermost list; advance the ordered counter.
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let m = format!("{n}. ");
@@ -271,8 +253,7 @@ impl Renderer {
             Tag::Emphasis => self.italic += 1,
             Tag::Strong => self.bold += 1,
             Tag::Strikethrough => self.strike += 1,
-            // Links/images: keep the visible text (emitted as child Text
-            // events); the URL is dropped — not useful in a terminal log.
+            // Links/images: keep the visible text (child Text events); drop the URL.
             _ => {}
         }
     }
@@ -334,12 +315,10 @@ impl Renderer {
         }
     }
 
-    // Code-block text arrives as one Text event spanning multiple lines; split
-    // it so each source line becomes its own styled, indented output row.
+    // One Text event spans multiple lines; split so each becomes its own indented row.
     fn emit_code_lines(&mut self, text: &str) {
         let style = Style::default().fg(CODE_FG);
-        // trim_end_matches('\n') so the block's trailing newline doesn't add a
-        // spurious blank code row before the post-block blank line.
+        // Drop the block's trailing newline so there's no spurious blank code row.
         for line in text.trim_end_matches('\n').split('\n') {
             self.out.push(Line::from(Span::styled(
                 format!("  {}", sanitize(line)),
@@ -348,10 +327,8 @@ impl Renderer {
         }
     }
 
-    // Emit a buffered table once all rows are known. Columns are sized to the
-    // widest cell so content aligns; the header is bold and followed by a
-    // box-drawing separator. Wide tables will overflow and wrap — accepted,
-    // since truncating columns loses more than it saves in a log view.
+    // Columns sized to the widest cell; bold header + separator. Wide tables wrap
+    // rather than truncate (truncation loses more in a log view).
     fn render_table(&mut self, t: Table) {
         let cols = t
             .aligns
@@ -398,8 +375,6 @@ impl Renderer {
     }
 }
 
-// Pads each cell to its column width (honoring per-column alignment) and joins
-// with a vertical bar — one plain string for the whole row.
 fn row_string(cells: &[String], widths: &[usize], aligns: &[Alignment]) -> String {
     let mut parts = Vec::with_capacity(widths.len());
     for (i, w) in widths.iter().enumerate() {
@@ -423,9 +398,8 @@ fn pad_cell(s: &str, width: usize, align: Alignment) -> String {
     }
 }
 
-// Same control-char defense as the TUI's sanitize_span_text: ratatui copies
-// each char into a cell verbatim, so a literal tab/newline/control char in
-// model output would garble the grid on repaint.
+// Same control-char defense as the TUI's sanitize_span_text — ratatui garbles a
+// literal tab/newline/control char on repaint.
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -439,9 +413,8 @@ fn sanitize(s: &str) -> String {
     out
 }
 
-/// Parse `text` as CommonMark and render it to styled lines. A trailing blank
-/// line (from the final block's separator) is trimmed so the caller's own
-/// inter-entry spacing isn't doubled.
+/// Parse `text` as CommonMark and render to styled lines, trimming the trailing
+/// blank so the caller's inter-entry spacing isn't doubled.
 pub fn render(text: &str) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
