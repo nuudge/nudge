@@ -72,7 +72,7 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        if let Some(pending) = self.pending.take() {
+        if let Some(mut pending) = self.pending.take() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let _ = ui_tx.try_send(UiEvent::PermissionResponse {
@@ -87,6 +87,22 @@ impl App {
                         allow: false,
                     });
                     self.auto_scroll = true;
+                }
+                KeyCode::Up => {
+                    pending.scroll = pending.scroll.saturating_sub(1);
+                    self.pending = Some(pending);
+                }
+                KeyCode::Down => {
+                    pending.scroll = pending.scroll.saturating_add(1);
+                    self.pending = Some(pending);
+                }
+                KeyCode::PageUp => {
+                    pending.scroll = pending.scroll.saturating_sub(10);
+                    self.pending = Some(pending);
+                }
+                KeyCode::PageDown => {
+                    pending.scroll = pending.scroll.saturating_add(10);
+                    self.pending = Some(pending);
                 }
                 _ => {
                     self.pending = Some(pending);
@@ -267,6 +283,20 @@ impl App {
 
     // Returns true when visible state changed, so the caller can skip motion-only redraws.
     pub(super) fn handle_mouse(&mut self, ev: MouseEvent) -> bool {
+        // A permission popup is modal, so the wheel scrolls it rather than the log behind.
+        if let Some(pending) = &mut self.pending {
+            match ev.kind {
+                MouseEventKind::ScrollUp => {
+                    pending.scroll = pending.scroll.saturating_sub(3);
+                    return true;
+                }
+                MouseEventKind::ScrollDown => {
+                    pending.scroll = pending.scroll.saturating_add(3);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 self.auto_scroll = false;

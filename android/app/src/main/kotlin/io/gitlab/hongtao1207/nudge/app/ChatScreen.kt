@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
@@ -26,6 +27,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
@@ -315,10 +317,15 @@ private fun PermissionPrompt(pending: PendingPermission, onAllow: () -> Unit, on
         Column(modifier = Modifier.padding(12.dp)) {
             Text("Allow tool: ${pending.toolName}?", style = MaterialTheme.typography.titleSmall)
             if (pending.summary.isNotBlank()) {
+                // Bound the summary so a long command (e.g. a big bash invocation) scrolls
+                // within the card instead of pushing the Allow/Deny buttons off-screen.
                 MarkdownText(
                     text = pending.summary,
                     style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(top = 4.dp),
+                    modifier = Modifier
+                        .padding(top = 4.dp)
+                        .heightIn(max = 240.dp)
+                        .verticalScroll(rememberScrollState()),
                 )
             }
             Row(
