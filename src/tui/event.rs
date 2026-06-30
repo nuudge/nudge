@@ -44,6 +44,7 @@ impl App {
                     tool_use_id,
                     tool_name,
                     summary,
+                    scroll: 0,
                 });
             }
             ControllerEvent::PermissionResolved { tool_name, allow } => {

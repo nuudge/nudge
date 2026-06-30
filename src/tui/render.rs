@@ -413,7 +413,7 @@ impl App {
         }
 
         // Drawn last so a permission prompt sits on top of an open model picker.
-        if let Some(p) = &self.pending {
+        if let Some(p) = &mut self.pending {
             let popup = centered_rect(60, 30, f.area());
             f.render_widget(Clear, popup);
             let mut body = vec![
@@ -431,9 +431,19 @@ impl App {
                 "Allow?  [y]es  /  [N]o",
                 Style::default().add_modifier(Modifier::BOLD),
             )));
-            let para = Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title("permission"))
-                .wrap(Wrap { trim: false });
+            let para = Paragraph::new(body).wrap(Wrap { trim: false });
+            let inner_width = popup.width.saturating_sub(2);
+            let visible = popup.height.saturating_sub(2);
+            let max_scroll = (para.line_count(inner_width) as u16).saturating_sub(visible);
+            p.scroll = p.scroll.min(max_scroll);
+            let title = if max_scroll > 0 {
+                "permission (↑/↓ scroll)"
+            } else {
+                "permission"
+            };
+            let para = para
+                .block(Block::default().borders(Borders::ALL).title(title))
+                .scroll((p.scroll, 0));
             f.render_widget(para, popup);
         }
     }

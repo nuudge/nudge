@@ -35,6 +35,8 @@ pub(super) struct PendingPermission {
     pub(super) tool_use_id: String,
     pub(super) tool_name: String,
     pub(super) summary: String,
+    // Vertical scroll offset into the popup body; clamped to content height at render.
+    pub(super) scroll: u16,
 }
 
 // Background = detached: the loop runs headless and buffers; the view freezes.
