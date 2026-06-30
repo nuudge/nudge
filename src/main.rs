@@ -170,11 +170,20 @@ async fn main() -> Result<()> {
         eprintln!("{line}");
     }
 
-    if cli.print_prompt {
-        return coding::print_preamble(&cfg, &provider, &session, &mcp).await;
+    // Discover Skills under ~/.nudge/skills/ (personal) and <cwd>/.nudge/skills/
+    // (project) before the TUI takes the screen, so discovery — including a
+    // malformed SKILL.md being skipped — prints cleanly to stderr.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let skills = coding::skills::SkillRegistry::discover(&session.cwd, home.as_deref());
+    for line in &skills.discovery_log {
+        eprintln!("{line}");
     }
 
-    let backend = coding::CodingBackend::new(session.cwd.clone(), mcp);
+    if cli.print_prompt {
+        return coding::print_preamble(&cfg, &provider, &session, &mcp, &skills).await;
+    }
+
+    let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills);
 
     // Pre-translate the resumed transcript to controller events and seed the
     // host's replay buffer with it, so the TUI (and later a remote client)

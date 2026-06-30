@@ -10,6 +10,7 @@ pub mod context;
 pub mod file_state;
 pub mod mcp;
 pub mod prompt;
+pub mod skills;
 pub mod tools;
 
 pub use backend::{CodingBackend, print_preamble};

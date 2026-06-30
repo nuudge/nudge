@@ -9,6 +9,7 @@ use crate::coding::context::{
 use crate::coding::file_state::FileState;
 use crate::coding::mcp::{LOAD_TOOL_NAME, McpRegistry};
 use crate::coding::prompt::system_prompt_body;
+use crate::coding::skills::{SkillRegistry, USE_SKILL_NAME};
 use crate::coding::tools;
 use crate::core::session::Session;
 use crate::core::{AgentConfig, AgentEvent, Backend, UiEvent};
@@ -23,13 +24,14 @@ pub struct CodingBackend {
     claude_md: Option<String>,
     cwd: PathBuf,
     mcp: McpRegistry,
+    skills: SkillRegistry,
     // Session-scoped Read-before-Edit tracker. Resumed sessions start with an
     // empty tracker — see file_state.rs for the rationale.
     file_state: Arc<Mutex<FileState>>,
 }
 
 impl CodingBackend {
-    pub fn new(cwd: PathBuf, mcp: McpRegistry) -> Self {
+    pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry) -> Self {
         Self {
             // Built once: the roster is derived from the compile-time tool set,
             // and the env/CLAUDE.md are read at session start, so these stay
@@ -39,6 +41,7 @@ impl CodingBackend {
             claude_md: claude_md_block(&cwd),
             cwd,
             mcp,
+            skills,
             file_state: Arc::new(Mutex::new(FileState::default())),
         }
     }
@@ -56,7 +59,7 @@ impl Backend for CodingBackend {
     }
 
     fn tool_schemas(&self) -> (Vec<serde_json::Value>, Option<usize>) {
-        build_tool_array(&self.mcp)
+        build_tool_array(&self.mcp, &self.skills)
     }
 
     fn tool_summary(&self, name: &str, input: &serde_json::Value) -> String {
@@ -75,6 +78,11 @@ impl Backend for CodingBackend {
         // flow, so the user approves before the model pulls a server in.
         if name == LOAD_TOOL_NAME {
             true
+        } else if name == USE_SKILL_NAME {
+            // Loading a skill only reads a local file the user installed into
+            // context — effectively read-only (like CLAUDE.md auto-loading and
+            // MCP readOnlyHint). Any script the skill names still gates at Bash.
+            false
         } else if self.mcp.is_mcp_tool(name) {
             self.mcp.requires_permission(name)
         } else {
@@ -101,6 +109,12 @@ impl Backend for CodingBackend {
     ) -> Result<String> {
         if name == LOAD_TOOL_NAME {
             load_dormant(&mut self.mcp, input, notify).await
+        } else if name == USE_SKILL_NAME {
+            let skill = input
+                .get("skill")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("use_skill requires a `skill` string"))?;
+            self.skills.load_body(skill)
         } else if self.mcp.is_mcp_tool(name) {
             self.mcp.call(name, input).await
         } else {
@@ -188,13 +202,20 @@ fn build_system_blocks(
 // mid-session, so a dormant load/unload (which only touches the tail after
 // this marker) keeps the whole stable prefix a cache hit instead of
 // re-processing every schema.
-fn build_tool_array(mcp: &McpRegistry) -> (Vec<serde_json::Value>, Option<usize>) {
+fn build_tool_array(
+    mcp: &McpRegistry,
+    skills: &SkillRegistry,
+) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tool_schemas = tools::schemas();
-    // The load_tool meta-tool is foundational: it never changes mid-session
-    // (the dormant catalog is compile-time-fixed), so it sits in the stable
-    // prefix above the breakpoint alongside the native tools.
+    // The load_tool and use_skill meta-tools are foundational: their catalogs
+    // are fixed at startup (the dormant MCP catalog is compile-time; the skill
+    // catalog is discovered once), so they sit in the stable prefix above the
+    // breakpoint alongside the native tools.
     if let Some(load_tool) = mcp.load_tool_schema() {
         tool_schemas.push(load_tool);
+    }
+    if let Some(use_skill) = skills.use_skill_schema() {
+        tool_schemas.push(use_skill);
     }
     tool_schemas.extend(mcp.always_on_schemas());
     // Index of the stable/dynamic boundary: everything up to here never
@@ -216,13 +237,14 @@ pub async fn print_preamble<P: Provider>(
     provider: &P,
     session: &Session,
     mcp: &McpRegistry,
+    skills: &SkillRegistry,
 ) -> Result<()> {
     let system_prompt = system_prompt_body();
     let stable_env = stable_env_block(&session.cwd);
     let volatile_env = volatile_env_block(&session.cwd);
     let claude_md = claude_md_block(&session.cwd);
     let system = build_system_blocks(&system_prompt, &claude_md, &stable_env, &volatile_env);
-    let (tools, boundary) = build_tool_array(mcp);
+    let (tools, boundary) = build_tool_array(mcp, skills);
 
     println!("===== SYSTEM =====");
     for block in &system {
