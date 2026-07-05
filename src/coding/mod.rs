@@ -23,7 +23,10 @@ pub use backend::{CodingBackend, print_preamble};
 // merge reassembles them by id, exactly as for live events, so one render path
 // serves both live and replay. Usage / permission outcomes aren't in the JSONL
 // (they're runtime-only), so they're absent here, matching the old seed_replay.
-pub fn replay_events(messages: &[Message], dropped: usize) -> Vec<ControllerEvent> {
+// `owner` attributes the historical user turns: the transcript records no per-message
+// identity, so replayed user messages are stamped with the resuming user's name (they
+// render as "you" for that user, and as a named party for anyone else who attaches).
+pub fn replay_events(messages: &[Message], dropped: usize, owner: &str) -> Vec<ControllerEvent> {
     let mut out = Vec::new();
     if dropped > 0 {
         out.push(ControllerEvent::Warn {
@@ -39,7 +42,10 @@ pub fn replay_events(messages: &[Message], dropped: usize) -> Vec<ControllerEven
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            out.push(ControllerEvent::UserMessage { text: text.clone() });
+                            out.push(ControllerEvent::UserMessage {
+                                text: text.clone(),
+                                sender: owner.to_string(),
+                            });
                         }
                         ContentBlock::ToolResult {
                             tool_use_id,

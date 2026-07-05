@@ -22,14 +22,23 @@ impl App {
         for entry in &self.log {
             match entry {
                 LogEntry::Blank => out.push(Line::from("")),
-                LogEntry::User(text) => emit_prefixed(
-                    &mut out,
-                    text,
-                    "> ",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                LogEntry::User { text, sender } => {
+                    // Own turns render as "> "; another party's turns are prefixed
+                    // with their name so a shared session stays legible.
+                    let prefix = if *sender == self.self_name {
+                        "> ".to_string()
+                    } else {
+                        format!("{sender} > ")
+                    };
+                    emit_prefixed(
+                        &mut out,
+                        text,
+                        &prefix,
+                        Style::default()
+                            .fg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
                 LogEntry::Assistant(text) => {
                     let body = markdown::render(text);
                     emit_prefixed_lines(&mut out, body, "* ", Style::default().fg(Color::Cyan))

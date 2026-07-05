@@ -393,7 +393,19 @@ private fun ChatRow(line: ChatLine) {
         )
 
         Role.User -> Bubble(alignEnd = true, container = MaterialTheme.colorScheme.primaryContainer) {
-            Text(text = line.text, modifier = Modifier.padding(10.dp))
+            if (line.sender != null) {
+                // Another party's turn in a shared session — label it with their name.
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Text(
+                        text = line.sender,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(text = line.text)
+                }
+            } else {
+                Text(text = line.text, modifier = Modifier.padding(10.dp))
+            }
         }
 
         Role.Assistant -> Bubble(alignEnd = false, container = MaterialTheme.colorScheme.surfaceVariant) {

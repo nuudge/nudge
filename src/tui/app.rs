@@ -3,7 +3,9 @@ use crate::core::HandoffStatus;
 // Stored semantically (not pre-rendered) so the Ctrl-O expand toggle can re-format.
 pub(super) enum LogEntry {
     Blank,
-    User(String),
+    // `sender` is the display name of whoever sent it; the renderer shows the local
+    // user's own turns as "> " and others prefixed by their name.
+    User { text: String, sender: String },
     Assistant(String),
     Thinking(String),
     // result is filled in-place when the matching ToolResult arrives, correlated by id.
@@ -76,9 +78,13 @@ pub(super) struct App {
     pub(super) pairing_code: Option<String>,
     // Relay-dial progress; None until the first update.
     pub(super) handoff_status: Option<HandoffStatus>,
-    // owner hosts the loop and can force-reclaim; guest is --connect. Cosmetic here —
-    // the capability lives in attach_force.
+    // Cosmetic only: owner = this process hosts the loop (and may show a pairing QR);
+    // guest = --connect. Drives the header badges in render.rs. There is no reclaim
+    // capability — the broker is multi-attach, so clients coexist.
     pub(super) is_owner: bool,
+    // This client's own display name, used to render its own user turns as "> "
+    // (others show the sender's name). From the attach identity.
+    pub(super) self_name: String,
     pub(super) quit: bool,
 }
 
@@ -91,6 +97,7 @@ pub struct UiConfig {
     pub pairing_qr: Option<String>,
     pub pairing_code: Option<String>,
     pub is_owner: bool,
+    pub user_name: String,
 }
 
 impl App {
@@ -119,6 +126,7 @@ impl App {
             pairing_code: cfg.pairing_code,
             handoff_status: None,
             is_owner: cfg.is_owner,
+            self_name: cfg.user_name,
             quit: false,
         }
     }

@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::encryption::Cipher;
-use crate::core::{ControllerEvent, UiEvent};
+use crate::core::{ClientIdentity, ControllerEvent, UiEvent};
 
 // The serializable form of the in-memory `Controller`/`UiEvent` model from 8.0.
 // 8.1 only *transports* that model — the broker's buffer/replay and permission
@@ -26,8 +26,12 @@ use crate::core::{ControllerEvent, UiEvent};
 pub enum ClientFrame {
     // Bind to the session. `after_seq` is the resume cursor: replay only events
     // with `seq > after_seq`, so a client whose connection dropped catches up on
-    // exactly what it missed. `None` = fresh attach → full replay from seq 0.
-    Attach { after_seq: Option<u64> },
+    // exactly what it missed. `None` = fresh attach → full replay from seq 0. `who`
+    // is the attaching client's identity — the attach frame is the handshake.
+    Attach {
+        after_seq: Option<u64>,
+        who: ClientIdentity,
+    },
     // Yield the session without ending it — the loop keeps running headless and
     // buffering. (Distinct from dropping the connection, though the daemon
     // treats a dropped socket as an implicit detach too.)
@@ -43,8 +47,8 @@ pub enum ServerFrame {
     // Attach accepted; the controller event stream (replay-from-cursor, then
     // live) follows as `Event` frames.
     Attached,
-    // Attach refused: another controller already holds the session
-    // (single-attach lock). The client should not expect any `Event` frames.
+    // Attach could not be served: the session is gone (the daemon's broker has shut
+    // down). The client should not expect any `Event` frames.
     Busy,
     // One controller event tagged with its monotonic sequence number. `seq`
     // counts every event the session has ever emitted (replay + live share one
@@ -291,9 +295,15 @@ mod tests {
         )
         .await
         .unwrap();
-        write_frame(&mut writer, &ClientFrame::Attach { after_seq: Some(7) })
-            .await
-            .unwrap();
+        write_frame(
+            &mut writer,
+            &ClientFrame::Attach {
+                after_seq: Some(7),
+                who: ClientIdentity::human("alice"),
+            },
+        )
+        .await
+        .unwrap();
 
         match read_frame::<_, ClientFrame>(&mut reader).await.unwrap() {
             Some(ClientFrame::Command(UiEvent::PermissionResponse { tool_use_id, allow })) => {
@@ -303,7 +313,11 @@ mod tests {
             other => panic!("expected Command(PermissionResponse), got {other:?}"),
         }
         match read_frame::<_, ClientFrame>(&mut reader).await.unwrap() {
-            Some(ClientFrame::Attach { after_seq }) => assert_eq!(after_seq, Some(7)),
+            Some(ClientFrame::Attach { after_seq, who }) => {
+                assert_eq!(after_seq, Some(7));
+                assert_eq!(who.name, "alice");
+                assert!(matches!(who.kind, crate::core::identity::ClientKind::Human));
+            }
             other => panic!("expected Attach, got {other:?}"),
         }
     }

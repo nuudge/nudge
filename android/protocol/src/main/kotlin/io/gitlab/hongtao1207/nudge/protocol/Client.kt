@@ -17,6 +17,9 @@ import java.util.concurrent.TimeUnit
 class RelayClient(
     private val pairing: Pairing,
     private val listener: Listener,
+    // This client's identity, announced in the attach handshake so the daemon can
+    // attribute its turns. Defaulted for the smoke tool; the app supplies a device name.
+    private val who: ClientIdentity = ClientIdentity.human("phone"),
     private val httpClient: OkHttpClient = defaultHttpClient,
 ) {
     // Callbacks fire on OkHttp's WebSocket thread; an Android caller marshals to the
@@ -44,7 +47,7 @@ class RelayClient(
             request,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
-                    sendFrame(webSocket, ClientFrame.Attach(afterSeq))
+                    sendFrame(webSocket, ClientFrame.Attach(afterSeq, who))
                 }
 
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {

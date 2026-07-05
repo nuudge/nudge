@@ -15,7 +15,9 @@ use std::io::{self, Stdout, Write};
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
-use crate::core::{Controller, ControllerEvent, HandoffStatus, SessionHandle, UiEvent};
+use crate::core::{
+    ClientIdentity, Controller, ControllerEvent, HandoffStatus, SessionHandle, UiEvent,
+};
 
 use super::SPINNER_TICK;
 use super::app::{App, LogEntry, Mode, UiConfig};
@@ -23,18 +25,19 @@ use super::app::{App, LogEntry, Mode, UiConfig};
 pub async fn run<H: SessionHandle>(
     host: &H,
     cfg: UiConfig,
+    who: ClientIdentity,
     initial: Controller,
     handoff_rx: Option<mpsc::Receiver<HandoffStatus>>,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, host, cfg, initial, handoff_rx).await;
+    let result = run_loop(&mut terminal, host, cfg, who, initial, handoff_rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
 
 // Never resolves while detached (None), so the select! branch stays inert.
 async fn recv_events(
-    events: &mut Option<mpsc::Receiver<ControllerEvent>>,
+    events: &mut Option<mpsc::UnboundedReceiver<ControllerEvent>>,
 ) -> Option<ControllerEvent> {
     match events {
         Some(rx) => rx.recv().await,
@@ -54,13 +57,14 @@ async fn run_loop<H: SessionHandle>(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     host: &H,
     cfg: UiConfig,
+    who: ClientIdentity,
     initial: Controller,
     mut handoff_rx: Option<mpsc::Receiver<HandoffStatus>>,
 ) -> Result<()> {
     let mut app = App::new(cfg);
 
     // Some while Foreground, None while Background; swapped at the transitions below.
-    let mut events: Option<mpsc::Receiver<ControllerEvent>> = Some(initial.events);
+    let mut events: Option<mpsc::UnboundedReceiver<ControllerEvent>> = Some(initial.events);
     let mut ui_tx: Option<mpsc::Sender<UiEvent>> = Some(initial.ui_tx);
 
     let mut input_stream = EventStream::new();
@@ -143,24 +147,21 @@ async fn run_loop<H: SessionHandle>(
                     app.enter_background();
                 }
                 Mode::Foreground => {
-                    // Force-reclaim; only the owner can take a session a guest holds
-                    // (attach_force is a plain attach for guests).
-                    match host.attach_force().await {
+                    // Re-attach as an ordinary client — there is no reclaim. With the
+                    // broker multi-attach, foregrounding just adds this controller back
+                    // alongside any others (e.g. a phone still paired over the relay);
+                    // both stay live. `attach_force` is the inert seam a future
+                    // identity-aware reclaim policy would hook into.
+                    match host.attach_force(who.clone()).await {
                         Some(c) => {
                             app.enter_foreground();
                             events = Some(c.events);
                             ui_tx = Some(c.ui_tx);
                         }
-                        None => {
-                            // Owner force fails only if the broker is gone; guest attach
-                            // fails when another controller holds the session.
-                            let why = if app.is_owner {
-                                "could not foreground — session has ended"
-                            } else {
-                                "could not foreground — another controller holds the session"
-                            };
-                            app.push(LogEntry::Warn(why.into()));
-                        }
+                        // attach fails only if the broker is gone (session ended).
+                        None => app.push(LogEntry::Warn(
+                            "could not foreground — session has ended".into(),
+                        )),
                     }
                 }
             }

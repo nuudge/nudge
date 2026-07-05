@@ -17,8 +17,26 @@ class FramesTest {
 
     @Test
     fun clientFrameAttachStructVariant() {
-        assertEquals("""{"Attach":{"after_seq":null}}""", enc(ClientFrame.serializer(), ClientFrame.Attach(null)))
-        assertEquals("""{"Attach":{"after_seq":7}}""", enc(ClientFrame.serializer(), ClientFrame.Attach(7)))
+        // The attach frame carries the client's identity; these bytes pin serde's field
+        // order (after_seq, who) and ClientIdentity's shape (kind as a bare string, then
+        // name, session_id, task — nulls emitted, not omitted).
+        val who = ClientIdentity.human("alice")
+        assertEquals(
+            """{"Attach":{"after_seq":null,"who":{"kind":"Human","name":"alice","session_id":null,"task":null}}}""",
+            enc(ClientFrame.serializer(), ClientFrame.Attach(null, who)),
+        )
+        assertEquals(
+            """{"Attach":{"after_seq":7,"who":{"kind":"Human","name":"alice","session_id":null,"task":null}}}""",
+            enc(ClientFrame.serializer(), ClientFrame.Attach(7, who)),
+        )
+    }
+
+    @Test
+    fun userMessageCarriesSender() {
+        assertEquals(
+            """{"UserMessage":{"text":"hi","sender":"alice"}}""",
+            enc(ControllerEvent.serializer(), ControllerEvent.UserMessage("hi", "alice")),
+        )
     }
 
     @Test
@@ -95,7 +113,7 @@ class FramesTest {
             ControllerEvent.MaxIterations,
             ControllerEvent.AssistantThinking("pondering"),
             ControllerEvent.PermissionResolved("Bash", true),
-            ControllerEvent.UserMessage("hello"),
+            ControllerEvent.UserMessage("hello", "alice"),
             ControllerEvent.Notice("note"),
             ControllerEvent.Warn("careful"),
             ControllerEvent.Error("boom"),
@@ -110,8 +128,8 @@ class FramesTest {
     @Test
     fun clientFrameRoundTrips() {
         val frames = listOf(
-            ClientFrame.Attach(null),
-            ClientFrame.Attach(42),
+            ClientFrame.Attach(null, ClientIdentity.human("alice")),
+            ClientFrame.Attach(42, ClientIdentity.human("alice")),
             ClientFrame.Detach,
             ClientFrame.Command(UiEvent.UserMessage("go")),
             ClientFrame.Command(UiEvent.SetModel("claude-opus-4-8")),

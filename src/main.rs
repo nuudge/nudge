@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-use crate::core::{AgentConfig, Backend, SessionHandle};
+use crate::core::{AgentConfig, Backend, ClientIdentity, SessionHandle};
 
 mod coding;
 mod config;
@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
     };
 
     let thinking_display = cli.thinking.as_display();
+    let who = local_identity();
     let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
         session_name: session.name.clone(),
@@ -143,8 +144,9 @@ async fn main() -> Result<()> {
         // Filled in the in-process branch below when --relay arms remote pairing.
         pairing_qr: None,
         pairing_code: None,
-        // This process hosts the agent loop: it's the owner TUI (can force-reclaim).
+        // This process hosts the agent loop: it's the owner TUI (cosmetic badge only).
         is_owner: true,
+        user_name: who.name.clone(),
     };
     let cfg = AgentConfig {
         model: DEFAULT_MODEL.into(),
@@ -189,7 +191,7 @@ async fn main() -> Result<()> {
     // host's replay buffer with it, so the TUI (and later a remote client)
     // rebuilds history purely from the event stream — no front-end-side JSONL
     // replay. `initial_messages` still seeds the model's conversation in the loop.
-    let mut seed = coding::replay_events(&initial_messages, dropped);
+    let mut seed = coding::replay_events(&initial_messages, dropped, &who.name);
     // Prepend the initial session context so every controller has a header on its very
     // first attach, before any turn completes. The loop re-emits SessionInfo on each
     // turn boundary (and on /model) to keep it live; clients only ever render it.
@@ -286,14 +288,21 @@ async fn main() -> Result<()> {
         };
 
         let controller = host
-            .attach()
+            .attach(who.clone())
             .await
             .expect("initial attach on a fresh session cannot be busy");
-        let tui_result = tui::run(&host, ui_cfg, controller, handoff_rx).await;
+        let tui_result = tui::run(&host, ui_cfg, who, controller, handoff_rx).await;
         // TUI exited → end the session explicitly (loop outlives the front-end).
         let _ = host.shutdown().await;
         tui_result
     }
+}
+
+// The local user's identity, announced at attach. `$USER` if set, else a neutral
+// default — a `--name` override can come later.
+fn local_identity() -> ClientIdentity {
+    let name = std::env::var("USER").unwrap_or_else(|_| "human".into());
+    ClientIdentity::human(name)
 }
 
 // Attach a TUI to a running daemon (Unix socket or relay). The client owns no loop
@@ -302,6 +311,7 @@ async fn main() -> Result<()> {
 async fn run_connect(cli: Cli) -> Result<()> {
     // Placeholders only: the daemon's SessionInfo event (replayed first on attach)
     // overwrites session id / model / cwd / branch with the daemon's real context.
+    let who = local_identity();
     let ui_cfg = tui::UiConfig {
         session_id: "(connecting…)".into(),
         session_name: None,
@@ -311,33 +321,33 @@ async fn run_connect(cli: Cli) -> Result<()> {
         pairing_qr: None,
         pairing_code: None,
         // A --connect client is a guest: it attaches to a daemon it doesn't host
-        // and (per attach_force's default) cannot force-reclaim.
+        // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,
+        user_name: who.name.clone(),
     };
     // Use each client's `connect` rather than the silent `SessionHandle::attach` for
     // this first attach: it runs before the TUI owns the screen, so a connection
     // failure can (and should) surface its cause here. `Err` = transport failure
-    // (no daemon / relay unreachable); `None` = up but the session is held elsewhere.
+    // (no daemon / relay unreachable); `None` = reachable but the session is gone
+    // (the daemon's broker has shut down).
     if let Some(code) = cli.pair_code {
         // A scanned pairing code is self-contained: it carries the relay URL, room
         // id, and E2E key, so it needs no other flags.
         let pairing = transport::Pairing::decode(&code)?;
         let client = transport::RelayClient::new(pairing.dial_url(), pairing.cipher);
-        let controller = match client.connect(None).await? {
+        let controller = match client.connect(None, who.clone()).await? {
             Some(c) => c,
-            None => bail!("could not attach: the relay session is held by another client"),
+            None => bail!("could not attach: the relay session has ended"),
         };
-        tui::run(&client, ui_cfg, controller, None).await
+        tui::run(&client, ui_cfg, who, controller, None).await
     } else if let Some(path) = cli.socket {
         // Local debug daemon over a Unix socket (--daemon --socket on the other end).
         let client = transport::SocketClient::new(path);
-        let controller = match client.connect(None).await? {
+        let controller = match client.connect(None, who.clone()).await? {
             Some(c) => c,
-            None => {
-                bail!("could not attach: the daemon is busy (another client holds the session)")
-            }
+            None => bail!("could not attach: the daemon has no live session"),
         };
-        tui::run(&client, ui_cfg, controller, None).await
+        tui::run(&client, ui_cfg, who, controller, None).await
     } else {
         bail!("--connect needs --pair-code <code> (relay) or --socket <path> (local debug daemon)")
     }

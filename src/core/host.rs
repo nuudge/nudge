@@ -6,16 +6,23 @@ use tokio::task::JoinHandle;
 
 use super::agent::{AgentConfig, Backend, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
+use super::identity::ClientIdentity;
 use super::session::Session;
 use crate::llm::{Message, Provider};
 
 const CHANNEL_CAPACITY: usize = 64;
 
+// The broker's registry key for one attached controller. Broker-internal: it keys
+// fan-out and reaping, and is never exposed on `Controller` (detach is drop-based).
+type ControllerId = u64;
+
 // A front-end's handle to the live session: it receives the controller event
 // stream and sends UiEvents back. The front-end owns these ends; the broker owns
-// the matching ends and mediates between them and the loop.
+// the matching ends and mediates between them and the loop. The event stream is
+// unbounded so the broker can fan an event to every controller without one slow
+// consumer blocking delivery to the others or to the loop (head-of-line blocking).
 pub struct Controller {
-    pub events: mpsc::Receiver<ControllerEvent>,
+    pub events: mpsc::UnboundedReceiver<ControllerEvent>,
     pub ui_tx: mpsc::Sender<UiEvent>,
 }
 
@@ -40,19 +47,19 @@ pub enum HandoffStatus {
 // it drives the loop directly or across a socket — the whole point of 8.1.
 pub trait SessionHandle {
     // Bind a front-end, yielding its `Controller` (the replay+live event stream
-    // and the UiEvent sink). `None` = the session is held elsewhere (single-attach
-    // lock) or the transport is gone. The future is `Send` so a server can drive
-    // it from a spawned task.
-    fn attach(&self) -> impl Future<Output = Option<Controller>> + Send;
-    // Bind a front-end, overriding the single-attach lock if one is already held
-    // (local-TUI force-takeover — boots the current holder so the physically
-    // present computer can reclaim a session a phone left attached). The default
-    // delegates to `attach` (no force): a *remote* client must never be able to
-    // force, so only the in-process `SessionHost` overrides this. `tui::run` calls
-    // it on every foreground, so the local host forces and any remote `--connect`
-    // TUI silently stays non-forcing.
-    fn attach_force(&self) -> impl Future<Output = Option<Controller>> + Send {
-        self.attach()
+    // and the UiEvent sink). `who` is the attaching party's identity, announced at
+    // the handshake and recorded by the broker. Many front-ends can attach at once
+    // (a human plus a watcher, a peer agent, …); each gets its own replay + live
+    // stream. `None` = the transport or broker is gone. The future is `Send` so a
+    // server can drive it from a spawned task.
+    fn attach(&self, who: ClientIdentity) -> impl Future<Output = Option<Controller>> + Send;
+    // Retained seam for a local-TUI reclaim policy. Currently inert — with no
+    // single-attach lock there is nothing to force, so the default (a plain
+    // `attach`, admitting a second controller alongside the first) is the whole
+    // behaviour. `tui::run` still calls it on every foreground. A future
+    // designated-driver policy would key off handshake identity and live here.
+    fn attach_force(&self, who: ClientIdentity) -> impl Future<Output = Option<Controller>> + Send {
+        self.attach(who)
     }
     // Yield the front-end without ending the session (pause-in-place, e.g.
     // /background). Fire-and-forget: the loop keeps running headless and buffering;
@@ -63,22 +70,25 @@ pub trait SessionHandle {
 // The broker's view of one attached controller.
 struct ControllerChannels {
     ui_rx: mpsc::Receiver<UiEvent>,
-    event_tx: mpsc::Sender<ControllerEvent>,
+    event_tx: mpsc::UnboundedSender<ControllerEvent>,
+    // The attaching party's announced identity. Recorded at attach and read when the
+    // broker stamps this controller's messages, so a shared session attributes each
+    // turn to a named party.
+    who: ClientIdentity,
 }
 
 // Control messages from `SessionHost`'s methods to the broker task.
 enum HostCommand {
-    // Bind a front-end. `force` overrides the single-attach lock (local-TUI
-    // takeover); without it a second attach is refused. `ack` reports whether the
-    // bind succeeded (false = busy).
+    // Bind a front-end. The broker always admits it (there is no single-attach
+    // lock); `ack` fires `true` once the controller is registered and its replay
+    // has been queued, so the caller only sees its `Controller` after history is
+    // in flight. A dropped `ack` (or `false`, unused) means the broker is gone.
     Attach {
         ui_rx: mpsc::Receiver<UiEvent>,
-        event_tx: mpsc::Sender<ControllerEvent>,
-        force: bool,
+        event_tx: mpsc::UnboundedSender<ControllerEvent>,
+        who: ClientIdentity,
         ack: oneshot::Sender<bool>,
     },
-    // Detach the current front-end without ending the session (pause-in-place).
-    Detach,
     // End the session: the broker forwards a final UiEvent::Quit to the loop.
     Quit,
 }
@@ -177,24 +187,19 @@ impl SessionHost {
 }
 
 impl SessionHandle for SessionHost {
-    async fn attach(&self) -> Option<Controller> {
-        self.broker_handle().attach().await
+    async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
+        self.broker_handle().attach(who).await
     }
 
-    // The in-process host is the only `SessionHandle` that actually forces — it's
-    // the local TUI, the one front-end allowed to boot a remote holder.
-    async fn attach_force(&self) -> Option<Controller> {
-        self.broker_handle().attach_force().await
-    }
-
+    // The actual detach happens when the TUI drops its `Controller` (run_loop sets
+    // both channel slots to None on /background); this call only arms handoff by
+    // firing the injected hook (it dials the relay). The hook no-ops while a dial is
+    // already live, so firing every time just lets a failed dial be retried by
+    // backgrounding again.
     fn detach(&self) {
-        // Each /background arms handoff by firing the injected hook (it dials the
-        // relay). The hook no-ops while a dial is already live, so firing every time
-        // just lets a failed dial be retried by backgrounding again.
         if let Some(hook) = &self.handoff_hook {
             hook();
         }
-        self.broker_handle().detach();
     }
 }
 
@@ -210,16 +215,19 @@ pub struct BrokerHandle {
 
 impl BrokerHandle {
     // Whether the broker task is still running (its receiver hasn't dropped). The
-    // relay dial loop uses this to tell a force-takeover (broker alive — keep dialing
-    // so a device can attach again) from a host shutdown (broker gone — stop).
+    // relay dial loop uses this after a controller's stream closes: broker alive →
+    // keep dialing so a device can attach again; broker gone (host shutdown) → stop.
     pub fn is_alive(&self) -> bool {
         !self.ctl_tx.is_closed()
     }
 
-    // Shared body of attach / attach_force. `force` overrides the single-attach
-    // lock (boots the current holder); without it a second attach is refused.
-    async fn attach_inner(&self, force: bool) -> Option<Controller> {
-        let (event_tx, event_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    // Shared body of attach / attach_force. The event stream is unbounded so the
+    // broker's fan-out never blocks on this controller; the ui channel stays
+    // bounded (this direction is one controller → the broker, so local backpressure
+    // on a flooding sender is the right behaviour). `who` is the attaching party's
+    // identity, recorded by the broker.
+    async fn attach_inner(&self, who: ClientIdentity) -> Option<Controller> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
@@ -227,7 +235,7 @@ impl BrokerHandle {
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                force,
+                who,
                 ack: ack_tx,
             })
             .is_err()
@@ -239,31 +247,23 @@ impl BrokerHandle {
                 events: event_rx,
                 ui_tx,
             }),
-            _ => None, // busy, or broker gone
+            _ => None, // broker gone
         }
     }
 }
 
 impl SessionHandle for BrokerHandle {
-    // Returns `None` if another controller already holds the session (single-attach
-    // mutual exclusion). On success the controller's event stream begins with a
-    // replay of the full history, then live events.
-    async fn attach(&self) -> Option<Controller> {
-        self.attach_inner(false).await
+    // Always admits (no single-attach lock); `None` only if the broker is gone.
+    // The controller's event stream begins with a replay of the full history, then
+    // live events. `attach_force` uses the trait default (== `attach`).
+    async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
+        self.attach_inner(who).await
     }
 
-    // Boot the current holder and bind. Only ever reached via `SessionHost`
-    // (the local TUI) — the daemon attaches remote clients with plain `attach`.
-    async fn attach_force(&self) -> Option<Controller> {
-        self.attach_inner(true).await
-    }
-
-    // Sent on the same control channel as attach, so a detach immediately followed
-    // by an attach rebinds deterministically (FIFO) — no race against the
-    // eventually-consistent drop-detach.
-    fn detach(&self) {
-        let _ = self.ctl_tx.send(HostCommand::Detach);
-    }
+    // Detach is drop-based: a controller leaves by dropping its `Controller`, whose
+    // closed `ui_rx` / `event_tx` the broker reaps on the next poll. With no lock to
+    // release, this call is a no-op — kept only to satisfy the trait.
+    fn detach(&self) {}
 }
 
 // Translate a loop event into the controller-facing form, terminating a
@@ -333,28 +333,60 @@ fn translate(
     }
 }
 
-// Resolve to the current controller's next UiEvent, or never resolve while
-// detached. Pulled out so the `select!` UI branch borrows `attached` only for the
-// duration of its own future.
-async fn recv_controller_ui(attached: &mut Option<ControllerChannels>) -> Option<UiEvent> {
-    match attached {
-        Some(c) => c.ui_rx.recv().await,
-        None => std::future::pending().await,
+// Send an event to every attached controller, reaping any whose receiver has
+// dropped (an unbounded send only fails when the `Controller.events` end is gone).
+// The event channel is unbounded, so this never blocks the broker on a slow
+// consumer — one stalled controller can't hold up delivery to the others or the
+// loop.
+fn fan_out(attached: &mut HashMap<ControllerId, ControllerChannels>, ev: &ControllerEvent) {
+    let mut dead: Vec<ControllerId> = Vec::new();
+    for (id, c) in attached.iter() {
+        if c.event_tx.send(ev.clone()).is_err() {
+            dead.push(*id);
+        }
+    }
+    for id in dead {
+        attached.remove(&id);
     }
 }
 
-// Mediate between the loop and at most one attached front-end. Owns the
+// Resolve to the next UiEvent from ANY attached controller, tagged by its id, or
+// never resolve while none are attached (so the broker's other `select!` arms keep
+// running). `None` = that controller dropped its `ui_tx` → the caller reaps it.
+// Pulled out so the `select!` UI branch borrows `attached` only for the duration of
+// its own future; the losing futures are dropped before returning, ending the
+// borrow, and the handler body re-borrows fresh.
+async fn recv_any_ui(
+    attached: &mut HashMap<ControllerId, ControllerChannels>,
+) -> (ControllerId, Option<UiEvent>) {
+    if attached.is_empty() {
+        // select_all panics on an empty iterator, so stay pending until an attach
+        // wakes the ctl_rx arm and repopulates the map.
+        std::future::pending().await
+    } else {
+        let futures = attached.iter_mut().map(|(id, c)| {
+            let id = *id;
+            Box::pin(async move { (id, c.ui_rx.recv().await) })
+        });
+        let ((id, ev), _idx, _rest) = futures::future::select_all(futures).await;
+        (id, ev)
+    }
+}
+
+// Mediate between the loop and any number of attached front-ends. Owns the
 // session's full event history (an in-memory buffer, replayed on attach) and the
-// outstanding permission senders. The loop's channels live here for the whole
-// session, so a front-end leaving never closes them — only an explicit Quit (or
-// the loop ending on its own) stops the broker.
+// outstanding permission senders. Loop events fan out to every controller; inbound
+// UiEvents from every controller merge into the loop's single input. The loop's
+// channels live here for the whole session, so a front-end leaving never closes
+// them — only an explicit Quit (or the loop ending on its own) stops the broker.
 async fn broker(
     loop_ui_tx: mpsc::Sender<UiEvent>,
     mut loop_agent_rx: mpsc::Receiver<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<HostCommand>,
     seed: Vec<ControllerEvent>,
 ) {
-    let mut attached: Option<ControllerChannels> = None;
+    let mut attached: HashMap<ControllerId, ControllerChannels> = HashMap::new();
+    let mut next_id: ControllerId = 0;
     // Pre-seeded with the resumed transcript (if any), so the first attach
     // replays history + live as one stream. Live events append after the seed.
     let mut buffer: Vec<ControllerEvent> = seed;
@@ -364,29 +396,22 @@ async fn broker(
         tokio::select! {
             cmd = ctl_rx.recv() => {
                 match cmd {
-                    Some(HostCommand::Attach { ui_rx, event_tx, force, ack }) => {
-                        if attached.is_some() && !force {
-                            let _ = ack.send(false); // busy — single-attach lock holds
-                        } else {
-                            // `force` replaces the holder: dropping the old
-                            // ControllerChannels closes its event_tx, so the
-                            // booted front-end sees its stream end.
-                            attached = Some(ControllerChannels { ui_rx, event_tx });
-                            let _ = ack.send(true);
-                            // Replay the full history before any live event. We're
-                            // in this handler synchronously, so loop/controller
-                            // branches can't interleave — replayed events strictly
-                            // precede live ones.
-                            if let Some(c) = attached.as_ref() {
-                                for ev in &buffer {
-                                    let _ = c.event_tx.send(ev.clone()).await;
-                                }
-                            }
+                    Some(HostCommand::Attach { ui_rx, event_tx, who, ack }) => {
+                        // Replay the full history to this controller before any live
+                        // event. This handler has no await point, so no other arm can
+                        // interleave — replayed events strictly precede live ones for
+                        // this controller. Unbounded send only errors if the
+                        // controller already vanished (harmless — reaped on the next
+                        // poll / fan-out).
+                        for ev in &buffer {
+                            let _ = event_tx.send(ev.clone());
                         }
+                        let id = next_id;
+                        next_id += 1;
+                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who });
+                        let _ = ack.send(true);
                     }
-                    Some(HostCommand::Detach) => attached = None,
-                    // Buffer + forward a system Notice, exactly like a translated
-                    // loop Notice, so it survives into later attach-replays.
+                    // End the session: forward a final Quit to the loop and stop.
                     Some(HostCommand::Quit) | None => {
                         let _ = loop_ui_tx.send(UiEvent::Quit).await;
                         return;
@@ -398,45 +423,47 @@ async fn broker(
                     Some(ev) => {
                         let cev = translate(ev, &mut pending);
                         buffer.push(cev.clone());
-                        if let Some(c) = attached.as_ref() {
-                            let _ = c.event_tx.send(cev).await;
-                        }
+                        fan_out(&mut attached, &cev);
                     }
                     None => return, // loop ended on its own
                 }
             }
-            ui = recv_controller_ui(&mut attached) => {
+            (id, ui) = recv_any_ui(&mut attached) => {
                 match ui {
-                    // Answer a permission: fulfil the loop's held oneshot and
-                    // record a resolution marker. Never forwarded to the loop.
+                    // Answer a permission: fulfil the loop's held oneshot and record
+                    // a resolution marker, fanned to all controllers so every UI
+                    // clears its prompt. First responder wins — a second answer for
+                    // the same id finds nothing in `pending` and no-ops. Never
+                    // forwarded to the loop.
                     Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
                         if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
                             let _ = tx.send(allow);
                             let resolved = ControllerEvent::PermissionResolved { tool_name, allow };
                             buffer.push(resolved.clone());
-                            if let Some(c) = attached.as_ref() {
-                                let _ = c.event_tx.send(resolved).await;
-                            }
+                            fan_out(&mut attached, &resolved);
                         }
                     }
                     // Drive the loop, and echo into the stream so every controller
-                    // (including a later attach) reconstructs the user's turns.
+                    // (including a later attach) reconstructs the shared transcript.
+                    // The echo is attributed to the sending controller's identity.
                     Some(UiEvent::UserMessage { text }) => {
+                        let sender = attached
+                            .get(&id)
+                            .map(|c| c.who.name.clone())
+                            .unwrap_or_default();
                         let _ = loop_ui_tx.send(UiEvent::UserMessage { text: text.clone() }).await;
-                        let echo = ControllerEvent::UserMessage { text };
+                        let echo = ControllerEvent::UserMessage { text, sender };
                         buffer.push(echo.clone());
-                        if let Some(c) = attached.as_ref() {
-                            let _ = c.event_tx.send(echo).await;
-                        }
+                        fan_out(&mut attached, &echo);
                     }
                     // Pure control (SetModel / MCP load-unload-list / Quit): forward
                     // to the loop; its effects return as events.
                     Some(other) => {
                         let _ = loop_ui_tx.send(other).await;
                     }
-                    // Front-end dropped its ui_tx without an explicit detach → the
-                    // loop lives on, headless.
-                    None => attached = None,
+                    // This controller dropped its ui_tx (detach / quit) → reap it; the
+                    // loop and any other controllers live on.
+                    None => { attached.remove(&id); }
                 }
             }
         }
@@ -479,27 +506,39 @@ pub(crate) fn spawn_bare_broker(seed: Vec<ControllerEvent>) -> BareBroker {
 mod tests {
     use super::*;
 
-    // Mirror SessionHost::attach but allow choosing `force`, so a test can probe
-    // both the busy refusal and the local-TUI takeover.
+    // Attach a fresh controller to the broker, returning its (unbounded) event
+    // stream and its UiEvent sink. Always admitted now — there is no single-attach
+    // lock — so the ack is asserted rather than returned.
     async fn try_attach(
         ctl_tx: &mpsc::UnboundedSender<HostCommand>,
-        force: bool,
-    ) -> Option<(mpsc::Receiver<ControllerEvent>, mpsc::Sender<UiEvent>)> {
-        let (event_tx, event_rx) = mpsc::channel(16);
+    ) -> (mpsc::UnboundedReceiver<ControllerEvent>, mpsc::Sender<UiEvent>) {
+        try_attach_as(ctl_tx, "test").await
+    }
+
+    // Attach with a chosen display name, so attribution tests can tell senders apart.
+    async fn try_attach_as(
+        ctl_tx: &mpsc::UnboundedSender<HostCommand>,
+        name: &str,
+    ) -> (mpsc::UnboundedReceiver<ControllerEvent>, mpsc::Sender<UiEvent>) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
         ctl_tx
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                force,
+                who: ClientIdentity::human(name),
                 ack: ack_tx,
             })
             .unwrap();
-        if ack_rx.await.unwrap_or(false) {
-            Some((event_rx, ui_tx))
-        } else {
-            None
+        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        (event_rx, ui_tx)
+    }
+
+    async fn expect_text(events: &mut mpsc::UnboundedReceiver<ControllerEvent>, want: &str) {
+        match events.recv().await {
+            Some(ControllerEvent::AssistantText { text }) if text == want => {}
+            other => panic!("expected AssistantText({want:?}), got {other:?}"),
         }
     }
 
@@ -513,7 +552,7 @@ mod tests {
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
 
-        let (mut a_events, a_ui_tx) = try_attach(&ctl_tx, false).await.expect("first attach");
+        let (mut a_events, a_ui_tx) = try_attach(&ctl_tx).await;
 
         // User message: forwarded to the loop and echoed back to the controller.
         a_ui_tx
@@ -525,7 +564,7 @@ mod tests {
             other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
         }
         match a_events.recv().await {
-            Some(ControllerEvent::UserMessage { text }) => assert_eq!(text, "hi"),
+            Some(ControllerEvent::UserMessage { text, .. }) => assert_eq!(text, "hi"),
             other => panic!("expected UserMessage echo, got {other:?}"),
         }
 
@@ -574,106 +613,273 @@ mod tests {
         broker_task.await.unwrap();
     }
 
-    // Single-attach exclusivity (busy refusal), full replay on (re)attach, and
-    // local-TUI force-takeover booting the current holder.
+    // One loop event fans out to every attached controller.
     #[tokio::test]
-    async fn single_attach_replay_and_force_takeover() {
+    async fn fan_out_reaches_all_controllers() {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
 
-        // A attaches; one event is buffered.
-        let (mut a_events, _a_ui_tx) = try_attach(&ctl_tx, false).await.expect("A attach");
+        let (mut a, _a_ui) = try_attach(&ctl_tx).await;
+        let (mut b, _b_ui) = try_attach(&ctl_tx).await;
+
         loop_agent_tx
-            .send(AgentEvent::AssistantText {
-                text: "hello".into(),
-            })
+            .send(AgentEvent::AssistantText { text: "hi".into() })
             .await
             .unwrap();
-        match a_events.recv().await {
-            Some(ControllerEvent::AssistantText { text }) => assert_eq!(text, "hello"),
-            other => panic!("expected A to receive AssistantText, got {other:?}"),
-        }
+        expect_text(&mut a, "hi").await;
+        expect_text(&mut b, "hi").await;
 
-        // A non-forced attach is refused while A holds the session (single-attach).
-        assert!(
-            try_attach(&ctl_tx, false).await.is_none(),
-            "a non-forced attach must be refused while a controller holds the session"
-        );
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
 
-        // Force-takeover boots A and binds B; B replays the buffered history.
-        let (mut b_events, b_ui_tx) = try_attach(&ctl_tx, true).await.expect("B force-attach");
-        match b_events.recv().await {
-            Some(ControllerEvent::AssistantText { text }) => assert_eq!(text, "hello"),
-            other => panic!("expected B replay of AssistantText, got {other:?}"),
-        }
-        assert!(
-            a_events.recv().await.is_none(),
-            "force-takeover must close the booted controller's stream"
-        );
+    // Either controller can drive the loop; the loop sees the message once, and
+    // every controller sees the echo (a shared transcript).
+    #[tokio::test]
+    async fn either_controller_drives_all_see_echo() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
 
-        // A live event reaches B.
-        loop_agent_tx
-            .send(AgentEvent::Notice {
-                text: "live".into(),
-            })
+        let (mut a, a_ui) = try_attach(&ctl_tx).await;
+        let (mut b, _b_ui) = try_attach(&ctl_tx).await;
+
+        a_ui
+            .send(UiEvent::UserMessage { text: "go".into() })
             .await
             .unwrap();
-        match b_events.recv().await {
-            Some(ControllerEvent::Notice { text }) => assert_eq!(text, "live"),
-            other => panic!("expected B to receive live Notice, got {other:?}"),
-        }
 
-        // B detaches by dropping; the broker (and the loop's channels) survive —
-        // proven by a fresh attach replaying the full buffer. Use force so the
-        // test doesn't depend on the broker having yet noticed B's drop (a
-        // non-forced attach would race that eventually-consistent detach notice).
-        drop(b_events);
-        drop(b_ui_tx);
-        let (mut c_events, _c_ui_tx) = try_attach(&ctl_tx, true).await.expect("C force-attach");
-        match c_events.recv().await {
-            Some(ControllerEvent::AssistantText { text }) => assert_eq!(text, "hello"),
-            other => panic!("expected C replay [0], got {other:?}"),
+        match loop_ui_rx.recv().await {
+            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "go"),
+            other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
         }
-        match c_events.recv().await {
-            Some(ControllerEvent::Notice { text }) => assert_eq!(text, "live"),
-            other => panic!("expected C replay [1], got {other:?}"),
+        for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
+            match ev {
+                Some(ControllerEvent::UserMessage { text, .. }) => assert_eq!(text, "go"),
+                other => panic!("{who} expected UserMessage echo, got {other:?}"),
+            }
         }
 
         ctl_tx.send(HostCommand::Quit).unwrap();
         broker_task.await.unwrap();
     }
 
-    // Explicit detach (the /background path) frees the lock so a *non-forced*
-    // reattach succeeds, deterministically — Detach and the next Attach ride the
-    // same FIFO control channel, so the broker processes the detach first (no
-    // race against the eventually-consistent drop-detach). Reattach replays.
+    // A user message's echo is attributed to the sending controller's identity, and
+    // fans to every controller (so a shared session shows who said what).
     #[tokio::test]
-    async fn explicit_detach_frees_lock_for_nonforced_reattach() {
+    async fn user_message_echo_is_attributed_to_sender() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut a, a_ui) = try_attach_as(&ctl_tx, "alice").await;
+        let (mut b, _b_ui) = try_attach_as(&ctl_tx, "bob").await;
+
+        a_ui
+            .send(UiEvent::UserMessage { text: "hi".into() })
+            .await
+            .unwrap();
+        // Forwarded to the loop once (the loop only needs the text, not the sender).
+        match loop_ui_rx.recv().await {
+            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "hi"),
+            other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
+        }
+        // Both controllers see the echo stamped with alice.
+        for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
+            match ev {
+                Some(ControllerEvent::UserMessage { text, sender }) => {
+                    assert_eq!(text, "hi");
+                    assert_eq!(sender, "alice");
+                }
+                other => panic!("{who} expected attributed echo, got {other:?}"),
+            }
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A permission request fans to every controller; the first answer fulfils the
+    // loop's one-shot and clears the prompt on all. A second answer for the same id
+    // finds nothing pending and no-ops (proven: the next event both controllers see
+    // is a fresh one, not a duplicate PermissionResolved).
+    #[tokio::test]
+    async fn permission_first_responder_wins() {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
 
-        let (mut a_events, _a_ui_tx) = try_attach(&ctl_tx, false).await.expect("A attach");
+        let (mut a, a_ui) = try_attach(&ctl_tx).await;
+        let (mut b, b_ui) = try_attach(&ctl_tx).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
         loop_agent_tx
-            .send(AgentEvent::AssistantText { text: "x".into() })
+            .send(AgentEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                respond: resp_tx,
+            })
             .await
             .unwrap();
-        match a_events.recv().await {
-            Some(ControllerEvent::AssistantText { text }) => assert_eq!(text, "x"),
-            other => panic!("expected A to receive AssistantText, got {other:?}"),
+        for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
+            match ev {
+                Some(ControllerEvent::PermissionRequest { tool_use_id, .. }) => {
+                    assert_eq!(tool_use_id, "t1")
+                }
+                other => panic!("{who} expected PermissionRequest, got {other:?}"),
+            }
         }
 
-        // Explicit detach, then a non-forced reattach — deterministically admitted.
-        ctl_tx.send(HostCommand::Detach).unwrap();
-        let (mut b_events, _b_ui_tx) = try_attach(&ctl_tx, false)
+        // A answers first: the loop's one-shot resolves, both see PermissionResolved.
+        a_ui
+            .send(UiEvent::PermissionResponse {
+                tool_use_id: "t1".into(),
+                allow: true,
+            })
             .await
-            .expect("non-forced reattach must succeed after an explicit detach");
-        match b_events.recv().await {
-            Some(ControllerEvent::AssistantText { text }) => assert_eq!(text, "x"),
-            other => panic!("expected B replay after detach, got {other:?}"),
+            .unwrap();
+        assert!(resp_rx.await.unwrap());
+        for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
+            match ev {
+                Some(ControllerEvent::PermissionResolved { allow, .. }) => assert!(allow),
+                other => panic!("{who} expected PermissionResolved, got {other:?}"),
+            }
+        }
+
+        // B answers the same id late — no-op. A fresh loop event is the next thing
+        // each controller sees, regardless of the order the broker processes the two.
+        b_ui
+            .send(UiEvent::PermissionResponse {
+                tool_use_id: "t1".into(),
+                allow: false,
+            })
+            .await
+            .unwrap();
+        loop_agent_tx
+            .send(AgentEvent::AssistantText { text: "next".into() })
+            .await
+            .unwrap();
+        expect_text(&mut a, "next").await;
+        expect_text(&mut b, "next").await;
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // Dropping one controller reaps it without disturbing the others or the loop.
+    #[tokio::test]
+    async fn dropping_one_controller_keeps_the_rest() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (a, a_ui) = try_attach(&ctl_tx).await;
+        let (mut b, _b_ui) = try_attach(&ctl_tx).await;
+
+        drop(a);
+        drop(a_ui);
+
+        loop_agent_tx
+            .send(AgentEvent::Notice {
+                text: "still here".into(),
+            })
+            .await
+            .unwrap();
+        match b.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert_eq!(text, "still here"),
+            other => panic!("B expected live Notice after A dropped, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A controller that never drains its event stream must not stall delivery to a
+    // fast controller or the loop — the unbounded fan-out guarantee.
+    #[tokio::test]
+    async fn slow_controller_does_not_block_others_or_the_loop() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        // A attaches but never drains (leading underscore = a live, undrained binding).
+        let (_a_slow, _a_ui) = try_attach(&ctl_tx).await;
+        let (mut b, b_ui) = try_attach(&ctl_tx).await;
+
+        for i in 0..100 {
+            loop_agent_tx
+                .send(AgentEvent::AssistantText {
+                    text: i.to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        for i in 0..100 {
+            expect_text(&mut b, &i.to_string()).await;
+        }
+
+        // The loop still receives input driven while A is stuck.
+        b_ui
+            .send(UiEvent::UserMessage {
+                text: "drive".into(),
+            })
+            .await
+            .unwrap();
+        match loop_ui_rx.recv().await {
+            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "drive"),
+            other => panic!("loop expected driven UserMessage, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A controller attaching after events exist replays the full buffer even while
+    // another controller is already attached; then a live event reaches both.
+    #[tokio::test]
+    async fn late_attach_replays_with_others_present() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut a, _a_ui) = try_attach(&ctl_tx).await;
+        loop_agent_tx
+            .send(AgentEvent::AssistantText { text: "one".into() })
+            .await
+            .unwrap();
+        loop_agent_tx
+            .send(AgentEvent::AssistantText { text: "two".into() })
+            .await
+            .unwrap();
+        expect_text(&mut a, "one").await;
+        expect_text(&mut a, "two").await;
+
+        // B attaches late — full replay even though A is still attached.
+        let (mut b, _b_ui) = try_attach(&ctl_tx).await;
+        expect_text(&mut b, "one").await;
+        expect_text(&mut b, "two").await;
+
+        // A live event reaches both.
+        loop_agent_tx
+            .send(AgentEvent::Notice {
+                text: "live".into(),
+            })
+            .await
+            .unwrap();
+        for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
+            match ev {
+                Some(ControllerEvent::Notice { text }) => assert_eq!(text, "live"),
+                other => panic!("{who} expected live Notice, got {other:?}"),
+            }
         }
 
         ctl_tx.send(HostCommand::Quit).unwrap();
