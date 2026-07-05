@@ -15,7 +15,9 @@ use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
 use super::{RelayClient, SocketClient, bind_listener, run_daemon, run_relay_daemon};
 use crate::core::host::spawn_bare_broker;
-use crate::core::{AgentEvent, ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent};
+use crate::core::{
+    AgentEvent, ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent,
+};
 
 // A collision-free socket path under the system temp dir. The name is kept short
 // on purpose: a Unix socket path must fit in `sockaddr_un.sun_path` (104 bytes on
@@ -34,10 +36,10 @@ async fn attach_at(client: &SocketClient, after_seq: Option<u64>) -> Controller 
         Duration::from_secs(5),
         client.connect(after_seq, ClientIdentity::human("test")),
     )
-        .await
-        .expect("attach timed out")
-        .expect("attach errored")
-        .expect("attach refused (Busy) — unexpected with a serial accept loop")
+    .await
+    .expect("attach timed out")
+    .expect("attach errored")
+    .expect("attach refused (Busy) — unexpected with a serial accept loop")
 }
 
 async fn next_event(ctrl: &mut Controller) -> Option<ControllerEvent> {

@@ -5,7 +5,10 @@ pub(super) enum LogEntry {
     Blank,
     // `sender` is the display name of whoever sent it; the renderer shows the local
     // user's own turns as "> " and others prefixed by their name.
-    User { text: String, sender: String },
+    User {
+        text: String,
+        sender: String,
+    },
     Assistant(String),
     Thinking(String),
     // result is filled in-place when the matching ToolResult arrives, correlated by id.

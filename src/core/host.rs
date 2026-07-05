@@ -511,7 +511,10 @@ mod tests {
     // lock — so the ack is asserted rather than returned.
     async fn try_attach(
         ctl_tx: &mpsc::UnboundedSender<HostCommand>,
-    ) -> (mpsc::UnboundedReceiver<ControllerEvent>, mpsc::Sender<UiEvent>) {
+    ) -> (
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        mpsc::Sender<UiEvent>,
+    ) {
         try_attach_as(ctl_tx, "test").await
     }
 
@@ -519,7 +522,10 @@ mod tests {
     async fn try_attach_as(
         ctl_tx: &mpsc::UnboundedSender<HostCommand>,
         name: &str,
-    ) -> (mpsc::UnboundedReceiver<ControllerEvent>, mpsc::Sender<UiEvent>) {
+    ) -> (
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        mpsc::Sender<UiEvent>,
+    ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -647,8 +653,7 @@ mod tests {
         let (mut a, a_ui) = try_attach(&ctl_tx).await;
         let (mut b, _b_ui) = try_attach(&ctl_tx).await;
 
-        a_ui
-            .send(UiEvent::UserMessage { text: "go".into() })
+        a_ui.send(UiEvent::UserMessage { text: "go".into() })
             .await
             .unwrap();
 
@@ -679,8 +684,7 @@ mod tests {
         let (mut a, a_ui) = try_attach_as(&ctl_tx, "alice").await;
         let (mut b, _b_ui) = try_attach_as(&ctl_tx, "bob").await;
 
-        a_ui
-            .send(UiEvent::UserMessage { text: "hi".into() })
+        a_ui.send(UiEvent::UserMessage { text: "hi".into() })
             .await
             .unwrap();
         // Forwarded to the loop once (the loop only needs the text, not the sender).
@@ -737,13 +741,12 @@ mod tests {
         }
 
         // A answers first: the loop's one-shot resolves, both see PermissionResolved.
-        a_ui
-            .send(UiEvent::PermissionResponse {
-                tool_use_id: "t1".into(),
-                allow: true,
-            })
-            .await
-            .unwrap();
+        a_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
         assert!(resp_rx.await.unwrap());
         for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
             match ev {
@@ -754,15 +757,16 @@ mod tests {
 
         // B answers the same id late — no-op. A fresh loop event is the next thing
         // each controller sees, regardless of the order the broker processes the two.
-        b_ui
-            .send(UiEvent::PermissionResponse {
-                tool_use_id: "t1".into(),
-                allow: false,
-            })
-            .await
-            .unwrap();
+        b_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: false,
+        })
+        .await
+        .unwrap();
         loop_agent_tx
-            .send(AgentEvent::AssistantText { text: "next".into() })
+            .send(AgentEvent::AssistantText {
+                text: "next".into(),
+            })
             .await
             .unwrap();
         expect_text(&mut a, "next").await;
@@ -827,12 +831,11 @@ mod tests {
         }
 
         // The loop still receives input driven while A is stuck.
-        b_ui
-            .send(UiEvent::UserMessage {
-                text: "drive".into(),
-            })
-            .await
-            .unwrap();
+        b_ui.send(UiEvent::UserMessage {
+            text: "drive".into(),
+        })
+        .await
+        .unwrap();
         match loop_ui_rx.recv().await {
             Some(UiEvent::UserMessage { text }) => assert_eq!(text, "drive"),
             other => panic!("loop expected driven UserMessage, got {other:?}"),
