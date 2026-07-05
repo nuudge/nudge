@@ -110,8 +110,10 @@ sealed class ControllerEvent {
         @SerialName("is_error") val isError: Boolean,
     ) : ControllerEvent()
 
+    // `sender` is the display name of whoever sent it (the daemon stamps it from that
+    // controller's identity), so a shared session can attribute each turn.
     @Serializable
-    data class UserMessage(val text: String) : ControllerEvent()
+    data class UserMessage(val text: String, val sender: String) : ControllerEvent()
 
     object TurnComplete : ControllerEvent()
 
@@ -241,11 +243,37 @@ object UiEventSerializer : KSerializer<UiEvent> {
     }
 }
 
+// ── ClientIdentity (attach handshake) ────────────────────────────────────────
+// Announced by every client in ClientFrame.Attach; the daemon records it and
+// attributes the session's turns. Mirrors Rust core::identity::ClientIdentity. serde
+// serializes a fieldless enum variant as a bare string ("Human"), which is exactly
+// what a kotlinx @Serializable enum produces — so no custom serializer is needed.
+@Serializable
+enum class ClientKind { Human, Agent }
+
+@Serializable
+data class ClientIdentity(
+    val kind: ClientKind,
+    val name: String,
+    // Populated for a spawned agent; a human leaves these null. serde emits them as
+    // null (not absent), and encodeDefaults keeps them on the wire in that order.
+    @SerialName("session_id") val sessionId: String? = null,
+    val task: String? = null,
+) {
+    companion object {
+        fun human(name: String) = ClientIdentity(ClientKind.Human, name)
+    }
+}
+
 // ── ClientFrame (client -> daemon) ───────────────────────────────────────────
 @Serializable(with = ClientFrameSerializer::class)
 sealed class ClientFrame {
+    // `who` is this client's identity — the attach frame is the handshake.
     @Serializable
-    data class Attach(@SerialName("after_seq") val afterSeq: Long?) : ClientFrame()
+    data class Attach(
+        @SerialName("after_seq") val afterSeq: Long?,
+        val who: ClientIdentity,
+    ) : ClientFrame()
 
     object Detach : ClientFrame()
 

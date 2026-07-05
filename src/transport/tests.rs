@@ -3,8 +3,9 @@
 // debug host). The broker has no agent loop behind it — events are injected directly
 // (see `spawn_bare_broker`) — so this exercises only the transport seam: framing, the
 // attach handshake, seq assignment + `after_seq` filtering, and the guest-quit-as-detach
-// rule. Broker-internal invariants (single-attach lock, force-takeover, permission
-// correlation) are covered by the host unit tests; wire framing by the wire tests.
+// rule. Broker-internal invariants (multi-attach fan-out, inbound merge,
+// first-responder permission, drop-reaping) are covered by the host unit tests; wire
+// framing by the wire tests.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
 use super::{RelayClient, SocketClient, bind_listener, run_daemon, run_relay_daemon};
 use crate::core::host::spawn_bare_broker;
-use crate::core::{AgentEvent, Controller, ControllerEvent, SessionHandle, UiEvent};
+use crate::core::{AgentEvent, ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent};
 
 // A collision-free socket path under the system temp dir. The name is kept short
 // on purpose: a Unix socket path must fit in `sockaddr_un.sun_path` (104 bytes on
@@ -29,7 +30,10 @@ fn unique_socket_path() -> PathBuf {
 // connection at a time, so a reattach simply blocks until the previous connection's
 // detach lets the server loop back to `accept` — no busy/retry dance needed.
 async fn attach_at(client: &SocketClient, after_seq: Option<u64>) -> Controller {
-    timeout(Duration::from_secs(5), client.connect(after_seq))
+    timeout(
+        Duration::from_secs(5),
+        client.connect(after_seq, ClientIdentity::human("test")),
+    )
         .await
         .expect("attach timed out")
         .expect("attach errored")
@@ -60,7 +64,10 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
 
     // Attach over the socket via the product path (`SessionHandle::attach`, full
     // replay). The buffer is empty, so nothing replays yet.
-    let mut a = client.attach().await.expect("initial attach");
+    let mut a = client
+        .attach(ClientIdentity::human("test"))
+        .await
+        .expect("initial attach");
 
     // Two injected loop events buffer and stream live to A, in order.
     bb.agent_tx
@@ -170,7 +177,10 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
     ));
 
     let client = RelayClient::new(url.clone(), cipher.clone());
-    let mut a = client.attach().await.expect("relay attach");
+    let mut a = client
+        .attach(ClientIdentity::human("test"))
+        .await
+        .expect("relay attach");
 
     // Injected loop event streams live to the client through the WS codec.
     bb.agent_tx
@@ -188,7 +198,7 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
         .await
         .unwrap();
     match next_event(&mut a).await {
-        Some(ControllerEvent::UserMessage { text }) if text == "drive" => {}
+        Some(ControllerEvent::UserMessage { text, .. }) if text == "drive" => {}
         other => panic!("expected echoed UserMessage, got {other:?}"),
     }
 
@@ -270,7 +280,10 @@ async fn relay_sees_only_ciphertext() {
     ));
 
     let client = RelayClient::new(url.clone(), cipher.clone());
-    let mut a = client.attach().await.expect("relay attach");
+    let mut a = client
+        .attach(ClientIdentity::human("test"))
+        .await
+        .expect("relay attach");
 
     // Send the marker each way: a loop event out, a user message in (echoed back).
     bb.agent_tx
@@ -287,7 +300,7 @@ async fn relay_sees_only_ciphertext() {
         .await
         .unwrap();
     match next_event(&mut a).await {
-        Some(ControllerEvent::UserMessage { text }) if text == MARKER => {}
+        Some(ControllerEvent::UserMessage { text, .. }) if text == MARKER => {}
         other => panic!("expected echoed marker, got {other:?}"),
     }
 

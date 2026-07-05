@@ -43,12 +43,12 @@ pub fn bind_listener(path: &Path) -> Result<UnixListener> {
     }
 }
 
-// Accept one client at a time and bridge it to the broker. Serial by design:
-// handling connections one at a time makes a foreground reattach race-free — the
-// previous connection's `detach` completes (on `handle_conn` returning) before the
-// next connection's `attach` runs, so the second never sees a stale single-attach
-// lock. Only the standalone `--daemon --socket` debug host reaches here (the local
-// session's handoff is relay-only), so it logs freely — there's no TUI to corrupt.
+// Accept one client at a time and bridge it to the broker. Serial by design: the
+// broker is multi-attach, but this standalone `--daemon --socket` debug host only
+// needs one client at a time, so the accept loop stays simple. (True concurrent
+// clients — remote watch-mode — would spawn `handle_conn` per connection.) Only this
+// debug host reaches here (the local session's handoff is relay-only), so it logs
+// freely — there's no TUI to corrupt.
 async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -68,8 +68,8 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
             ConnOutcome::Disconnected => {
                 eprintln!("[daemon] client disconnected; session still running");
             }
-            // The controller's stream closed, which for a standalone daemon means
-            // the host itself is shutting down (no force-takeover here).
+            // The controller's stream closed, which means the host itself is
+            // shutting down.
             ConnOutcome::SessionEnded => {
                 eprintln!("[daemon] session ended; shutting down");
                 break;
@@ -150,9 +150,11 @@ async fn relay_dial_loop(
                     // Controller left (Quit, clean detach, dropped socket, or the
                     // relay timed out an unpaired wait): re-dial for the next one.
                     ConnOutcome::Disconnected => continue,
-                    // Host shut down (broker gone → stop) OR a local force-takeover
-                    // booted the controller (broker alive → re-dial so a device can
-                    // attach again once control hands back).
+                    // The controller's stream closed, which now happens only when the
+                    // broker itself is gone — foregrounding on the laptop no longer
+                    // boots a paired phone; they coexist. The is_alive check stays as
+                    // a cheap guard: if the broker somehow outlives the stream, re-dial
+                    // rather than exit.
                     ConnOutcome::SessionEnded => {
                         if broker.is_alive() {
                             continue;
@@ -184,25 +186,27 @@ where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
-    // Handshake: the first frame must be Attach; it carries the resume cursor.
-    let after_seq = match reader.recv().await {
-        Ok(Some(ClientFrame::Attach { after_seq })) => after_seq,
+    // Handshake: the first frame must be Attach; it carries the resume cursor and the
+    // attaching client's identity, which we forward to the broker.
+    let (after_seq, who) = match reader.recv().await {
+        Ok(Some(ClientFrame::Attach { after_seq, who })) => (after_seq, who),
         // Anything else first (or immediate EOF/error) → the client never bound;
         // nothing to detach, the session is unaffected.
         _ => return ConnOutcome::Disconnected,
     };
 
-    let controller = match broker.attach().await {
+    let controller = match broker.attach(who).await {
         Some(c) => c,
         None => {
-            // Single-attach lock held elsewhere: tell the client and drop. We
-            // never bound, so the current holder keeps running undisturbed.
+            // There is no single-attach lock — attach fails only if the broker is
+            // gone (the host shut down between our accept and this attach). Tell the
+            // client (it treats Busy as "couldn't attach") and drop.
             let _ = writer.send(&ServerFrame::Busy).await;
             return ConnOutcome::Disconnected;
         }
     };
     if writer.send(&ServerFrame::Attached).await.is_err() {
-        broker.detach();
+        // Returning drops `controller`, which detaches it — the session lives on.
         return ConnOutcome::Disconnected;
     }
 
@@ -233,13 +237,15 @@ where
                             .is_err()
                         {
                             // Socket write failed → client gone; pause in place.
-                            broker.detach();
+                            // Returning drops this controller, detaching it; the
+                            // session lives on headless.
                             return ConnOutcome::Disconnected;
                         }
                     }
-                    // The controller stream closed: the host was shut down (the
-                    // daemon process is stopping) or a force-takeover booted us.
-                    // Either way this connection is done and the daemon stops.
+                    // The controller stream closed: the broker (and the session) shut
+                    // down. Nothing else closes it now — a second client attaching no
+                    // longer boots this one — so this connection is done and the
+                    // daemon stops.
                     None => return ConnOutcome::SessionEnded,
                 }
             }
@@ -250,9 +256,9 @@ where
                         // ends the session. A daemon is a service — only stopping its
                         // process ends it — and a controller leaving (quit, detach, or
                         // drop) must never strand the others. So Quit is handled
-                        // exactly like Detach, and is not forwarded to the loop.
+                        // exactly like Detach (drop this controller and return), and is
+                        // not forwarded to the loop.
                         if matches!(ui, UiEvent::Quit) {
-                            broker.detach();
                             return ConnOutcome::Disconnected;
                         }
                         if ui_tx.send(ui).await.is_err() {
@@ -260,18 +266,15 @@ where
                         }
                     }
                     // Explicit detach or a clean EOF (client dropped the socket):
-                    // pause in place so a later client reattaches and replays.
+                    // pause in place (dropping this controller detaches it) so a later
+                    // client reattaches and replays.
                     Ok(Some(ClientFrame::Detach)) | Ok(None) => {
-                        broker.detach();
                         return ConnOutcome::Disconnected;
                     }
                     // A second Attach mid-session is a protocol error; ignore it.
                     Ok(Some(ClientFrame::Attach { .. })) => {}
                     // Transport / parse error → treat as a drop.
-                    Err(_) => {
-                        broker.detach();
-                        return ConnOutcome::Disconnected;
-                    }
+                    Err(_) => return ConnOutcome::Disconnected,
                 }
             }
         }

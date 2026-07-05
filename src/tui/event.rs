@@ -57,9 +57,9 @@ impl App {
                 });
                 self.auto_scroll = true;
             }
-            ControllerEvent::UserMessage { text } => {
+            ControllerEvent::UserMessage { text, sender } => {
                 // Rendered from the broker's echo, so live input and replay share one path.
-                self.push(LogEntry::User(text));
+                self.push(LogEntry::User { text, sender });
                 self.push(LogEntry::Blank);
                 self.auto_scroll = true;
             }

@@ -10,7 +10,7 @@ use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
 };
-use crate::core::{Controller, ControllerEvent, SessionHandle, UiEvent};
+use crate::core::{ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent};
 
 // Channel depth between the bridge tasks and the TUI. Matches the in-process
 // host's CHANNEL_CAPACITY so backpressure behaves the same across transports.
@@ -35,7 +35,11 @@ impl SocketClient {
     // Open + handshake on a fresh connection. `after_seq` is the resume cursor
     // (None = full replay). Split from the trait method so a future auto-reconnect
     // path can request replay-from-cursor without a new public API.
-    pub(crate) async fn connect(&self, after_seq: Option<u64>) -> Result<Option<Controller>> {
+    pub(crate) async fn connect(
+        &self,
+        after_seq: Option<u64>,
+        who: ClientIdentity,
+    ) -> Result<Option<Controller>> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("connecting to daemon at {}", self.socket_path.display()))?;
@@ -43,17 +47,17 @@ impl SocketClient {
         let mut reader = LineReader(BufReader::new(read_half));
         let mut writer = LineWriter(write_half);
 
-        writer.send(&ClientFrame::Attach { after_seq }).await?;
+        writer.send(&ClientFrame::Attach { after_seq, who }).await?;
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
             Some(ServerFrame::Attached) => {}
-            Some(ServerFrame::Busy) => return Ok(None), // held elsewhere
+            Some(ServerFrame::Busy) => return Ok(None), // session gone (broker down)
             // The daemon must answer the handshake with Attached or Busy; anything
             // else (including EOF) is a protocol fault.
             other => anyhow::bail!("unexpected handshake response: {other:?}"),
         }
 
-        let (event_tx, event_rx) = mpsc::channel::<ControllerEvent>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
 
         // Reader bridge: inbound Event frames → the controller's event stream.
@@ -79,8 +83,8 @@ impl SessionHandle for SocketClient {
     // ratatui's diff (the stderr-under-TUI rule). The one place that needs the
     // error's cause — the very first connect, before the TUI owns the screen — calls
     // `connect` directly (see `run_connect`) and reports it there.
-    async fn attach(&self) -> Option<Controller> {
-        self.connect(None).await.ok().flatten()
+    async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
+        self.connect(None, who).await.ok().flatten()
     }
 
     // No-op: the connection lives in the bridge tasks, not here. The TUI drops the
@@ -110,7 +114,11 @@ impl RelayClient {
     // Dial the relay + handshake on a fresh connection. Split from the trait method
     // (mirroring `SocketClient::connect`) so the first connect — run before the TUI
     // owns the screen — can surface its error cause via `run_connect`.
-    pub(crate) async fn connect(&self, after_seq: Option<u64>) -> Result<Option<Controller>> {
+    pub(crate) async fn connect(
+        &self,
+        after_seq: Option<u64>,
+        who: ClientIdentity,
+    ) -> Result<Option<Controller>> {
         let (ws, _resp) = connect_async(self.relay_url.as_str())
             .await
             .with_context(|| format!("dialing relay at {}", self.relay_url))?;
@@ -118,15 +126,15 @@ impl RelayClient {
         let mut writer = WsWriter::new(sink, self.cipher.clone());
         let mut reader = WsReader::new(stream, self.cipher.clone());
 
-        writer.send(&ClientFrame::Attach { after_seq }).await?;
+        writer.send(&ClientFrame::Attach { after_seq, who }).await?;
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
             Some(ServerFrame::Attached) => {}
-            Some(ServerFrame::Busy) => return Ok(None), // held elsewhere
+            Some(ServerFrame::Busy) => return Ok(None), // session gone (broker down)
             other => anyhow::bail!("unexpected handshake response: {other:?}"),
         }
 
-        let (event_tx, event_rx) = mpsc::channel::<ControllerEvent>(CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
         tokio::spawn(pump_reads(reader, event_tx));
         tokio::spawn(pump_writes(writer, ui_rx));
@@ -141,8 +149,8 @@ impl RelayClient {
 impl SessionHandle for RelayClient {
     // Full-replay attach, silent on failure — same contract as `SocketClient`
     // (see its `attach` for why a foreground reattach must not write to stderr).
-    async fn attach(&self) -> Option<Controller> {
-        self.connect(None).await.ok().flatten()
+    async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
+        self.connect(None, who).await.ok().flatten()
     }
 
     // No-op: the connection lives in the bridge tasks. Dropping the `Controller`
@@ -152,19 +160,19 @@ impl SessionHandle for RelayClient {
 }
 
 // Forward controller events the daemon streams us into the TUI's event channel.
-// Ends when the daemon closes the connection (clean EOF, or a force-takeover boot)
+// Ends when the daemon closes the connection (clean EOF, or the host shutting down)
 // or the TUI drops the receiver; dropping `event_tx` here closes the TUI's stream,
 // which the run loop reads as "session/connection ended".
 async fn pump_reads<R: FrameReader<ServerFrame> + 'static>(
     mut reader: R,
-    event_tx: mpsc::Sender<ControllerEvent>,
+    event_tx: mpsc::UnboundedSender<ControllerEvent>,
 ) {
     loop {
         match reader.recv().await {
             Ok(Some(ServerFrame::Event { event, .. })) => {
                 // (`seq` is the daemon's cursor bookkeeping; the client ignores it
                 // until auto-reconnect needs to resume from a cursor.)
-                if event_tx.send(event).await.is_err() {
+                if event_tx.send(event).is_err() {
                     break; // TUI dropped the stream (detach / quit)
                 }
             }

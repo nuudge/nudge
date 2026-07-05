@@ -4,8 +4,10 @@ import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import io.gitlab.hongtao1207.nudge.protocol.ClientIdentity
 import io.gitlab.hongtao1207.nudge.protocol.ControllerEvent
 import io.gitlab.hongtao1207.nudge.protocol.Pairing
 import io.gitlab.hongtao1207.nudge.protocol.RelayClient
@@ -33,6 +35,9 @@ data class ChatLine(
     val text: String,
     val body: String? = null,
     val isError: Boolean = false,
+    // For a User line, the sender's name when it wasn't us (another party in a shared
+    // session); null for our own turns, which render without a name label.
+    val sender: String? = null,
 )
 
 // The tool-call permission the agent is currently blocked on, awaiting our answer.
@@ -77,6 +82,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private var client: RelayClient? = null
     private var pairing: Pairing? = null
     private var nextId = 0L
+
+    // This device's identity, announced at attach so the daemon (and any co-attached
+    // laptop) can attribute our turns. The device model is a recognizable label.
+    private val identity = ClientIdentity.human(Build.MODEL)
 
     // Watch the default network so a wifi↔cellular handoff redials immediately instead of
     // waiting ~20-40s for OkHttp's ping to notice the stranded socket. Callbacks arrive off
@@ -148,7 +157,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val p = pairing ?: return
         client?.close()
         generation++
-        client = RelayClient(p, listener(generation)).also { it.connect(afterSeq) }
+        client = RelayClient(p, listener(generation), identity).also { it.connect(afterSeq) }
     }
 
     // Called when the app returns to the foreground (or launches). If we're bound and
@@ -244,15 +253,22 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         override fun onBusy() {
+            // With the daemon multi-attach, an attach is refused only when there's no
+            // live session (the broker is gone) — not because another controller holds it.
             if (live()) _state.update {
-                it.copy(connection = Connection.Busy, status = "Busy — another controller holds the session")
+                it.copy(connection = Connection.Busy, status = "The daemon has no live session")
             }
         }
 
         override fun onEvent(seq: Long, event: ControllerEvent) {
             if (!live()) return
             when (event) {
-                is ControllerEvent.UserMessage -> append(Role.User, event.text)
+                is ControllerEvent.UserMessage -> {
+                    // Attribute to the sender unless it's us (or unstamped) — then it's
+                    // a plain own-turn bubble.
+                    val from = event.sender.takeIf { it.isNotEmpty() && it != identity.name }
+                    append(Role.User, event.text, sender = from)
+                }
                 is ControllerEvent.AssistantText -> append(Role.Assistant, event.text)
                 is ControllerEvent.AssistantThinking -> append(Role.Thinking, event.text)
                 is ControllerEvent.ToolUseStart ->
@@ -360,8 +376,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (previous != null && previous != network && wantConnected) forceReconnect()
     }
 
-    private fun append(role: Role, text: String, body: String? = null, isError: Boolean = false) =
-        _state.update { it.copy(lines = it.lines + ChatLine(nextId++, role, text, body, isError)) }
+    private fun append(
+        role: Role,
+        text: String,
+        body: String? = null,
+        isError: Boolean = false,
+        sender: String? = null,
+    ) = _state.update {
+        it.copy(lines = it.lines + ChatLine(nextId++, role, text, body, isError, sender))
+    }
 
     override fun onCleared() {
         connectivityManager?.unregisterNetworkCallback(networkCallback)

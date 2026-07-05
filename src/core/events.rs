@@ -132,9 +132,12 @@ pub enum ControllerEvent {
     },
     // Echo of a submitted user message, so every controller (including one that
     // attaches later and replays) reconstructs the user's turns too — the loop
-    // emits no event for these.
+    // emits no event for these. `sender` is the display name of whoever sent it
+    // (the broker stamps it from that controller's announced identity), so a shared
+    // session can attribute each turn; a controller renders its own name as "you".
     UserMessage {
         text: String,
+        sender: String,
     },
     TurnComplete,
     MaxIterations,
