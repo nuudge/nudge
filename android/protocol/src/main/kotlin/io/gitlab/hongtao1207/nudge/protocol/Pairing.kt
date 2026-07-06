@@ -14,8 +14,13 @@ class Pairing(
     val rendezvousId: String,
     val cipher: Cipher,
 ) {
-    // The wss URL both peers dial: relay base + room id as the single path segment.
+    // The room URL both peers build on: relay base + room id as a path segment. The
+    // relay pairs a host with a client by a trailing role segment (it can't read the
+    // encrypted attach frame), so a front-end dials `clientDialUrl()`.
     fun dialUrl(): String = "${relayBase.trimEnd('/')}/$rendezvousId"
+
+    // The URL a front-end (this app) dials — the room URL plus the `client` role.
+    fun clientDialUrl(): String = "${dialUrl()}/client"
 
     companion object {
         private const val SCHEME = "nudge:"

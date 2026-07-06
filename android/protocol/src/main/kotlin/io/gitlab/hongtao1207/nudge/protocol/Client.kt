@@ -42,7 +42,7 @@ class RelayClient(
     // Open the connection and attach. afterSeq = null is a fresh attach (full replay);
     // pass lastSeq to resume after a drop and replay only the events that were missed.
     fun connect(afterSeq: Long? = null) {
-        val request = Request.Builder().url(toHttpUrl(pairing.dialUrl())).build()
+        val request = Request.Builder().url(toHttpUrl(pairing.clientDialUrl())).build()
         webSocket = httpClient.newWebSocket(
             request,
             object : WebSocketListener() {

@@ -1,19 +1,26 @@
 // A tiny, ciphertext-blind WebSocket relay (Phase 8.2-b): the publicly-reachable
-// box both peers dial OUT to — the only direction that crosses NAT/CGNAT. Its
-// whole job is to pair two connections that name the same rendezvous id (taken
-// from the URL path) and copy WebSocket messages between them verbatim. It never
-// inspects a payload, knows nothing of the agent's wire protocol, and has no
-// notion of "host" vs "controller" — so once the app-layer E2E lands (8.2-d) it
-// forwards only ciphertext, with no change here. Sharing no code with the agent,
-// it lives as a standalone binary that can lift into its own repo to deploy.
+// box both peers dial OUT to — the only direction that crosses NAT/CGNAT. Its whole
+// job is to pair connections that name the same rendezvous id (the URL path is
+// `<room_id>/<role>`) and copy WebSocket messages between a pair verbatim. It never
+// inspects a payload — so once the app-layer E2E lands (8.2-d) it forwards only
+// ciphertext, with no change here. The one thing it reads is the plaintext `role`
+// segment (`host` or `client`): the relay can't open the encrypted attach frame, so
+// the role is the only signal telling the session host apart from a front-end.
+// Sharing no code with the agent, it lives as a standalone binary that can lift into
+// its own repo to deploy.
 //
-// Pairing handoff: the first arriver for an id parks a oneshot sender in the
-// rendezvous map and waits (bounded); the second arriver takes that sender, hands
-// its socket over, and exits, leaving the first task to own the bidirectional
-// pump. TLS and per-hop keepalive are deploy concerns (8.3); locally this is plain
-// ws:// on a loopback port.
+// Room model: one session's daemon is the single *host* (it opens one connection per
+// client — a byte-blind pipe joins exactly two sockets, so it can't fan one host
+// socket to many). A room holds two queues of parked waiters, `host_conns` and
+// `client_conns`; an arriver pairs with a waiter in the *opposite* queue (so two
+// clients never pair with each other) or parks in its own. A client parks bounded
+// (a lonely client — no host during a re-dial gap, or a hostless room — is closed on
+// timeout); a host spare parks indefinitely, since waiting for the next client is its
+// whole job. The paired-with party owns the bidirectional pump. TLS and per-hop
+// keepalive are deploy concerns (8.3); locally this is plain ws:// on a loopback port.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -45,9 +52,42 @@ struct Cli {
 }
 
 type Ws = WebSocketStream<TcpStream>;
-// Rendezvous map: id → (token, sender). The token lets a timed-out waiter evict
-// only *its own* entry, never a later waiter that reused the same id.
-type Rendezvous = Arc<Mutex<HashMap<String, (u64, oneshot::Sender<Ws>)>>>;
+
+// Which side of a session a connection dialed as. The only plaintext the relay reads
+// (from the path's trailing segment) — it can't see the encrypted attach frame.
+#[derive(Clone, Copy)]
+enum Role {
+    Host,
+    Client,
+}
+
+// One rendezvous room: parked waiters split by role. Each entry is `(token, sender)`;
+// the token lets a timed-out or dropped waiter evict only *its own* entry, never a
+// later waiter that pushed onto the same queue.
+#[derive(Default)]
+struct Room {
+    host_conns: VecDeque<(u64, oneshot::Sender<Ws>)>,
+    client_conns: VecDeque<(u64, oneshot::Sender<Ws>)>,
+}
+
+impl Room {
+    // A host spare is parked right now. Derived from the queue (no separate field to
+    // keep in sync); reads false in the brief re-dial gap after a spare is consumed
+    // and before the daemon parks the next one — so it gates teardown, not admission.
+    fn host_present(&self) -> bool {
+        !self.host_conns.is_empty()
+    }
+
+    // Nothing left to rendezvous: no host spare parked and no client waiting. The room
+    // is host-anchored, so this is the one place it gets torn down.
+    fn removable(&self) -> bool {
+        !self.host_present() && self.client_conns.is_empty()
+    }
+}
+
+// Rendezvous map: room id → its parked waiters. A room is created on first arrival
+// and removed once both its queues drain.
+type Rendezvous = Arc<Mutex<HashMap<String, Room>>>;
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
@@ -91,47 +131,97 @@ async fn handle_conn(
     rendezvous: Rendezvous,
     pair_timeout: Duration,
 ) -> Result<()> {
-    // Capture the rendezvous id from the upgrade request path during the WS
-    // handshake. The path is the only plaintext the relay ever sees — a room
-    // number, not secret content (the pairing key that seeds E2E never comes here).
-    let mut id = String::new();
+    // Capture the request path during the WS handshake — the only plaintext the relay
+    // ever sees. It is `<room_id>/<role>`: the room id is the secret rendezvous number
+    // (not content — the E2E key never comes here), the role is `host` or `client`.
+    let mut path = String::new();
     let ws = accept_hdr_async(stream, |req: &Request, resp: Response| {
-        id = req.uri().path().trim_start_matches('/').to_string();
+        path = req.uri().path().trim_start_matches('/').to_string();
         Ok(resp)
     })
     .await
     .context("websocket handshake failed")?;
 
-    if id.is_empty() {
-        anyhow::bail!("client did not name a rendezvous id (empty path)");
-    }
+    // Split off the trailing role segment; whatever precedes it is the room id.
+    let (id, role) = match path.rsplit_once('/') {
+        Some((id, "host")) if !id.is_empty() => (id.to_string(), Role::Host),
+        Some((id, "client")) if !id.is_empty() => (id.to_string(), Role::Client),
+        _ => anyhow::bail!("client did not name a rendezvous id and role (path '{path}')"),
+    };
 
-    // Already a peer waiting on this id? Then we're the second arriver: take their
-    // sender and hand our socket over — they own the bidirectional pump.
-    let waiting = rendezvous.lock().await.remove(&id);
-    if let Some((_token, partner_tx)) = waiting {
-        return partner_tx
-            .send(ws)
-            .map_err(|_| anyhow::anyhow!("partner for '{id}' vanished before pairing"));
-    }
+    park_or_pair(ws, id, role, rendezvous, pair_timeout).await
+}
 
-    // First arriver: register a waiter and block (bounded) for a partner. We do
-    // NOT read this socket while parked — anything the peer sends early just sits
-    // in the TCP buffer until the pump starts, so no message is lost.
+// Pair with a waiter in the *opposite* queue if one exists (so two clients never pair
+// with each other), else park in this role's own queue and wait for a partner. The
+// party that parks owns the pump; the party that arrives second hands its socket over
+// and exits. A client's wait is bounded by `pair_timeout`; a host spare parks with no
+// timeout (waiting for the next client is its whole purpose). While parked we do NOT
+// read the socket — anything the peer sends early just sits in the TCP buffer until
+// the pump starts, so no message is lost.
+async fn park_or_pair(
+    ws: Ws,
+    id: String,
+    role: Role,
+    rendezvous: Rendezvous,
+    pair_timeout: Duration,
+) -> Result<()> {
     let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = oneshot::channel::<Ws>();
-    rendezvous.lock().await.insert(id.clone(), (token, tx));
-
-    match tokio::time::timeout(pair_timeout, rx).await {
-        Ok(Ok(partner)) => pipe(ws, partner).await,
-        _ => {
-            // Timed out (or the sender was dropped): evict our entry, but only if
-            // it's still ours — a later waiter may have reused the id meanwhile.
-            let mut map = rendezvous.lock().await;
-            if matches!(map.get(&id), Some((t, _)) if *t == token) {
+    let rx = {
+        let mut map = rendezvous.lock().await;
+        let room = map.entry(id.clone()).or_default();
+        let opposite = match role {
+            Role::Host => &mut room.client_conns,
+            Role::Client => &mut room.host_conns,
+        };
+        if let Some((_partner_token, partner_tx)) = opposite.pop_front() {
+            // A partner is parked: hand our socket over — it owns the pump — and exit.
+            if room.removable() {
                 map.remove(&id);
             }
+            return partner_tx
+                .send(ws)
+                .map_err(|_| anyhow::anyhow!("partner for '{id}' vanished before pairing"));
+        }
+        // No partner: park in our own queue and wait.
+        let (tx, rx) = oneshot::channel::<Ws>();
+        match role {
+            Role::Host => room.host_conns.push_back((token, tx)),
+            Role::Client => room.client_conns.push_back((token, tx)),
+        }
+        rx
+    };
+
+    // Hosts wait indefinitely; clients are bounded so a lonely one can't accumulate.
+    let paired = match role {
+        Role::Host => rx.await.ok(),
+        Role::Client => tokio::time::timeout(pair_timeout, rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok()),
+    };
+    match paired {
+        Some(partner) => pipe(ws, partner).await,
+        None => {
+            evict(&rendezvous, &id, role, token).await;
             anyhow::bail!("no partner connected for '{id}' within {pair_timeout:?}")
+        }
+    }
+}
+
+// Remove our own parked entry (matched by token, so a later waiter on the same queue
+// is untouched) after a timeout or a dropped sender, and drop the room if it's now
+// empty. A no-op if the room or our entry is already gone.
+async fn evict(rendezvous: &Rendezvous, id: &str, role: Role, token: u64) {
+    let mut map = rendezvous.lock().await;
+    if let Some(room) = map.get_mut(id) {
+        let queue = match role {
+            Role::Host => &mut room.host_conns,
+            Role::Client => &mut room.client_conns,
+        };
+        queue.retain(|(t, _)| *t != token);
+        if room.removable() {
+            map.remove(id);
         }
     }
 }
@@ -193,12 +283,23 @@ mod tests {
         Message::Binary(bytes.to_vec())
     }
 
-    // Two clients on the same id are paired; opaque bytes flow both directions.
+    // Await one Binary message's payload, failing loudly instead of hanging.
+    async fn recv(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Vec<u8> {
+        timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("recv timed out")
+            .expect("stream ended")
+            .expect("recv errored")
+            .into_data()
+            .to_vec()
+    }
+
+    // A host and a client on the same id are paired; opaque bytes flow both directions.
     #[tokio::test]
     async fn pairs_and_pipes_both_directions() {
         let port = start_relay(DEFAULT_PAIR_TIMEOUT).await;
-        let mut a = dial(port, "room1").await;
-        let mut b = dial(port, "room1").await;
+        let mut a = dial(port, "room1/host").await;
+        let mut b = dial(port, "room1/client").await;
 
         a.send(bin(b"hello-b")).await.unwrap();
         let got = timeout(Duration::from_secs(2), b.next())
@@ -221,9 +322,9 @@ mod tests {
     #[tokio::test]
     async fn different_ids_are_isolated() {
         let port = start_relay(Duration::from_secs(5)).await;
-        let mut a1 = dial(port, "room1").await;
-        let mut a2 = dial(port, "room1").await; // pairs with a1
-        let mut b = dial(port, "room2").await; // lonely, different id
+        let mut a1 = dial(port, "room1/host").await;
+        let mut a2 = dial(port, "room1/client").await; // pairs with a1
+        let mut b = dial(port, "room2/client").await; // lonely, different id
 
         a1.send(bin(b"secret")).await.unwrap();
         let got = timeout(Duration::from_secs(2), a2.next())
@@ -239,11 +340,12 @@ mod tests {
         );
     }
 
-    // An unpaired waiter is closed once the pairing timeout elapses.
+    // An unpaired *client* is closed once the pairing timeout elapses (a host spare is
+    // not — see `parked_host_is_not_timed_out`).
     #[tokio::test]
     async fn lonely_waiter_is_dropped_after_timeout() {
         let port = start_relay(Duration::from_millis(300)).await;
-        let mut a = dial(port, "solo").await;
+        let mut a = dial(port, "solo/client").await;
 
         let res = timeout(Duration::from_secs(2), a.next())
             .await
@@ -253,5 +355,74 @@ mod tests {
             Some(Ok(m)) => assert!(m.is_close(), "expected close, got {m:?}"),
             Some(Err(_)) => {} // reset is acceptable too
         }
+    }
+
+    // The room survives a pairing: a host serves two clients in turn (the daemon parks
+    // a fresh spare after each), proving the room isn't consumed like the old FIFO pair.
+    #[tokio::test]
+    async fn host_serves_two_sequential_clients() {
+        let port = start_relay(DEFAULT_PAIR_TIMEOUT).await;
+
+        let mut host1 = dial(port, "room/host").await;
+        let mut a = dial(port, "room/client").await;
+        a.send(bin(b"to-host-1")).await.unwrap();
+        assert_eq!(recv(&mut host1).await, b"to-host-1");
+
+        // The daemon parks another spare; a second client pairs with the same room.
+        let mut host2 = dial(port, "room/host").await;
+        let mut b = dial(port, "room/client").await;
+        b.send(bin(b"to-host-2")).await.unwrap();
+        assert_eq!(recv(&mut host2).await, b"to-host-2");
+    }
+
+    // A client arriving before any host parks (not fails); the host pairs with it.
+    // This is the re-dial gap: a client can land while the host pool is momentarily
+    // empty and must wait, not be rejected.
+    #[tokio::test]
+    async fn client_waits_for_host_then_pairs() {
+        let port = start_relay(DEFAULT_PAIR_TIMEOUT).await;
+
+        let mut c = dial(port, "room/client").await;
+        let mut h = dial(port, "room/host").await;
+        h.send(bin(b"hello-client")).await.unwrap();
+        assert_eq!(recv(&mut c).await, b"hello-client");
+    }
+
+    // Two clients on the same id never pair with each other — both are lonely and get
+    // closed on timeout (role-awareness: a client only pairs with a host).
+    #[tokio::test]
+    async fn two_clients_do_not_pair_with_each_other() {
+        let port = start_relay(Duration::from_millis(300)).await;
+        let mut c1 = dial(port, "room/client").await;
+        let mut c2 = dial(port, "room/client").await;
+
+        for c in [&mut c1, &mut c2] {
+            let res = timeout(Duration::from_secs(2), c.next())
+                .await
+                .expect("a client that mispaired would stay open past the timeout");
+            match res {
+                None => {}
+                Some(Ok(m)) => assert!(m.is_close(), "expected close, got {m:?}"),
+                Some(Err(_)) => {}
+            }
+        }
+    }
+
+    // A parked host spare outlives the pair timeout (only clients are bounded), and
+    // still pairs once a client finally arrives.
+    #[tokio::test]
+    async fn parked_host_is_not_timed_out() {
+        let port = start_relay(Duration::from_millis(200)).await;
+        let mut h = dial(port, "room/host").await;
+
+        // No close within a window well past the client timeout.
+        assert!(
+            timeout(Duration::from_millis(500), h.next()).await.is_err(),
+            "a parked host must not be closed by the pair timeout"
+        );
+
+        let mut c = dial(port, "room/client").await;
+        c.send(bin(b"late")).await.unwrap();
+        assert_eq!(recv(&mut h).await, b"late");
     }
 }
