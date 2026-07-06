@@ -17,7 +17,7 @@ edition = "2024"
 description = "A coding agent for your terminal and on the go, written in Rust from scratch."
 license = "MIT"
 readme = "README.md"
-repository = "https://gitlab.com/hongtao1207/nudge"
+repository = "https://github.com/nuudge/nudge"
 keywords = ["agent", "llm", "claude", "tui", "cli"]
 categories = ["command-line-utilities"]
 

@@ -1,5 +1,3 @@
-[[_TOC_]]
-
 # nudge
 
 Yet another coding agent — except this one doesn't sleep, doesn't quit, and follows you home. Written in Rust from scratch: no agent SDK, no framework, no abstraction tax, just the raw LLM API over HTTP. The loop is decoupled from the UI, so a session outlives any front-end — detach it, reattach from another terminal, or **drive it live from your phone** over an end-to-end-encrypted link.
@@ -38,7 +36,7 @@ nudge is three components: the **terminal agent** (the whole product on its own)
 Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API key. CI builds on Rust 1.96.0; recent stable usually works too.
 
 ```bash
-git clone https://gitlab.com/hongtao1207/nudge.git && cd nudge
+git clone https://github.com/nuudge/nudge.git && cd nudge
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
 cargo run
 ```
@@ -47,7 +45,7 @@ cargo run
 
 ```bash
 cargo install --path .                 # from a local checkout
-cargo install --git https://gitlab.com/hongtao1207/nudge   # straight from git
+cargo install --git https://github.com/nuudge/nudge   # straight from git
 ```
 
 The installed binary reads `ANTHROPIC_API_KEY` from the environment. To avoid setting it per project, put it in a global config at `~/.nudge/config.env`:
@@ -97,12 +95,12 @@ Without a relay, `/background` still detaches the session locally and `--socket`
 
 Minimum device API is 26 (Android 8.0). Install the prebuilt APK if you trust me, or build your own from source — then launch and pair as described at the bottom.
 
-- **Install the prebuilt APK (optional).** I publish a signed release APK to the project's package registry, so you can skip the Android toolchain entirely. This is purely a matter of trust: the APK is signed with my release key, and installing it means trusting that key and that I built it honestly:
+- **Install the prebuilt APK (optional).** I publish a signed release APK to the project's GitHub Releases, so you can skip the Android toolchain entirely. This is purely a matter of trust: the APK is signed with my release key, and installing it means trusting that key and that I built it honestly:
 
    ```bash
-   # browse available versions at https://gitlab.com/hongtao1207/nudge/-/packages
+   # browse available versions at https://github.com/nuudge/nudge/releases
    curl -fL -o nudge.apk \
-     "https://gitlab.com/api/v4/projects/83699725/packages/generic/nudge-android/0.1/nudge.apk"
+     "https://github.com/nuudge/nudge/releases/latest/download/nudge.apk"
    adb install nudge.apk    # or copy nudge.apk to your phone and tap it (enable "install unknown apps")
    ```
 
@@ -204,7 +202,7 @@ A few capabilities common to mature coding agents are deliberately absent today,
 
 ## Development
 
-The repo ships a `mise.toml` of dev tasks (`mise run` lists them); `mise run ci` mirrors the GitLab CI pipeline exactly — run it before pushing. Install the Rust toolchain with [rustup](https://rustup.rs); mise is a task runner only and does not manage it.
+The repo ships a `mise.toml` of dev tasks (`mise run` lists them); `mise run ci` mirrors the GitHub Actions pipeline exactly — run it before pushing. Install the Rust toolchain with [rustup](https://rustup.rs); mise is a task runner only and does not manage it.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full toolchain setup, local checks, and merge-request workflow.
 

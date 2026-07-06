@@ -60,8 +60,8 @@ The agent needs an `ANTHROPIC_API_KEY`; see the
 
 ## Checks before you push
 
-Run the full check bundle locally before opening a merge request. It mirrors the
-GitLab CI pipeline exactly:
+Run the full check bundle locally before opening a pull request. It mirrors the
+GitHub Actions pipeline exactly:
 
 ```bash
 mise run ci              # fmt --check + clippy -D warnings + tests
@@ -87,11 +87,11 @@ cargo test --all
 ## Submitting a change
 
 1. Create a branch off `main`.
-2. Keep the change focused; unrelated cleanups belong in their own MR.
+2. Keep the change focused; unrelated cleanups belong in their own PR.
 3. Write a descriptive commit message. Follow the existing prefix style:
    `feature:`, `fix:`, `refactor:`, `doc:`, `chore:`.
 4. Make sure `mise run ci` passes.
-5. Open a **Merge Request** against `main`. CI must be green to merge.
+5. Open a **Pull Request** against `main`. CI must be green to merge.
 
 For larger or design-affecting changes, open an issue first to discuss the
 approach before investing the work.
