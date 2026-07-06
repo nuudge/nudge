@@ -48,6 +48,21 @@ cargo install --path .                 # from a local checkout
 cargo install --git https://github.com/nuudge/nudge   # straight from git
 ```
 
+**Or download a prebuilt binary.** To skip the Rust toolchain, grab a released build for your platform from [the releases page](https://github.com/nuudge/nudge/releases) (built by CI from the tagged source). Pick the asset for your OS and CPU, make it executable, and put it on your `PATH`:
+
+```bash
+# Linux x86-64 — needs glibc 2.35+ (Ubuntu 22.04 / Debian 12 or newer)
+curl -fL -o nudge "https://github.com/nuudge/nudge/releases/latest/download/nudge-x86_64-unknown-linux-gnu"
+# macOS — Apple Silicon (M-series)
+curl -fL -o nudge "https://github.com/nuudge/nudge/releases/latest/download/nudge-aarch64-apple-darwin"
+# macOS — Intel
+curl -fL -o nudge "https://github.com/nuudge/nudge/releases/latest/download/nudge-x86_64-apple-darwin"
+
+chmod +x nudge && sudo mv nudge /usr/local/bin/   # or anywhere on your PATH
+```
+
+Each binary ships a matching `.sha256` on the release if you want to verify the download. The binaries are **not code-signed**, so on macOS Gatekeeper blocks the first launch — clear the quarantine flag with `xattr -d com.apple.quarantine /usr/local/bin/nudge` (or right-click → Open once). No prebuilt is published for older Linux (glibc < 2.35), Linux on ARM, or Windows — build from source with `cargo install` above.
+
 The installed binary reads `ANTHROPIC_API_KEY` from the environment. To avoid setting it per project, put it in a global config at `~/.nudge/config.env`:
 
 ```bash
