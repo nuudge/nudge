@@ -182,6 +182,11 @@ impl App {
                 if trimmed.is_empty() {
                     return;
                 }
+                if trimmed.eq_ignore_ascii_case("exit") {
+                    let _ = ui_tx.try_send(UiEvent::Quit);
+                    self.quit = true;
+                    return;
+                }
                 // Single-line `/...` is a slash command; multi-line starting with `/` is a message.
                 if trimmed.starts_with('/') && !trimmed.contains('\n') {
                     let cmd = trimmed.to_string();
@@ -368,4 +373,42 @@ pub(super) fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<Strin
         rows.push(String::new());
     }
     (rows, cursor_row, cursor_col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::app::UiConfig;
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(UiConfig {
+            session_id: "s".into(),
+            session_name: None,
+            model: "m".into(),
+            thinking_display: "".into(),
+            pairing_qr: None,
+            pairing_code: None,
+            is_owner: true,
+            user_name: "u".into(),
+        })
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn typing_exit_quits_case_insensitively() {
+        for word in ["exit", "ExIt"] {
+            let mut app = test_app();
+            let (tx, mut rx) = mpsc::channel(4);
+            for c in word.chars() {
+                app.handle_key(press(KeyCode::Char(c)), &tx);
+            }
+            app.handle_key(press(KeyCode::Enter), &tx);
+
+            assert!(app.quit);
+            assert!(matches!(rx.try_recv(), Ok(UiEvent::Quit)));
+        }
+    }
 }
