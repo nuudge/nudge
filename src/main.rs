@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
                 )?;
                 let pairing = transport::Pairing::generate(base);
                 print_pairing(&pairing)?;
-                transport::run_relay_daemon(pairing.dial_url(), pairing.cipher, broker).await
+                transport::run_relay_daemon(pairing.host_dial_url(), pairing.cipher, broker).await
             }
         };
         let daemon_result = tokio::select! {
@@ -260,7 +260,7 @@ async fn main() -> Result<()> {
             let pairing = transport::Pairing::generate(base);
             ui_cfg.pairing_qr = Some(pairing.render_qr()?);
             ui_cfg.pairing_code = Some(pairing.encode());
-            let dial_url = pairing.dial_url();
+            let dial_url = pairing.host_dial_url();
             let cipher = pairing.cipher;
             let broker = host.broker_handle();
             let (status_tx, status_rx) = mpsc::channel::<core::HandoffStatus>(HANDOFF_STATUS_CAP);
@@ -334,7 +334,7 @@ async fn run_connect(cli: Cli) -> Result<()> {
         // A scanned pairing code is self-contained: it carries the relay URL, room
         // id, and E2E key, so it needs no other flags.
         let pairing = transport::Pairing::decode(&code)?;
-        let client = transport::RelayClient::new(pairing.dial_url(), pairing.cipher);
+        let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
         let controller = match client.connect(None, who.clone()).await? {
             Some(c) => c,
             None => bail!("could not attach: the relay session has ended"),

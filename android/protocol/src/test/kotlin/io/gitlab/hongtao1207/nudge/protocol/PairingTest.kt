@@ -23,6 +23,7 @@ class PairingTest {
         assertEquals(relay, p.relayBase)
         assertEquals(expectedId, p.rendezvousId)
         assertEquals("$relay/$expectedId", p.dialUrl())
+        assertEquals("$relay/$expectedId/client", p.clientDialUrl())
 
         // The key survived decoding: a frame sealed under the raw key opens under
         // the decoded cipher — matching keys on both ends is the whole point.

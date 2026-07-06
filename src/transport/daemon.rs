@@ -93,11 +93,10 @@ pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHan
 
 // Headless daemon hosting the session over the relay (the `--daemon --relay`
 // process). Unlike the Unix daemon it does not listen — it dials OUT to the relay
-// (the only direction that crosses NAT) and is paired there with a controller.
-// Each pairing is one connection: when the controller leaves, the relay tears our
-// side down too, so we re-dial to be available for the next one. A controller's Quit
-// is just a detach (we re-dial); the session ends only when this daemon process is
-// stopped, which the caller turns into a graceful host shutdown.
+// (the only direction that crosses NAT) as this session's single host, parking one
+// spare connection and opening one more per attached client (see `relay_dial_loop`).
+// A controller's Quit is just a detach; the session ends only when this daemon
+// process is stopped, which the caller turns into a graceful host shutdown.
 pub async fn run_relay_daemon(
     relay_url: String,
     cipher: Cipher,
@@ -122,50 +121,62 @@ pub async fn serve_relay_handoff(
     relay_dial_loop(relay_url, cipher, broker, Some(status)).await;
 }
 
-// Dial OUT to the relay (the only direction that crosses NAT), pair with a
-// controller, and bridge it to the broker; re-dial when the controller leaves so
-// the next one can attach. `status` distinguishes the two callers: `None` is the
-// standalone `--daemon` (logs to stderr, retries forever on an unreachable relay);
-// `Some(tx)` is the co-located in-process handoff (silent, reports progress to the
-// TUI, and does NOT retry a failed dial — the user re-/background to try again).
+// Keep one spare host connection parked on the relay at all times. Each iteration
+// dials OUT (the only direction that crosses NAT), parks as the room's host spare,
+// and blocks until a client pairs with it — the first frame (its Attach) is that
+// signal. On pairing we hand the connection to a `bridge` task and immediately loop
+// to dial the next spare, so a second client never waits: the broker is multi-attach,
+// so every bridge attaches alongside the others. A client leaving ends only its own
+// bridge task. The loop (and the daemon) ends only when the broker is gone.
+//
+// `status` distinguishes the two callers: `None` is the standalone `--daemon` (logs
+// to stderr, retries forever on an unreachable relay); `Some(tx)` is the co-located
+// in-process handoff (silent, reports progress to the TUI, and does NOT retry a failed
+// dial — the user re-/background to try again). Connecting/Connected are reported once
+// on the first successful park, not on every re-dial, so the pair screen doesn't
+// flicker as spares rotate.
 async fn relay_dial_loop(
     relay_url: String,
     cipher: Cipher,
     broker: BrokerHandle,
     status: Option<mpsc::Sender<HandoffStatus>>,
 ) {
+    let mut announced = false;
     loop {
-        if let Some(s) = &status {
+        // Broker gone (host shut down) → stop parking spares; live bridge tasks wind
+        // down on their own when their broker sends start failing.
+        if !broker.is_alive() {
+            break;
+        }
+        if !announced && let Some(s) = &status {
             let _ = s.send(HandoffStatus::Connecting).await;
         }
         match connect_async(relay_url.as_str()).await {
             Ok((ws, _resp)) => {
-                if let Some(s) = &status {
-                    let _ = s.send(HandoffStatus::Connected).await;
+                if !announced {
+                    if let Some(s) = &status {
+                        let _ = s.send(HandoffStatus::Connected).await;
+                    }
+                    announced = true;
                 }
                 let (sink, stream) = ws.split();
-                let reader = WsReader::new(stream, cipher.clone());
+                let mut reader = WsReader::new(stream, cipher.clone());
                 let writer = WsWriter::new(sink, cipher.clone());
-                match handle_conn(reader, writer, &broker).await {
-                    // Controller left (Quit, clean detach, dropped socket, or the
-                    // relay timed out an unpaired wait): re-dial for the next one.
-                    ConnOutcome::Disconnected => continue,
-                    // The controller's stream closed, which now happens only when the
-                    // broker itself is gone — foregrounding on the laptop no longer
-                    // boots a paired phone; they coexist. The is_alive check stays as
-                    // a cheap guard: if the broker somehow outlives the stream, re-dial
-                    // rather than exit.
-                    ConnOutcome::SessionEnded => {
-                        if broker.is_alive() {
-                            continue;
-                        }
-                        break;
-                    }
+                // Parked as a host spare: this await is the wait for a client to pair.
+                // On pairing, serve the client on its own task, then loop to re-dial a
+                // fresh spare so the next client pairs immediately. If the relay instead
+                // dropped our spare before any client paired (relay restart, etc.),
+                // recv_attach yields None and we just loop to re-dial.
+                if let Some((after_seq, who)) = recv_attach(&mut reader).await {
+                    let broker = broker.clone();
+                    tokio::spawn(async move {
+                        bridge(reader, writer, &broker, after_seq, who).await;
+                    });
                 }
             }
             Err(e) => match &status {
-                // Co-located: surface the failure to the TUI and stop. Handoff is
-                // unavailable until the next /background fires a fresh dial.
+                // Co-located: surface the failure to the TUI and stop dialing new
+                // spares. Live bridges keep running; the next /background re-arms.
                 Some(s) => {
                     let _ = s.send(HandoffStatus::Failed(format!("{e}"))).await;
                     break;
@@ -181,20 +192,49 @@ async fn relay_dial_loop(
     }
 }
 
-async fn handle_conn<R, W>(mut reader: R, mut writer: W, broker: &BrokerHandle) -> ConnOutcome
+// Handshake read, split out so the relay dial loop can treat "the first frame
+// arrived" as its pairing signal: while a host connection is parked on the relay no
+// frame comes, so this pending `recv` *is* the parked-spare state. Resolves to the
+// attach params once a client pairs and sends its Attach; `None` on anything else
+// (wrong first frame, EOF, or error) — the client never bound, nothing to detach.
+async fn recv_attach<R>(reader: &mut R) -> Option<(Option<u64>, crate::core::ClientIdentity)>
+where
+    R: FrameReader<ClientFrame>,
+{
+    match reader.recv().await {
+        Ok(Some(ClientFrame::Attach { after_seq, who })) => Some((after_seq, who)),
+        _ => None,
+    }
+}
+
+// Combined handshake + bridge for the serial Unix debug host: read the Attach, then
+// serve. The relay path calls `recv_attach` and `bridge` separately so it can spawn
+// each client's `bridge` on its own task and immediately re-dial a spare.
+async fn handle_conn<R, W>(mut reader: R, writer: W, broker: &BrokerHandle) -> ConnOutcome
 where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
-    // Handshake: the first frame must be Attach; it carries the resume cursor and the
-    // attaching client's identity, which we forward to the broker.
-    let (after_seq, who) = match reader.recv().await {
-        Ok(Some(ClientFrame::Attach { after_seq, who })) => (after_seq, who),
-        // Anything else first (or immediate EOF/error) → the client never bound;
-        // nothing to detach, the session is unaffected.
-        _ => return ConnOutcome::Disconnected,
-    };
+    match recv_attach(&mut reader).await {
+        Some((after_seq, who)) => bridge(reader, writer, broker, after_seq, who).await,
+        None => ConnOutcome::Disconnected,
+    }
+}
 
+// Bridge one attached client to the broker: register the controller, stream its
+// replay+live events out, and forward its commands in, until it leaves. `after_seq`
+// and `who` come from the already-read Attach frame.
+async fn bridge<R, W>(
+    mut reader: R,
+    mut writer: W,
+    broker: &BrokerHandle,
+    after_seq: Option<u64>,
+    who: crate::core::ClientIdentity,
+) -> ConnOutcome
+where
+    R: FrameReader<ClientFrame>,
+    W: FrameWriter<ServerFrame>,
+{
     let controller = match broker.attach(who).await {
         Some(c) => c,
         None => {

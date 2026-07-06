@@ -17,7 +17,7 @@ fun main(args: Array<String>) {
     }
     val pairing = Pairing.decode(args[0])
     val message = args.getOrNull(1) ?: "Reply with exactly five words and use no tools."
-    println("dialing ${pairing.dialUrl()}")
+    println("dialing ${pairing.clientDialUrl()}")
 
     val done = CountDownLatch(1)
     lateinit var client: RelayClient

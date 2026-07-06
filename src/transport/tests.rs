@@ -336,3 +336,126 @@ async fn relay_sees_only_ciphertext() {
 
     bb.task.abort();
 }
+
+// A role-aware test relay: pairs a `host`-role connection with a `client`-role one by
+// room id (path `<room>/<role>`), like the real relay binary. `spawn_test_relay` above
+// is fixed at two connections, so it can't exercise the daemon's spare-dial pool
+// serving *concurrent* clients — this can. A host spare parks with no timeout; a client
+// waits for a host; the party that parked owns the pump.
+//
+// The handshake callback's `Err` type is tungstenite's large `ErrorResponse`, fixed by
+// its `Callback` trait (same as the real relay) — and we only ever return `Ok`.
+#[allow(clippy::result_large_err)]
+async fn spawn_role_relay() -> u16 {
+    use futures::{SinkExt, StreamExt};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Mutex, oneshot};
+    use tokio_tungstenite::accept_hdr_async;
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+    #[derive(Default)]
+    struct Room {
+        hosts: Vec<oneshot::Sender<Ws>>,
+        clients: Vec<oneshot::Sender<Ws>>,
+    }
+
+    let rooms: Arc<Mutex<HashMap<String, Room>>> = Arc::new(Mutex::new(HashMap::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let rooms = rooms.clone();
+            tokio::spawn(async move {
+                let mut path = String::new();
+                let ws = accept_hdr_async(stream, |req: &Request, resp: Response| {
+                    path = req.uri().path().trim_start_matches('/').to_string();
+                    Ok(resp)
+                })
+                .await
+                .unwrap();
+                let (room_id, role) = path.rsplit_once('/').unwrap();
+                let is_host = role == "host";
+
+                // Pair with a waiter in the opposite queue, or park in our own.
+                let rx = {
+                    let mut map = rooms.lock().await;
+                    let room = map.entry(room_id.to_string()).or_default();
+                    let opposite = if is_host { &mut room.clients } else { &mut room.hosts };
+                    if let Some(tx) = opposite.pop() {
+                        let _ = tx.send(ws);
+                        return; // paired; the parked partner runs the pump
+                    }
+                    let (tx, rx) = oneshot::channel::<Ws>();
+                    if is_host { &mut room.hosts } else { &mut room.clients }.push(tx);
+                    rx
+                };
+                let partner = match rx.await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                // Pump verbatim until either side closes.
+                let (mut at, mut ar) = ws.split();
+                let (mut bt, mut br) = partner.split();
+                loop {
+                    tokio::select! {
+                        m = ar.next() => match m {
+                            Some(Ok(x)) => if bt.send(x).await.is_err() { break },
+                            _ => break,
+                        },
+                        m = br.next() => match m {
+                            Some(Ok(x)) => if at.send(x).await.is_err() { break },
+                            _ => break,
+                        },
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+// Two `RelayClient`s attach to one session concurrently over the role-aware relay: the
+// daemon parks a host spare, client A pairs, the daemon re-dials another spare, client B
+// pairs — and one injected event fans out to both. The end-to-end multi-attach-over-a-
+// transport proof the phase-2 plan left as a stretch, and the regression guard for
+// `issues/relay-single-remote-client.md`.
+#[tokio::test]
+async fn relay_two_clients_attach_concurrently() {
+    let port = spawn_role_relay().await;
+    let base = format!("ws://127.0.0.1:{port}/room1");
+    let host_url = format!("{base}/host");
+    let client_url = format!("{base}/client");
+
+    let cipher = Cipher::generate();
+    let bb = spawn_bare_broker(Vec::new());
+    let daemon = tokio::spawn(run_relay_daemon(host_url, cipher.clone(), bb.handle.clone()));
+
+    let client = RelayClient::new(client_url, cipher.clone());
+    let mut a = timeout(Duration::from_secs(5), client.attach(ClientIdentity::human("a")))
+        .await
+        .expect("A attach timed out")
+        .expect("A attach failed");
+    // B attaches to the SAME room while A is still attached — impossible before the fix
+    // (the relay was a one-shot pair and the daemon parked no second endpoint).
+    let mut b = timeout(Duration::from_secs(5), client.attach(ClientIdentity::human("b")))
+        .await
+        .expect("B attach timed out (second concurrent client)")
+        .expect("B attach failed");
+
+    // One injected loop event fans out to both attached clients.
+    bb.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "hi-all".into(),
+        })
+        .await
+        .unwrap();
+    expect_text(&mut a, "hi-all").await;
+    expect_text(&mut b, "hi-all").await;
+
+    daemon.abort();
+    bb.task.abort();
+}

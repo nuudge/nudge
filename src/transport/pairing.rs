@@ -54,13 +54,26 @@ impl Pairing {
         }
     }
 
-    // The full WebSocket URL both peers dial: base + the room id as the path.
+    // The room URL both peers build on: relay base + the room id as the path. The
+    // role segment (below) is appended to it — the relay pairs a host with a client by
+    // that trailing segment, since it can't read the encrypted attach frame to tell
+    // the two apart.
     pub fn dial_url(&self) -> String {
         format!(
             "{}/{}",
             self.relay_base.trim_end_matches('/'),
             self.rendezvous_id
         )
+    }
+
+    // The daemon (session host) dials this; the relay parks it as a host spare.
+    pub fn host_dial_url(&self) -> String {
+        format!("{}/host", self.dial_url())
+    }
+
+    // A front-end (`RelayClient`) dials this; the relay pairs it with a host spare.
+    pub fn client_dial_url(&self) -> String {
+        format!("{}/client", self.dial_url())
     }
 
     // Encode to the scannable pairing code: `nudge:<base64url([id][key][relay])>`.
@@ -142,5 +155,8 @@ mod tests {
             cipher: Cipher::generate(),
         };
         assert_eq!(p.dial_url(), "wss://r.example.com/abc123");
+        // Host and client dial the same room, distinguished only by the role segment.
+        assert_eq!(p.host_dial_url(), "wss://r.example.com/abc123/host");
+        assert_eq!(p.client_dial_url(), "wss://r.example.com/abc123/client");
     }
 }
