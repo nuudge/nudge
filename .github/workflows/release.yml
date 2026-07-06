@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # The relay ships as a single x86_64-linux binary named `relay` — the exact
+  # asset name the deploy Makefile fetches. It runs on the maintainer's Debian
+  # box, so a glibc build on ubuntu-22.04 is the deployment floor.
+  relay:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p relay
+      - run: mkdir -p dist && cp target/release/relay dist/relay
+      - uses: actions/upload-artifact@v7
+        with:
+          name: relay
+          path: dist/relay
+          if-no-files-found: error
+
+  # The agent is the public download, built per-target on a native runner so
+  # aws-lc-sys (a C dep, via rustls) compiles for the host — no cross-toolchain
+  # and no Apple-SDK licensing detour. macOS builds run on Apple hardware.
+  agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release -p nudge --target ${{ matrix.target }}
+      - run: mkdir -p dist && cp "target/${{ matrix.target }}/release/nudge" "dist/nudge-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nudge-${{ matrix.target }}
+          path: dist/nudge-${{ matrix.target }}
+          if-no-files-found: error
+
+  # Collect every built binary, checksum them uniformly on one Linux host
+  # (macOS lacks `sha256sum`), and attach the lot to the tag's GitHub Release.
+  release:
+    needs: [relay, agent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

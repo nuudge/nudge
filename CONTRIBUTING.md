@@ -15,17 +15,17 @@ nudge is built with **Rust edition 2024**, so you need a recent toolchain.
 Install it with [rustup](https://rustup.rs):
 
 ```bash
-# match CI exactly (recommended)
-rustup toolchain install 1.96.0
+# match CI exactly (recommended) — rust-toolchain.toml pins the channel to stable
+rustup toolchain install stable
 rustup component add rustfmt clippy
 
 # IDE support
 rustup component add rust-analyzer rust-src
 ```
 
-CI builds and lints on **Rust 1.96.0**. Recent stable will usually build fine,
-but Clippy's lints change between toolchain versions — so to avoid passing
-locally and failing in CI, target 1.96.0. The lint job runs Clippy with
+CI builds and lints on **stable** Rust; `rust-toolchain.toml` pins the channel
+so local and CI toolchains agree. Keep your stable current (`rustup update`),
+since Clippy's lints evolve between releases. The lint job runs Clippy with
 `-D warnings`, meaning **any warning is a hard failure**.
 
 > **Note on mise.** The repo ships a `mise.toml`, but mise is now used only as
@@ -60,8 +60,8 @@ The agent needs an `ANTHROPIC_API_KEY`; see the
 
 ## Checks before you push
 
-Run the full check bundle locally before opening a merge request. It mirrors the
-GitLab CI pipeline exactly:
+Run the full check bundle locally before opening a pull request. It mirrors the
+GitHub Actions pipeline exactly:
 
 ```bash
 mise run ci              # fmt --check + clippy -D warnings + tests
@@ -87,11 +87,11 @@ cargo test --all
 ## Submitting a change
 
 1. Create a branch off `main`.
-2. Keep the change focused; unrelated cleanups belong in their own MR.
+2. Keep the change focused; unrelated cleanups belong in their own PR.
 3. Write a descriptive commit message. Follow the existing prefix style:
    `feature:`, `fix:`, `refactor:`, `doc:`, `chore:`.
 4. Make sure `mise run ci` passes.
-5. Open a **Merge Request** against `main`. CI must be green to merge.
+5. Open a **Pull Request** against `main`. CI must be green to merge.
 
 For larger or design-affecting changes, open an issue first to discuss the
 approach before investing the work.
