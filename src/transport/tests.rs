@@ -384,13 +384,22 @@ async fn spawn_role_relay() -> u16 {
                 let rx = {
                     let mut map = rooms.lock().await;
                     let room = map.entry(room_id.to_string()).or_default();
-                    let opposite = if is_host { &mut room.clients } else { &mut room.hosts };
+                    let opposite = if is_host {
+                        &mut room.clients
+                    } else {
+                        &mut room.hosts
+                    };
                     if let Some(tx) = opposite.pop() {
                         let _ = tx.send(ws);
                         return; // paired; the parked partner runs the pump
                     }
                     let (tx, rx) = oneshot::channel::<Ws>();
-                    if is_host { &mut room.hosts } else { &mut room.clients }.push(tx);
+                    if is_host {
+                        &mut room.hosts
+                    } else {
+                        &mut room.clients
+                    }
+                    .push(tx);
                     rx
                 };
                 let partner = match rx.await {
@@ -432,19 +441,29 @@ async fn relay_two_clients_attach_concurrently() {
 
     let cipher = Cipher::generate();
     let bb = spawn_bare_broker(Vec::new());
-    let daemon = tokio::spawn(run_relay_daemon(host_url, cipher.clone(), bb.handle.clone()));
+    let daemon = tokio::spawn(run_relay_daemon(
+        host_url,
+        cipher.clone(),
+        bb.handle.clone(),
+    ));
 
     let client = RelayClient::new(client_url, cipher.clone());
-    let mut a = timeout(Duration::from_secs(5), client.attach(ClientIdentity::human("a")))
-        .await
-        .expect("A attach timed out")
-        .expect("A attach failed");
+    let mut a = timeout(
+        Duration::from_secs(5),
+        client.attach(ClientIdentity::human("a")),
+    )
+    .await
+    .expect("A attach timed out")
+    .expect("A attach failed");
     // B attaches to the SAME room while A is still attached — impossible before the fix
     // (the relay was a one-shot pair and the daemon parked no second endpoint).
-    let mut b = timeout(Duration::from_secs(5), client.attach(ClientIdentity::human("b")))
-        .await
-        .expect("B attach timed out (second concurrent client)")
-        .expect("B attach failed");
+    let mut b = timeout(
+        Duration::from_secs(5),
+        client.attach(ClientIdentity::human("b")),
+    )
+    .await
+    .expect("B attach timed out (second concurrent client)")
+    .expect("B attach failed");
 
     // One injected loop event fans out to both attached clients.
     bb.agent_tx

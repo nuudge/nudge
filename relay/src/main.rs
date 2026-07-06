@@ -195,7 +195,10 @@ async fn park_or_pair(
     // Hosts wait indefinitely; clients are bounded so a lonely one can't accumulate.
     let paired = match role {
         Role::Host => rx.await.ok(),
-        Role::Client => tokio::time::timeout(pair_timeout, rx).await.ok().and_then(|r| r.ok()),
+        Role::Client => tokio::time::timeout(pair_timeout, rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok()),
     };
     match paired {
         Some(partner) => pipe(ws, partner).await,
