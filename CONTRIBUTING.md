@@ -15,17 +15,17 @@ nudge is built with **Rust edition 2024**, so you need a recent toolchain.
 Install it with [rustup](https://rustup.rs):
 
 ```bash
-# match CI exactly (recommended)
-rustup toolchain install 1.96.0
+# match CI exactly (recommended) — rust-toolchain.toml pins the channel to stable
+rustup toolchain install stable
 rustup component add rustfmt clippy
 
 # IDE support
 rustup component add rust-analyzer rust-src
 ```
 
-CI builds and lints on **Rust 1.96.0**. Recent stable will usually build fine,
-but Clippy's lints change between toolchain versions — so to avoid passing
-locally and failing in CI, target 1.96.0. The lint job runs Clippy with
+CI builds and lints on **stable** Rust; `rust-toolchain.toml` pins the channel
+so local and CI toolchains agree. Keep your stable current (`rustup update`),
+since Clippy's lints evolve between releases. The lint job runs Clippy with
 `-D warnings`, meaning **any warning is a hard failure**.
 
 > **Note on mise.** The repo ships a `mise.toml`, but mise is now used only as

@@ -33,7 +33,7 @@ nudge is three components: the **terminal agent** (the whole product on its own)
 
 ### The agent
 
-Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API key. CI builds on Rust 1.96.0; recent stable usually works too.
+Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API key. CI builds on stable Rust.
 
 ```bash
 git clone https://github.com/nuudge/nudge.git && cd nudge
