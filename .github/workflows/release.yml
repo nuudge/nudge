@@ -23,7 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p relay
       - run: mkdir -p dist && cp target/release/relay dist/relay
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: relay
           path: dist/relay
@@ -66,7 +66,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
