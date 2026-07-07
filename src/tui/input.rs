@@ -389,6 +389,7 @@ mod tests {
             pairing_code: None,
             is_owner: true,
             user_name: "u".into(),
+            models: Vec::new(),
         })
     }
 
