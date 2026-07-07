@@ -17,9 +17,9 @@ mod tui;
 use crate::config::Config;
 
 // (display label, API model id). The TUI's /model picker renders labels;
-// the id is what goes on the wire. The list is exactly the models that
-// support `thinking: {type: "adaptive"}` — the request shape run_agent
-// always sends — so every entry works without per-model request branching.
+// the id is what goes on the wire. Used as-is by guest/--connect clients
+// (no local API key to fetch with) and as the fallback when the owning
+// process's `list_models` call fails (offline, bad key, etc).
 pub const MODELS: &[(&str, &str)] = &[
     ("Fable 5", "claude-fable-5"),
     ("Mythos 5", "claude-mythos-5"),
@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
         // This process hosts the agent loop: it's the owner TUI (cosmetic badge only).
         is_owner: true,
         user_name: who.name.clone(),
+        models: owned_models(MODELS),
     };
     let cfg = AgentConfig {
         model: DEFAULT_MODEL.into(),
@@ -155,6 +156,8 @@ async fn main() -> Result<()> {
         thinking_display,
     };
     let provider = llm::AnthropicProvider::new(config.anthropic_api_key);
+
+    ui_cfg.models = resolve_models(&provider, MODELS).await;
 
     // Connect to MCP servers declared in the project-local `.mcp.json` before
     // the TUI takes the screen, so connection logs print cleanly to stderr.
@@ -324,6 +327,9 @@ async fn run_connect(cli: Cli) -> Result<()> {
         // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,
         user_name: who.name.clone(),
+        // A guest has no local API key to fetch a fresh list with; the daemon
+        // (the owner process) is the one that talks to the provider.
+        models: owned_models(MODELS),
     };
     // Use each client's `connect` rather than the silent `SessionHandle::attach` for
     // this first attach: it runs before the TUI owns the screen, so a connection
@@ -436,4 +442,64 @@ fn print_pairing(pairing: &transport::Pairing) -> Result<()> {
         pairing.encode()
     );
     Ok(())
+}
+
+fn owned_models(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(l, i)| (l.to_string(), i.to_string()))
+        .collect()
+}
+
+// Refreshes the /model picker from the provider so newly released models show
+// up without a code change; keeps the static `fallback` on any fetch failure.
+async fn resolve_models(
+    provider: &llm::AnthropicProvider,
+    fallback: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    pick_models(provider.list_models().await, fallback)
+}
+
+fn pick_models(
+    fetched: Result<Vec<(String, String)>>,
+    fallback: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    match fetched {
+        Ok(models) if !models.is_empty() => models,
+        Ok(_) => owned_models(fallback),
+        Err(e) => {
+            eprintln!("[models] falling back to built-in list: {e:#}");
+            owned_models(fallback)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FALLBACK: &[(&str, &str)] = &[("Fallback", "fallback-1")];
+
+    #[test]
+    fn pick_models_prefers_a_nonempty_fetch() {
+        let fetched = Ok(vec![("Fresh".to_string(), "fresh-1".to_string())]);
+        assert_eq!(
+            pick_models(fetched, FALLBACK),
+            vec![("Fresh".to_string(), "fresh-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn pick_models_falls_back_on_empty_fetch() {
+        assert_eq!(
+            pick_models(Ok(Vec::new()), FALLBACK),
+            owned_models(FALLBACK)
+        );
+    }
+
+    #[test]
+    fn pick_models_falls_back_on_fetch_error() {
+        let fetched = Err(anyhow::anyhow!("network down"));
+        assert_eq!(pick_models(fetched, FALLBACK), owned_models(FALLBACK));
+    }
 }

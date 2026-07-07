@@ -396,7 +396,7 @@ impl App {
             let popup = centered_rect(50, 30, f.area());
             f.render_widget(Clear, popup);
             let mut body = Vec::new();
-            for (i, (label, id)) in crate::MODELS.iter().enumerate() {
+            for (i, (label, id)) in self.models.iter().enumerate() {
                 let marker = if i == sel { "❯ " } else { "  " };
                 let current = if *id == self.model { "  (current)" } else { "" };
                 let style = if i == sel {
@@ -407,7 +407,7 @@ impl App {
                     Style::default()
                 };
                 body.push(Line::from(Span::styled(
-                    format!("{marker}{label}  — {id}{current}"),
+                    format!("{marker}{label} - {id}{current}"),
                     style,
                 )));
             }
@@ -417,7 +417,7 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             )));
             let para = Paragraph::new(body)
-                .block(Block::default().borders(Borders::ALL).title("select model"));
+                .block(Block::default().borders(Borders::ALL).title("Select model"));
             f.render_widget(para, popup);
         }
 

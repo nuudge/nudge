@@ -114,19 +114,17 @@ impl App {
             match key.code {
                 KeyCode::Up => self.model_picker = Some(sel.saturating_sub(1)),
                 KeyCode::Down => {
-                    self.model_picker = Some((sel + 1).min(crate::MODELS.len() - 1));
+                    self.model_picker = Some((sel + 1).min(self.models.len() - 1));
                 }
                 KeyCode::Enter => {
                     self.model_picker = None;
-                    let (label, id) = crate::MODELS[sel];
+                    let (label, id) = self.models[sel].clone();
                     if id != self.model {
-                        self.model = id.to_string();
+                        self.model = id.clone();
                         self.push(LogEntry::Info(format!("model set to {label} ({id})")));
                         self.push(LogEntry::Blank);
                         self.auto_scroll = true;
-                        let _ = ui_tx.try_send(UiEvent::SetModel {
-                            model: id.to_string(),
-                        });
+                        let _ = ui_tx.try_send(UiEvent::SetModel { model: id });
                     }
                 }
                 KeyCode::Esc => self.model_picker = None,
@@ -239,7 +237,8 @@ impl App {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
             Some("/model") => {
-                let current = crate::MODELS
+                let current = self
+                    .models
                     .iter()
                     .position(|(_, id)| *id == self.model)
                     .unwrap_or(0);

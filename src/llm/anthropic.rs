@@ -6,6 +6,7 @@ use super::{ContentBlock, Message, Provider, Request, Response, Usage};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const COUNT_TOKENS_URL: &str = "https://api.anthropic.com/v1/messages/count_tokens";
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -18,6 +19,32 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             api_key,
         }
+    }
+
+    // (display label, model id), newest first - whatever the API is currently
+    // serving. There's no capability flag for "supports adaptive thinking" in
+    // this response, so this trusts that every model the API still serves
+    // does (true for the current lineup); a pick that turns out wrong surfaces
+    // as a normal request error rather than silently misbehaving.
+    pub async fn list_models(&self) -> Result<Vec<(String, String)>> {
+        let resp: ModelsResponse = self
+            .client
+            .get(format!("{MODELS_URL}?limit=1000"))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .context("models request failed")?
+            .error_for_status()
+            .context("models endpoint returned error status")?
+            .json()
+            .await
+            .context("failed to parse models response")?;
+        Ok(resp
+            .data
+            .into_iter()
+            .map(|m| (m.display_name, m.id))
+            .collect())
     }
 
     // Shared wire shaping: serialize system blocks with `cache_control` on the
@@ -138,6 +165,17 @@ struct MessagesResponse {
     usage: WireUsage,
 }
 
+#[derive(Deserialize, Debug)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ModelInfo {
+    id: String,
+    display_name: String,
+}
+
 #[derive(Deserialize, Debug, Default)]
 struct WireUsage {
     #[serde(default)]
@@ -188,4 +226,36 @@ fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Va
             json!({ "role": msg.role, "content": content })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_response_maps_to_label_id_pairs_in_order() {
+        let json = r#"{"data": [
+            {"id": "claude-opus-4-8", "display_name": "Claude Opus 4.8"},
+            {"id": "claude-fable-5", "display_name": "Fable 5"}
+        ]}"#;
+        let resp: ModelsResponse = serde_json::from_str(json).unwrap();
+        let pairs: Vec<(String, String)> = resp
+            .data
+            .into_iter()
+            .map(|m| (m.display_name, m.id))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Claude Opus 4.8".to_string(), "claude-opus-4-8".to_string()),
+                ("Fable 5".to_string(), "claude-fable-5".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn models_response_tolerates_empty_data() {
+        let resp: ModelsResponse = serde_json::from_str(r#"{"data": []}"#).unwrap();
+        assert!(resp.data.is_empty());
+    }
 }
