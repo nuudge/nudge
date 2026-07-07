@@ -71,7 +71,9 @@ pub(super) struct App {
     pub(super) expanded: bool,
     pub(super) spinner_frame: usize,
     pub(super) pending: Option<PendingPermission>,
-    // Index into crate::MODELS while the picker is open.
+    // (display label, API model id), fetched at startup where possible. Index
+    // into this while the picker is open.
+    pub(super) models: Vec<(String, String)>,
     pub(super) model_picker: Option<usize>,
     pub(super) mode: Mode,
     // Set by handlers, applied by the run loop (which holds the host handle).
@@ -101,6 +103,7 @@ pub struct UiConfig {
     pub pairing_code: Option<String>,
     pub is_owner: bool,
     pub user_name: String,
+    pub models: Vec<(String, String)>,
 }
 
 impl App {
@@ -122,6 +125,7 @@ impl App {
             expanded: false,
             spinner_frame: 0,
             pending: None,
+            models: cfg.models,
             model_picker: None,
             mode: Mode::Foreground,
             pending_transition: None,
