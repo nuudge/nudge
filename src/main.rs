@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
-use crate::core::{AgentConfig, Backend, ClientIdentity, SessionHandle};
+use crate::core::{AgentConfig, Backend, ClientIdentity, ClientKind, SessionHandle};
 
 mod coding;
 mod config;
@@ -104,6 +104,11 @@ struct Cli {
         conflicts_with = "socket"
     )]
     pair_code: Option<String>,
+
+    /// (hidden) Spawn a built-ins-only child agent, mutually attach, and kick it with
+    /// this task — a debug harness for symmetric agent-to-agent communication.
+    #[arg(long, value_name = "task", hide = true, conflicts_with_all = ["daemon", "connect"])]
+    spawn_demo: Option<String>,
 }
 
 #[tokio::main]
@@ -125,6 +130,9 @@ async fn main() -> Result<()> {
     }
 
     let config = Config::from_env()?;
+    // Cloned before the provider takes ownership below, so the --spawn-demo child can
+    // build its own provider with the same key.
+    let api_key = config.anthropic_api_key.clone();
 
     let (session, initial_messages, dropped) = match &cli.resume {
         None => (coding::open_new()?, Vec::new(), 0),
@@ -290,6 +298,13 @@ async fn main() -> Result<()> {
             None
         };
 
+        // Hidden debug harness for symmetric spawn: stand up a real child agent and
+        // mutually attach. Kept alive for the session — dropping it ends the child.
+        let _child = match cli.spawn_demo.clone() {
+            Some(task) => Some(spawn_local_peer(&host, &api_key, task).await?),
+            None => None,
+        };
+
         let controller = host
             .attach(who.clone())
             .await
@@ -299,6 +314,75 @@ async fn main() -> Result<()> {
         let _ = host.shutdown().await;
         tui_result
     }
+}
+
+// Identity a spawned agent announces at attach — the first real use of
+// `ClientKind::Agent`. `session_id`/`task` give a peer legible provenance in the other
+// side's transcript and Notices.
+fn agent_identity(
+    name: String,
+    session_id: Option<String>,
+    task: Option<String>,
+) -> ClientIdentity {
+    ClientIdentity {
+        kind: ClientKind::Agent,
+        name,
+        session_id,
+        task,
+    }
+}
+
+// --spawn-demo harness. Stand up a built-ins-only child agent in the current directory
+// and mutually attach it to the parent: the parent drives/observes the child, and the
+// child holds the return edge back to the parent (unused until a `MessagePeer` tool
+// exists — step 4). Kicks the child with `task` so it starts working immediately.
+// Returns the child's `SessionHost`; the caller keeps it alive for the session.
+async fn spawn_local_peer(
+    parent: &core::SessionHost,
+    api_key: &str,
+    task: String,
+) -> Result<core::SessionHost> {
+    let session = coding::open_new()?;
+    let child_id = session.id.clone();
+    let cwd = session.cwd.clone();
+    // Built-ins only: no .mcp.json servers. Skills are still discovered locally (cheap).
+    let mcp = coding::mcp::McpRegistry::bootstrap(&[]).await;
+    let skills = coding::skills::SkillRegistry::discover(&cwd, None);
+    let backend = coding::CodingBackend::new(cwd, mcp, skills);
+    let cfg = AgentConfig {
+        model: DEFAULT_MODEL.into(),
+        max_tokens: MAX_TOKENS,
+        max_iterations: MAX_ITERATIONS,
+        thinking_display: "omitted".into(),
+    };
+    let provider = llm::AnthropicProvider::new(api_key.to_string());
+    let child = core::SessionHost::spawn(cfg, provider, backend, session, Vec::new(), Vec::new());
+
+    let short: String = child_id.chars().take(8).collect();
+    let child_who = agent_identity(format!("child-{short}"), Some(child_id), Some(task.clone()));
+    let parent_who = agent_identity("parent".into(), None, Some(task.clone()));
+
+    // Parent attaches to child (drive/observe); child attaches to parent (the return edge).
+    let child_ctrl = child
+        .attach(child_who.clone())
+        .await
+        .context("parent could not attach to the spawned child")?;
+    let parent_ctrl = parent
+        .attach(parent_who.clone())
+        .await
+        .context("child could not attach back to the parent")?;
+
+    // Kick the child before handing its controller to the parent's loop, so it starts
+    // working; its events buffer in the controller until the parent's loop drains them.
+    let _ = child_ctrl
+        .ui_tx
+        .send(core::UiEvent::UserMessage { text: task })
+        .await;
+
+    parent.register_peer(child_ctrl, child_who);
+    child.register_peer(parent_ctrl, parent_who);
+
+    Ok(child)
 }
 
 // The local user's identity, announced at attach. `$USER` if set, else a neutral

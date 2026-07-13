@@ -4,9 +4,10 @@ use std::future::Future;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::agent::{AgentConfig, Backend, run_agent};
+use super::agent::{AgentConfig, AgentIo, Backend, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::ClientIdentity;
+use super::peer::{PeerRegistration, PeerSet};
 use super::session::Session;
 use crate::llm::{Message, Provider};
 
@@ -110,6 +111,10 @@ pub struct SessionHost {
     // backgrounding again. `None` when no relay is configured (nothing to arm) and
     // in headless/daemon and remote modes.
     handoff_hook: Option<Box<dyn Fn() + Send + Sync>>,
+    // Producer half of the loop's peer-registration channel: hand it a `Controller`
+    // (obtained by attaching to a peer's broker) and the loop starts driving/observing
+    // that peer. Held for the session so the channel stays open even when childless.
+    peer_register_tx: mpsc::UnboundedSender<PeerRegistration>,
 }
 
 impl SessionHost {
@@ -131,6 +136,10 @@ impl SessionHost {
     {
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (loop_ui_tx, loop_ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        // Low-frequency control channel: the composition root hands the loop a peer
+        // (a `Controller` obtained by attaching to the peer's broker) at runtime. The
+        // loop starts with an empty `PeerSet`, so a childless session is unchanged.
+        let (peer_register_tx, peer_register_rx) = mpsc::unbounded_channel();
 
         let agent_task = tokio::spawn(run_agent(
             cfg,
@@ -138,8 +147,12 @@ impl SessionHost {
             backend,
             session,
             initial_messages,
-            loop_ui_rx,
-            loop_agent_tx,
+            AgentIo {
+                ui_rx: loop_ui_rx,
+                agent_tx: loop_agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: Some(peer_register_rx),
+            },
         ));
 
         // `seed` is the resumed transcript pre-translated to controller events
@@ -154,6 +167,7 @@ impl SessionHost {
             broker_task,
             ctl_tx,
             handoff_hook: None,
+            peer_register_tx,
         }
     }
 
@@ -173,6 +187,17 @@ impl SessionHost {
     // configured, nor in daemon / remote (`SocketClient`) modes.
     pub fn set_handoff_hook(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.handoff_hook = Some(Box::new(hook));
+    }
+
+    // Hand this session a peer to drive/observe. `controller` is obtained by attaching
+    // to the peer's broker — locally via `SessionHost::attach`, or (step 6) remotely via
+    // `RelayClient::attach` — so `core` names no transport: the composition root creates
+    // the controller and injects it here. The loop picks it up on its next idle wait and
+    // adds it to its `PeerSet`. Fire-and-forget: a dropped send means the loop has ended.
+    pub fn register_peer(&self, controller: Controller, who: ClientIdentity) {
+        let _ = self
+            .peer_register_tx
+            .send(PeerRegistration { controller, who });
     }
 
     // End the session: ask the broker to deliver a final Quit to the loop, then
