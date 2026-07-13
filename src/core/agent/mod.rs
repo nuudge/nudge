@@ -3,7 +3,8 @@ use serde_json::Value;
 use std::future::Future;
 use tokio::sync::mpsc;
 
-use super::events::{AgentEvent, UiEvent};
+use super::events::{AgentEvent, ControllerEvent, UiEvent};
+use super::peer::{PeerId, PeerRegistration, PeerSet};
 use crate::core::session::Session;
 use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 
@@ -53,15 +54,33 @@ pub trait Backend {
     }
 }
 
+// The loop's I/O, bundled so the signature stays readable as it grows. `ui_rx` /
+// `agent_tx` are the inbound-drive / outbound-event halves (who drives me, what I
+// emit); `peers` is the set of agents I'm a *client* of (whom I drive/observe), and
+// `peer_register_rx` delivers peers handed to me at runtime (e.g. a spawned child).
+// A top-level session has an empty `PeerSet` and a registrar that never fires, so the
+// two peer-related select arms are inert and behavior is byte-for-byte unchanged.
+pub struct AgentIo {
+    pub ui_rx: mpsc::Receiver<UiEvent>,
+    pub agent_tx: mpsc::Sender<AgentEvent>,
+    pub peers: PeerSet,
+    pub peer_register_rx: Option<mpsc::UnboundedReceiver<PeerRegistration>>,
+}
+
 pub async fn run_agent<P: Provider, B: Backend>(
     mut cfg: AgentConfig,
     provider: P,
     mut backend: B,
     mut session: Session,
     initial_messages: Vec<Message>,
-    mut ui_rx: mpsc::Receiver<UiEvent>,
-    agent_tx: mpsc::Sender<AgentEvent>,
+    io: AgentIo,
 ) -> Result<()> {
+    let AgentIo {
+        mut ui_rx,
+        agent_tx,
+        mut peers,
+        mut peer_register_rx,
+    } = io;
     let mut messages: Vec<Message> = initial_messages;
     // Index of `messages` after the last completed turn. On API error mid-turn we roll
     // back here so the next turn lands on a valid alternating-role boundary (the API
@@ -79,7 +98,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
     // OUTER loop: one iteration per user turn.
     loop {
         let user_text = loop {
-            match ui_rx.recv().await {
+            tokio::select! {
+                ui = ui_rx.recv() => match ui {
                 Some(UiEvent::UserMessage { text }) => break text,
                 Some(UiEvent::SetModel { model }) => {
                     cfg.model = model;
@@ -143,6 +163,16 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 Some(UiEvent::Quit) | None => return Ok(()),
                 Some(ev) => {
                     backend.handle_control(&ev, &agent_tx).await;
+                }
+                },
+                reg = recv_registration(&mut peer_register_rx) => match reg {
+                    Some(reg) => {
+                        peers.register(reg.controller, reg.who);
+                    }
+                    None => peer_register_rx = None,
+                },
+                (pid, ev) = peers.recv() => {
+                    supervise_peer_event(&mut peers, &agent_tx, pid, ev).await;
                 }
             }
         };
@@ -363,5 +393,423 @@ async fn finalize_rename(
                 })
                 .await;
         }
+    }
+}
+
+// Await the next peer handed in at runtime; pend forever once the registrar is gone
+// (or was never wired), so the loop's select arm stays quiet for a peerless session.
+async fn recv_registration(
+    rx: &mut Option<mpsc::UnboundedReceiver<PeerRegistration>>,
+) -> Option<PeerRegistration> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+// Handle one event observed from a peer this agent drives. Step-3 supervision is
+// deliberately minimal: activity surfaces to this agent's own front-end as a Notice
+// (the watch substrate), and a permission check-in is auto-approved so the peer stays
+// unblocked.
+//
+// PLACEHOLDER (step 5 replaces): the auto-approve becomes a real steering turn — the
+// parent decides the peer's check-in with its full transcript in context (and gains
+// escalation-to-human). For now it always allows, which is why the spawn path stays
+// gated behind the hidden --spawn-demo flag.
+async fn supervise_peer_event(
+    peers: &mut PeerSet,
+    agent_tx: &mpsc::Sender<AgentEvent>,
+    pid: PeerId,
+    ev: Option<ControllerEvent>,
+) {
+    let name = peers.display_name(pid);
+    match ev {
+        None => {
+            peers.remove(pid);
+            let _ = agent_tx
+                .send(AgentEvent::Notice {
+                    text: format!("[peer {name}] disconnected"),
+                })
+                .await;
+        }
+        Some(ControllerEvent::PermissionRequest {
+            tool_use_id,
+            tool_name,
+            summary,
+        }) => {
+            let _ = agent_tx
+                .send(AgentEvent::Notice {
+                    text: format!("[peer {name}] auto-approved {tool_name}: {summary}"),
+                })
+                .await;
+            peers
+                .drive(
+                    pid,
+                    UiEvent::PermissionResponse {
+                        tool_use_id,
+                        allow: true,
+                    },
+                )
+                .await;
+        }
+        Some(other) => {
+            if let Some(text) = peer_notice(&name, &other) {
+                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            }
+        }
+    }
+}
+
+// Map a peer's observed event to a one-line Notice for this agent's front-end, or None
+// for the noisy/internal events (usage, session info, turn markers) that add no watch
+// value.
+fn peer_notice(name: &str, ev: &ControllerEvent) -> Option<String> {
+    match ev {
+        ControllerEvent::AssistantText { text } => Some(format!("[peer {name}] {text}")),
+        ControllerEvent::ToolUseStart {
+            name: tool,
+            summary,
+            ..
+        } => Some(format!("[peer {name}] uses {tool}: {summary}")),
+        ControllerEvent::PermissionResolved { tool_name, allow } => Some(format!(
+            "[peer {name}] {} {tool_name}",
+            if *allow { "allowed" } else { "denied" }
+        )),
+        // A peer's own Notices are deliberately NOT re-narrated. Under mutual attach I am
+        // an attached controller of my peer, so a Notice I emit about it is fanned back
+        // to it; if it re-narrated my Notices (and I its), one event would amplify into an
+        // unbounded `[peer a] [peer b] [peer a] …` cascade. Every re-narration is itself a
+        // Notice, so refusing to re-narrate Notices breaks the cycle at one hop. (The real
+        // fix is identity-aware fan-out that never routes supervision chatter to peer
+        // agents — deferred; see docs/symmetric-communication.md open questions.)
+        ControllerEvent::Notice { .. } => None,
+        ControllerEvent::Error { message } => Some(format!("[peer {name}] error: {message}")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::host::Controller;
+    use crate::core::identity::{ClientIdentity, ClientKind};
+    use crate::core::{SessionHandle, SessionHost};
+    use crate::llm::{Response, Usage};
+    use std::path::PathBuf;
+
+    // A provider that always closes the turn with a one-line assistant reply — enough
+    // to prove a turn ran without touching the network.
+    struct FakeProvider;
+    impl Provider for FakeProvider {
+        async fn complete(&self, _req: &Request<'_>) -> Result<Response> {
+            Ok(Response {
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: "end_turn".into(),
+                usage: Usage::default(),
+            })
+        }
+        async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    // A no-tool backend: the loop needs a Backend, but these tests exercise input
+    // routing (peers, drive edges), not tool dispatch.
+    struct FakeBackend;
+    impl Backend for FakeBackend {
+        fn system_blocks(&self) -> Vec<SystemBlock> {
+            Vec::new()
+        }
+        fn tool_schemas(&self) -> (Vec<Value>, Option<usize>) {
+            (Vec::new(), None)
+        }
+        fn tool_summary(&self, _name: &str, _input: &Value) -> String {
+            String::new()
+        }
+        fn requires_permission(&self, _name: &str) -> bool {
+            false
+        }
+        fn permission_summary(&self, _name: &str, _input: &Value) -> String {
+            String::new()
+        }
+        async fn execute(
+            &mut self,
+            _name: &str,
+            _input: &Value,
+            _notify: &mpsc::Sender<AgentEvent>,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn handle_control(
+            &mut self,
+            _ev: &UiEvent,
+            _notify: &mpsc::Sender<AgentEvent>,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn mk_cfg() -> AgentConfig {
+        AgentConfig {
+            model: "fake-model".into(),
+            max_tokens: 64,
+            max_iterations: 4,
+            thinking_display: "omitted".into(),
+        }
+    }
+
+    fn mk_session() -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nudge-agent-{}", uuid::Uuid::new_v4()));
+        let session = Session::create(dir.clone(), dir.clone()).unwrap();
+        (session, dir)
+    }
+
+    fn agent_who(name: &str) -> ClientIdentity {
+        ClientIdentity {
+            kind: ClientKind::Agent,
+            name: name.into(),
+            session_id: None,
+            task: None,
+        }
+    }
+
+    // A synthetic peer: the `Controller` the loop holds, plus the far ends a test uses
+    // to inject the peer's events and observe what the loop drives back to it.
+    fn fake_peer() -> (
+        Controller,
+        mpsc::UnboundedSender<ControllerEvent>,
+        mpsc::Receiver<UiEvent>,
+    ) {
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        (
+            Controller {
+                events: ev_rx,
+                ui_tx,
+            },
+            ev_tx,
+            ui_rx,
+        )
+    }
+
+    // A peer attached at runtime drives the loop with no user message: its activity
+    // surfaces to this agent's own front-end as a Notice (the watch substrate).
+    #[tokio::test]
+    async fn peer_activity_surfaces_as_a_notice() {
+        let (session, dir) = mk_session();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            FakeProvider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            AgentIo {
+                ui_rx,
+                agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: Some(reg_rx),
+            },
+        ));
+
+        let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+        reg_tx
+            .send(PeerRegistration {
+                controller: peer_ctrl,
+                who: agent_who("child-1"),
+            })
+            .unwrap();
+        peer_ev
+            .send(ControllerEvent::AssistantText {
+                text: "peer working".into(),
+            })
+            .unwrap();
+
+        let mut saw = None;
+        while let Some(ev) = agent_rx.recv().await {
+            if let AgentEvent::Notice { text } = ev {
+                saw = Some(text);
+                break;
+            }
+        }
+        let text = saw.expect("expected a peer Notice");
+        assert!(
+            text.contains("child-1"),
+            "notice should name the peer: {text}"
+        );
+        assert!(
+            text.contains("peer working"),
+            "notice should carry the activity: {text}"
+        );
+
+        ui_tx.send(UiEvent::Quit).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A peer's permission check-in is answered (step-3 placeholder auto-approve): the
+    // loop drives a PermissionResponse back up the peer's ui_tx — the parent→peer drive
+    // edge.
+    #[tokio::test]
+    async fn peer_permission_check_in_is_auto_approved() {
+        let (session, dir) = mk_session();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, _agent_rx) = mpsc::channel(16);
+        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            FakeProvider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            AgentIo {
+                ui_rx,
+                agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: Some(reg_rx),
+            },
+        ));
+
+        let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+        reg_tx
+            .send(PeerRegistration {
+                controller: peer_ctrl,
+                who: agent_who("child-1"),
+            })
+            .unwrap();
+        peer_ev
+            .send(ControllerEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+            })
+            .unwrap();
+
+        match peer_ui.recv().await {
+            Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
+                assert_eq!(tool_use_id, "t1");
+                assert!(allow);
+            }
+            other => panic!("expected a PermissionResponse driven to the peer, got {other:?}"),
+        }
+
+        ui_tx.send(UiEvent::Quit).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A peerless session is unchanged: a user message on ui_rx drives one turn.
+    #[tokio::test]
+    async fn childless_session_still_drives_a_turn() {
+        let (session, dir) = mk_session();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            FakeProvider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            AgentIo {
+                ui_rx,
+                agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: None,
+            },
+        ));
+
+        ui_tx
+            .send(UiEvent::UserMessage { text: "hi".into() })
+            .await
+            .unwrap();
+
+        let mut saw_text = false;
+        while let Some(ev) = agent_rx.recv().await {
+            match ev {
+                AgentEvent::AssistantText { text } => {
+                    assert_eq!(text, "ok");
+                    saw_text = true;
+                }
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+        assert!(saw_text, "expected the assistant reply for the driven turn");
+
+        ui_tx.send(UiEvent::Quit).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The return edge: an agent holding a `Controller` to a peer (obtained by the same
+    // `attach` a human uses, but announcing `ClientKind::Agent`) drives that peer and
+    // observes its reply — end-to-end through the peer's broker + loop. This is what
+    // makes a spawned pair symmetric: the child reaches the parent exactly as the parent
+    // reaches the child.
+    #[tokio::test]
+    async fn return_edge_peer_drives_the_agent_it_holds() {
+        let (session, dir) = mk_session();
+        let parent = SessionHost::spawn(
+            mk_cfg(),
+            FakeProvider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        // The "child" attaches to the parent as an agent — this is the return edge.
+        let mut child_ctrl = parent.attach(agent_who("child-1")).await.unwrap();
+
+        child_ctrl
+            .ui_tx
+            .send(UiEvent::UserMessage {
+                text: "from child".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_reply = false;
+        while let Some(ev) = child_ctrl.events.recv().await {
+            if let ControllerEvent::AssistantText { text } = ev {
+                assert_eq!(text, "ok");
+                saw_reply = true;
+                break;
+            }
+        }
+        assert!(
+            saw_reply,
+            "the agent should take a turn driven over the return edge"
+        );
+
+        parent.shutdown().await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Guards against the mutual-attach amplification cascade: a peer's own Notice must
+    // never be re-narrated (every re-narration is a Notice, so re-narrating them would
+    // loop unboundedly under mutual attach), while genuine primary activity still is.
+    #[test]
+    fn peer_notice_does_not_renarrate_a_peer_notice() {
+        assert_eq!(
+            peer_notice(
+                "child-1",
+                &ControllerEvent::Notice {
+                    text: "[peer parent] anything".into()
+                }
+            ),
+            None,
+        );
+        assert_eq!(
+            peer_notice(
+                "child-1",
+                &ControllerEvent::AssistantText {
+                    text: "hello".into()
+                }
+            ),
+            Some("[peer child-1] hello".to_string()),
+        );
     }
 }
