@@ -22,7 +22,7 @@ pub struct CodingBackend {
     system_prompt: String,
     stable_env: String,
     claude_md: Option<String>,
-    // The subagent contract (see `as_subagent`); None for a top-level agent.
+    // The subagent contract (see `into_subagent`); None for a top-level agent.
     role_preamble: Option<String>,
     cwd: PathBuf,
     mcp: McpRegistry,
@@ -54,7 +54,7 @@ impl CodingBackend {
     // and CLAUDE.md is dropped — a subagent runs under its spawner's contract, and
     // anything project-specific it needs belongs in the authored task. Role by
     // prompt, not by type: the loop and everything below stay role-free.
-    pub fn as_subagent(mut self, role_preamble: String) -> Self {
+    pub fn into_subagent(mut self, role_preamble: String) -> Self {
         self.role_preamble = Some(role_preamble);
         self.claude_md = None;
         self
@@ -333,10 +333,10 @@ pub async fn print_preamble<P: Provider>(
 mod tests {
     use super::*;
 
-    // `as_subagent` installs the role block directly after the prompt body and drops
+    // `into_subagent` installs the role block directly after the prompt body and drops
     // CLAUDE.md — the two halves of the subagent-contract decision.
     #[tokio::test]
-    async fn as_subagent_swaps_claude_md_for_the_role_block() {
+    async fn into_subagent_swaps_claude_md_for_the_role_block() {
         let dir = std::env::temp_dir().join(format!("nudge-backend-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("CLAUDE.md"), "PROJECT CONVENTIONS").unwrap();
@@ -359,7 +359,7 @@ mod tests {
             McpRegistry::bootstrap(&[]).await,
             SkillRegistry::discover(&dir, None),
         )
-        .as_subagent("ROLE: report to parent-x".into());
+        .into_subagent("ROLE: report to parent-x".into());
         let blocks = sub.system_blocks();
         assert!(
             blocks[1].text.contains("ROLE: report to parent-x"),

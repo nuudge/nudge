@@ -44,7 +44,7 @@ pub fn system_prompt_body() -> String {
     SYSTEM_PROMPT_TEMPLATE.replace("{{TOOLS}}", &tools::roster())
 }
 
-// The role preamble a spawned subagent runs under (see `CodingBackend::as_subagent`).
+// The role preamble a spawned subagent runs under (see `CodingBackend::into_subagent`).
 // Role is set by prompt, not by a type — this block is what makes an otherwise
 // ordinary agent behave as a subagent: its one hard obligation is that results are
 // DELIVERED via MessagePeer, because the spawner never reads its transcript.

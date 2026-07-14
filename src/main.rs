@@ -359,13 +359,13 @@ fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFactory
             );
 
             // Built-ins only: no .mcp.json servers. Skills are still discovered
-            // locally (cheap). `as_subagent` installs the role contract (report back
+            // locally (cheap). `into_subagent` installs the role contract (report back
             // to the spawner via MessagePeer) and drops CLAUDE.md — a subagent runs
             // under its spawner's contract, not the repo's human conventions.
             let mcp = coding::mcp::McpRegistry::bootstrap(&[]).await;
             let skills = coding::skills::SkillRegistry::discover(&cwd, None);
             let backend = coding::CodingBackend::new(cwd, mcp, skills)
-                .as_subagent(coding::prompt::subagent_role(&parent_who.name));
+                .into_subagent(coding::prompt::subagent_role(&parent_who.name));
             let cfg = AgentConfig {
                 model: DEFAULT_MODEL.into(),
                 max_tokens: MAX_TOKENS,
