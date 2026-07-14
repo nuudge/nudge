@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
 
 use super::events::{ControllerEvent, UiEvent};
-use super::host::Controller;
+use super::host::{BrokerHandle, Controller, SessionHost};
 use super::identity::ClientIdentity;
 
 // The set of peers this agent is a *client* of — the outbound half of symmetric
@@ -16,18 +17,61 @@ use super::identity::ClientIdentity;
 // `ControllerId`; this is the mirror on the client side and is unrelated to it.
 pub type PeerId = u64;
 
+// Creates a peer on demand — the executor behind the model-facing `Spawn` tool. The
+// composition root supplies it (building an agent needs a provider, a backend, and a
+// session — all things `core` must not construct), and the loop calls it with the
+// task plus a handle to its OWN broker so the factory can wire the return edge
+// (child attaches back to the spawner). Absent for agents that may not spawn (a
+// factory-made child gets `None`, so there is no recursive spawning yet).
+pub type PeerFactory = Box<
+    dyn Fn(
+            String,
+            BrokerHandle,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<PeerRegistration>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // A peer this agent holds a client connection to.
 struct Peer {
     who: ClientIdentity,
     controller: Controller,
+    // Keep-alive for a locally spawned child: the `SessionHost` owns the child's loop
+    // and broker tasks, so dropping this `Peer` (reap, or the parent ending) ends the
+    // child. `None` when the peer's lifetime is owned elsewhere (the return edge held
+    // by a child, a remote peer, a test's synthetic controller).
+    _host: Option<SessionHost>,
 }
 
-// A peer handed to the loop at runtime (e.g. a freshly spawned child). Carries the
-// controller plus the peer's announced identity, so the loop can attribute the
-// peer's activity to a name.
+// A peer handed to the loop at runtime (spawned by the factory, or registered by the
+// composition root). Carries the controller plus the peer's announced identity, so
+// the loop can attribute the peer's activity to a name.
 pub struct PeerRegistration {
     pub controller: Controller,
     pub who: ClientIdentity,
+    pub host: Option<SessionHost>,
+}
+
+// The peer capabilities an agent is born with: whether it may spawn subagents (the
+// factory) and which peers it already holds — e.g. a spawned child starts with its
+// return edge to the spawner seeded here, so MessagePeer is available from its very
+// first turn. Default = a plain session with neither.
+#[derive(Default)]
+pub struct PeerWiring {
+    pub factory: Option<PeerFactory>,
+    pub initial_peers: PeerSet,
+}
+
+impl PeerRegistration {
+    // A registration with no owned host — for peers whose lifetime lives elsewhere.
+    pub fn new(controller: Controller, who: ClientIdentity) -> Self {
+        Self {
+            controller,
+            who,
+            host: None,
+        }
+    }
 }
 
 // Holds every peer the agent drives/observes and merges their event streams into
@@ -41,10 +85,17 @@ pub struct PeerSet {
 
 impl PeerSet {
     // Start holding a peer; returns its local id (the routing key for `drive`).
-    pub fn register(&mut self, controller: Controller, who: ClientIdentity) -> PeerId {
+    pub fn register(&mut self, reg: PeerRegistration) -> PeerId {
         let id = self.next_id;
         self.next_id += 1;
-        self.peers.insert(id, Peer { who, controller });
+        self.peers.insert(
+            id,
+            Peer {
+                who: reg.who,
+                controller: reg.controller,
+                _host: reg.host,
+            },
+        );
         id
     }
 
@@ -79,6 +130,26 @@ impl PeerSet {
     // Stop holding a peer (its stream closed). No-op if already gone.
     pub fn remove(&mut self, id: PeerId) {
         self.peers.remove(&id);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    // Resolve a peer by its announced name — how the model addresses one.
+    pub fn find_by_name(&self, name: &str) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|(_, p)| p.who.name == name)
+            .map(|(id, _)| *id)
+    }
+
+    // The names of every held peer, for the model's error recovery ("no such peer;
+    // current peers: …"). Sorted so the wording is deterministic.
+    pub fn roster(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.peers.values().map(|p| p.who.name.clone()).collect();
+        names.sort();
+        names
     }
 
     // Display name for a peer, for attributing its activity in Notices. Falls back to
@@ -121,8 +192,11 @@ mod tests {
         let mut peers = PeerSet::default();
         let (a_ctrl, a_ev, _a_ui) = fake_peer();
         let (b_ctrl, b_ev, _b_ui) = fake_peer();
-        let a = peers.register(a_ctrl, ClientIdentity::human("alice"));
-        let b = peers.register(b_ctrl, ClientIdentity::human("bob"));
+        let a = peers.register(PeerRegistration::new(
+            a_ctrl,
+            ClientIdentity::human("alice"),
+        ));
+        let b = peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")));
 
         b_ev.send(ControllerEvent::Notice {
             text: "from-b".into(),
@@ -154,7 +228,7 @@ mod tests {
     async fn drive_reaches_the_addressed_peer() {
         let mut peers = PeerSet::default();
         let (ctrl, _ev, mut ui_rx) = fake_peer();
-        let id = peers.register(ctrl, ClientIdentity::human("child"));
+        let id = peers.register(PeerRegistration::new(ctrl, ClientIdentity::human("child")));
 
         peers
             .drive(id, UiEvent::UserMessage { text: "go".into() })
@@ -172,8 +246,11 @@ mod tests {
         let mut peers = PeerSet::default();
         let (a_ctrl, a_ev, _a_ui) = fake_peer();
         let (b_ctrl, b_ev, _b_ui) = fake_peer();
-        let a = peers.register(a_ctrl, ClientIdentity::human("alice"));
-        let b = peers.register(b_ctrl, ClientIdentity::human("bob"));
+        let a = peers.register(PeerRegistration::new(
+            a_ctrl,
+            ClientIdentity::human("alice"),
+        ));
+        let b = peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")));
 
         drop(a_ev); // A's broker/stream is gone
         match peers.recv().await {

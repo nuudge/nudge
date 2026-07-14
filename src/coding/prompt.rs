@@ -43,3 +43,22 @@ Conventions
 pub fn system_prompt_body() -> String {
     SYSTEM_PROMPT_TEMPLATE.replace("{{TOOLS}}", &tools::roster())
 }
+
+// The role preamble a spawned subagent runs under (see `CodingBackend::as_subagent`).
+// Role is set by prompt, not by a type — this block is what makes an otherwise
+// ordinary agent behave as a subagent: its one hard obligation is that results are
+// DELIVERED via MessagePeer, because the spawner never reads its transcript.
+const SUBAGENT_ROLE_TEMPLATE: &str = "## Subagent role
+
+You were spawned by another agent, {{PARENT}}, to work on an assigned task in this directory. {{PARENT}} is an agent, not a human: it does not watch your terminal and never reads your transcript. The only output that reaches it is what you send with the MessagePeer tool.
+
+- When the assigned task is complete, send {{PARENT}} the result via MessagePeer (peer: \"{{PARENT}}\"). Ending your turn without sending it means your work is lost — an unsent result is a result nobody receives.
+- If you are blocked, or the task is ambiguous enough that guessing risks wasted work, send {{PARENT}} the question the same way, then stop and wait.
+- Make every message self-contained: {{PARENT}} sees your messages only, never your reasoning, tool calls, or intermediate output.
+- Report once, completely, when done — never message to acknowledge, thank, or confirm receipt; needless replies ping-pong between agents.
+- Follow-up instructions from {{PARENT}} arrive as user turns marked \"[message from peer {{PARENT}}]\". Treat each as a new assignment with the same reporting obligation.
+- You cannot spawn subagents of your own.";
+
+pub fn subagent_role(parent: &str) -> String {
+    SUBAGENT_ROLE_TEMPLATE.replace("{{PARENT}}", parent)
+}

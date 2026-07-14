@@ -22,6 +22,8 @@ pub struct CodingBackend {
     system_prompt: String,
     stable_env: String,
     claude_md: Option<String>,
+    // The subagent contract (see `as_subagent`); None for a top-level agent.
+    role_preamble: Option<String>,
     cwd: PathBuf,
     mcp: McpRegistry,
     skills: SkillRegistry,
@@ -39,11 +41,23 @@ impl CodingBackend {
             system_prompt: system_prompt_body(),
             stable_env: stable_env_block(&cwd),
             claude_md: claude_md_block(&cwd),
+            role_preamble: None,
             cwd,
             mcp,
             skills,
             file_state: Arc::new(Mutex::new(FileState::default())),
         }
+    }
+
+    // Reconfigure this backend as a spawned subagent's: `role_preamble` (see
+    // `prompt::subagent_role`) becomes a system block right after the prompt body,
+    // and CLAUDE.md is dropped — a subagent runs under its spawner's contract, and
+    // anything project-specific it needs belongs in the authored task. Role by
+    // prompt, not by type: the loop and everything below stay role-free.
+    pub fn as_subagent(mut self, role_preamble: String) -> Self {
+        self.role_preamble = Some(role_preamble);
+        self.claude_md = None;
+        self
     }
 }
 
@@ -52,6 +66,7 @@ impl Backend for CodingBackend {
         let volatile_env = volatile_env_block(&self.cwd);
         build_system_blocks(
             &self.system_prompt,
+            &self.role_preamble,
             &self.claude_md,
             &self.stable_env,
             &volatile_env,
@@ -170,6 +185,7 @@ async fn load_dormant(
 // blocks carry none.
 fn build_system_blocks(
     system_prompt: &str,
+    role_preamble: &Option<String>,
     claude_md: &Option<String>,
     stable_env: &str,
     volatile_env: &str,
@@ -178,6 +194,14 @@ fn build_system_blocks(
         text: system_prompt.to_string(),
         cache: false,
     }];
+    // Role before conventions: a subagent's contract sits directly under the body.
+    // Session-stable like the body, so the stable_env marker downstream covers it.
+    if let Some(role) = role_preamble {
+        system.push(SystemBlock {
+            text: role.clone(),
+            cache: false,
+        });
+    }
     if let Some(cm) = claude_md {
         system.push(SystemBlock {
             text: cm.clone(),
@@ -243,7 +267,13 @@ pub async fn print_preamble<P: Provider>(
     let stable_env = stable_env_block(&session.cwd);
     let volatile_env = volatile_env_block(&session.cwd);
     let claude_md = claude_md_block(&session.cwd);
-    let system = build_system_blocks(&system_prompt, &claude_md, &stable_env, &volatile_env);
+    let system = build_system_blocks(
+        &system_prompt,
+        &None,
+        &claude_md,
+        &stable_env,
+        &volatile_env,
+    );
     let (tools, boundary) = build_tool_array(mcp, skills);
 
     println!("===== SYSTEM =====");
@@ -272,7 +302,13 @@ pub async fn print_preamble<P: Provider>(
         model: &cfg.model,
         max_tokens: cfg.max_tokens,
         thinking_display: &cfg.thinking_display,
-        system: build_system_blocks(&system_prompt, &claude_md, &stable_env, &volatile_env),
+        system: build_system_blocks(
+            &system_prompt,
+            &None,
+            &claude_md,
+            &stable_env,
+            &volatile_env,
+        ),
         tools,
         tool_cache_boundary: boundary,
         messages: &probe,
@@ -291,4 +327,51 @@ pub async fn print_preamble<P: Provider>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `as_subagent` installs the role block directly after the prompt body and drops
+    // CLAUDE.md — the two halves of the subagent-contract decision.
+    #[tokio::test]
+    async fn as_subagent_swaps_claude_md_for_the_role_block() {
+        let dir = std::env::temp_dir().join(format!("nudge-backend-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "PROJECT CONVENTIONS").unwrap();
+
+        let plain = CodingBackend::new(
+            dir.clone(),
+            McpRegistry::bootstrap(&[]).await,
+            SkillRegistry::discover(&dir, None),
+        );
+        assert!(
+            plain
+                .system_blocks()
+                .iter()
+                .any(|b| b.text.contains("PROJECT CONVENTIONS")),
+            "a top-level backend loads CLAUDE.md"
+        );
+
+        let sub = CodingBackend::new(
+            dir.clone(),
+            McpRegistry::bootstrap(&[]).await,
+            SkillRegistry::discover(&dir, None),
+        )
+        .as_subagent("ROLE: report to parent-x".into());
+        let blocks = sub.system_blocks();
+        assert!(
+            blocks[1].text.contains("ROLE: report to parent-x"),
+            "the role block sits directly after the prompt body"
+        );
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b.text.contains("PROJECT CONVENTIONS")),
+            "a subagent backend drops CLAUDE.md"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
