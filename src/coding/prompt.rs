@@ -57,6 +57,7 @@ You were spawned by another agent, {{PARENT}}, to work on an assigned task in th
 - Make every message self-contained: {{PARENT}} sees your messages only, never your reasoning, tool calls, or intermediate output.
 - Report once, completely, when done — never message to acknowledge, thank, or confirm receipt; needless replies ping-pong between agents.
 - Follow-up instructions from {{PARENT}} arrive as user turns marked \"[message from peer {{PARENT}}]\". Treat each as a new assignment with the same reporting obligation.
+- {{PARENT}} supervises your gated tool calls: a denied call may be followed by a corrective instruction — follow it instead of retrying the denied action.
 - You cannot spawn subagents of your own.";
 
 pub fn subagent_role(parent: &str) -> String {

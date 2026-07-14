@@ -233,27 +233,55 @@ async fn peer_activity_surfaces_as_a_notice() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A peer's permission check-in is answered (step-3 placeholder auto-approve): the
-// loop drives a PermissionResponse back up the peer's ui_tx — the parent→peer drive
-// edge.
+// A supervised peer registration, as the Spawn path produces (steered + dismissable).
+fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistration {
+    PeerRegistration {
+        controller,
+        who,
+        host: None,
+        supervised: true,
+    }
+}
+
+// A supervised peer's check-in drives a steering inference; an approve verdict routes
+// allow back to the peer, the check-in carries the capped activity digest, and the
+// whole exchange is recorded in the transcript (resting on an assistant turn).
 #[tokio::test]
-async fn peer_permission_check_in_is_auto_approved() {
+async fn supervised_check_in_is_steered_to_approval() {
     let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("RespondToPeer", serde_json::json!({"verdict": "approve"})),
+            end_turn_response("ok"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
     let (ui_tx, ui_rx) = mpsc::channel(16);
-    let (agent_tx, _agent_rx) = mpsc::channel(16);
-    let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
     let task = tokio::spawn(run_agent(
         mk_cfg(),
-        FakeProvider,
+        provider,
         FakeBackend,
         session,
         Vec::new(),
-        mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+        mk_io(ui_rx, agent_tx, peers, None),
     ));
 
-    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
-    reg_tx
-        .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
+    // Some activity first, so the check-in has a digest to carry.
+    peer_ev
+        .send(ControllerEvent::ToolUseStart {
+            id: "c1".into(),
+            name: "Bash".into(),
+            summary: "listing files".into(),
+        })
         .unwrap();
     peer_ev
         .send(ControllerEvent::PermissionRequest {
@@ -268,8 +296,423 @@ async fn peer_permission_check_in_is_auto_approved() {
             assert_eq!(tool_use_id, "t1");
             assert!(allow);
         }
-        other => panic!("expected a PermissionResponse driven to the peer, got {other:?}"),
+        other => panic!("expected the approve routed to the peer, got {other:?}"),
     }
+
+    // The steering request carried the check-in + digest.
+    let transcript = seen_messages.lock().unwrap().clone();
+    let checkin = match &transcript[0].content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected the check-in turn, got {other:?}"),
+    };
+    assert!(
+        checkin.contains("[check-in from peer child-1]"),
+        "{checkin}"
+    );
+    assert!(checkin.contains("run ls"), "{checkin}");
+    assert!(
+        checkin.contains("requested Bash: listing files"),
+        "{checkin}"
+    );
+
+    // The exchange is recorded compactly and rests on an assistant turn: the next
+    // human turn arrives after just [check-in, assistant close].
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "hi".into() }))
+        .await
+        .unwrap();
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+    let transcript = seen_messages.lock().unwrap().clone();
+    assert_eq!(transcript.len(), 3, "{transcript:?}");
+    match &transcript[1].content[0] {
+        ContentBlock::Text { text } => {
+            assert!(text.contains("Approved child-1's Bash call"), "{text}")
+        }
+        other => panic!("expected the assistant close, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A deny verdict routes the block and then the redirect message — the peer paused on
+// denial, so the message arrives as its fresh instruction.
+#[tokio::test]
+async fn steering_deny_redirects_the_peer() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![tool_use_response(
+            "RespondToPeer",
+            serde_json::json!({"verdict": "deny", "message": "use Grep instead"}),
+        )]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, _agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "rm -rf".into(),
+        })
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
+            assert_eq!(tool_use_id, "t1");
+            assert!(!allow);
+        }
+        other => panic!("expected the deny routed to the peer, got {other:?}"),
+    }
+    match peer_ui.recv().await {
+        Some(UiEvent::UserMessage { text }) => assert_eq!(text, "use Grep instead"),
+        other => panic!("expected the redirect message, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// An escalate verdict surfaces the peer's request on this agent's own broker (named),
+// and the human's answer is routed down to the peer.
+#[tokio::test]
+async fn steering_escalates_to_the_human() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![tool_use_response(
+            "RespondToPeer",
+            serde_json::json!({"verdict": "escalate"}),
+        )]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "push to main".into(),
+        })
+        .unwrap();
+
+    // The escalated request reaches this agent's own event stream, named.
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest {
+                tool_use_id,
+                summary,
+                respond,
+                ..
+            }) => {
+                assert_eq!(tool_use_id, "t1");
+                assert!(summary.contains("peer child-1"), "{summary}");
+                respond.send(true).unwrap();
+                break;
+            }
+            Some(_) => {}
+            None => panic!("loop ended before escalation"),
+        }
+    }
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(allow),
+        other => panic!("expected the human's answer routed to the peer, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A steering call that yields no verdict (here: a plain text response) must deny
+// safely and roll the dangling check-in back — the next human turn starts clean.
+#[tokio::test]
+async fn steering_failure_denies_safely_and_rolls_back() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            end_turn_response("hmm, tricky"),
+            end_turn_response("ok"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+        })
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(!allow),
+        other => panic!("expected the safe deny, got {other:?}"),
+    }
+
+    // The dangling check-in was rolled back: the next turn's transcript is just the
+    // human message.
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "hi".into() }))
+        .await
+        .unwrap();
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+    let transcript = seen_messages.lock().unwrap().clone();
+    assert_eq!(transcript.len(), 1, "{transcript:?}");
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// An UNSUPERVISED peer's permission request is never answered by this agent — its
+// own supervisor (or a human) holds that decision. This is what stops a child
+// rubber-stamping its parent's gated calls.
+#[tokio::test]
+async fn unsupervised_check_in_is_not_answered() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(PeerRegistration::new(peer_ctrl, agent_who("parent-1")));
+
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+        })
+        .unwrap();
+
+    // The observation surfaces (so a human can see it), explicitly unanswered here.
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Notice { text }) if text.contains("not mine to answer") => break,
+            Some(_) => {}
+            None => panic!("expected the not-mine Notice"),
+        }
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    // The loop ended without ever sending the peer anything; its channel just closes.
+    assert!(peer_ui.recv().await.is_none(), "peer must not be answered");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// DismissPeer (gated) removes a supervised peer: dropping the Peer ends the held
+// connection (and, for a real child, its owned SessionHost). Observable here as the
+// peer's event channel closing.
+#[tokio::test]
+async fn dismiss_peer_ends_the_supervised_child() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "dismiss the child".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest {
+                tool_name, respond, ..
+            }) => {
+                assert_eq!(tool_name, "DismissPeer");
+                respond.send(true).unwrap();
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    // The Peer (and its controller) is gone: the far event sender now errors.
+    assert!(
+        peer_ev
+            .send(ControllerEvent::Notice { text: "?".into() })
+            .is_err(),
+        "the dismissed peer's channel must be closed"
+    );
+    let transcript = seen_messages.lock().unwrap().clone();
+    assert!(
+        transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, is_error: false, .. }
+                if content.contains("dismissed child-1")
+        ))),
+        "expected the dismissal record: {transcript:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Dismissal is supervised-only: the return edge to your own spawner is refused.
+#[tokio::test]
+async fn dismiss_refuses_an_unsupervised_peer() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("DismissPeer", serde_json::json!({"peer": "parent-1"})),
+            end_turn_response("ok"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (parent_ctrl, parent_ev, _parent_ui) = fake_peer();
+    peers.register(PeerRegistration::new(parent_ctrl, agent_who("parent-1")));
+    // A supervised peer must exist for the DismissPeer schema to be offered at all.
+    let (child_ctrl, _child_ev, _child_ui) = fake_peer();
+    peers.register(supervised_reg(child_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => {
+                respond.send(true).unwrap();
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    // Refused — and the parent edge is still alive.
+    let transcript = seen_messages.lock().unwrap().clone();
+    assert!(
+        transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, is_error: true, .. }
+                if content.contains("not a subagent you spawned")
+        ))),
+        "expected the refusal: {transcript:?}"
+    );
+    assert!(
+        parent_ev
+            .send(ControllerEvent::Notice { text: "?".into() })
+            .is_ok(),
+        "the unsupervised peer must remain held"
+    );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
@@ -614,6 +1057,7 @@ fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> P
                 controller,
                 who,
                 host: None,
+                supervised: true,
             })
         })
     })

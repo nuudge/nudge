@@ -90,7 +90,7 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     async fn complete(&self, req: &Request<'_>) -> Result<Response> {
         let (system, tools, messages) = Self::wire_parts(req);
-        let body = json!({
+        let mut body = json!({
             "model": req.model,
             "system": system,
             "max_tokens": req.max_tokens,
@@ -98,6 +98,18 @@ impl Provider for AnthropicProvider {
             "tools": tools,
             "messages": messages,
         });
+        // A forced tool call is incompatible with (adaptive) thinking — the API
+        // rejects the combination — so the `thinking` field is dropped for it. Body
+        // params sit outside the cached prefix (system/tools/messages), so neither
+        // change costs a cache miss.
+        if let Some(name) = req.tool_choice {
+            let obj = body.as_object_mut().expect("body is an object");
+            obj.insert(
+                "tool_choice".into(),
+                json!({ "type": "tool", "name": name }),
+            );
+            obj.remove("thinking");
+        }
         let resp: MessagesResponse = self
             .client
             .post(API_URL)

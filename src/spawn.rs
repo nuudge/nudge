@@ -111,6 +111,9 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
                 controller: child_ctrl,
                 who: child_who,
                 host: Some(child),
+                // Direction of creation: the spawner steers this peer's check-ins
+                // and may dismiss it. The child's return edge stays unsupervised.
+                supervised: true,
             })
         })
     })
