@@ -74,6 +74,11 @@ pub struct Request<'a> {
     // Index of the last tool belonging to the stable prefix; the provider may
     // place a cache breakpoint there. None disables tool-level caching.
     pub tool_cache_boundary: Option<usize>,
+    // Force the model to call this tool (by name) instead of choosing freely.
+    // Forcing a tool is incompatible with extended thinking, so a provider
+    // disables thinking for such a call — the caller wants a structured verdict,
+    // not a trace. None = the model picks (the normal case).
+    pub tool_choice: Option<&'a str>,
     pub messages: &'a [Message],
 }
 

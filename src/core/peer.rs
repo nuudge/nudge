@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 
 use super::events::{ControllerEvent, UiEvent};
@@ -42,7 +42,22 @@ struct Peer {
     // child. `None` when the peer's lifetime is owned elsewhere (the return edge held
     // by a child, a remote peer, a test's synthetic controller).
     _host: Option<SessionHost>,
+    // Direction of creation: true = this agent spawned the peer, so it steers the
+    // peer's permission check-ins and may dismiss it. The return edge a child holds
+    // to its spawner is unsupervised — which is what stops a child answering its
+    // parent's gated calls (first-responder-wins would let it beat the human).
+    supervised: bool,
+    // Compact activity digest for the NEXT steering check-in (supervised peers
+    // only): a capped ring of one-line records, drained when a check-in is composed
+    // and folded nowhere else — supervision cost scales with check-ins, not with
+    // the peer's verbosity.
+    recent: VecDeque<String>,
 }
+
+// The most a steering check-in may carry from the activity ring: these caps are the
+// context-frugality contract (see supervision_plan.md decision 2).
+const RECENT_LINES_CAP: usize = 10;
+const RECENT_LINE_CHARS_CAP: usize = 120;
 
 // A peer handed to the loop at runtime (spawned by the factory, or registered by the
 // composition root). Carries the controller plus the peer's announced identity, so
@@ -51,6 +66,9 @@ pub struct PeerRegistration {
     pub controller: Controller,
     pub who: ClientIdentity,
     pub host: Option<SessionHost>,
+    // Set only by this agent's own Spawn path (trust-by-wiring — never announced
+    // over the handshake, so a peer cannot claim it).
+    pub supervised: bool,
 }
 
 // The peer capabilities an agent is born with: whether it may spawn subagents (the
@@ -64,12 +82,14 @@ pub struct PeerWiring {
 }
 
 impl PeerRegistration {
-    // A registration with no owned host — for peers whose lifetime lives elsewhere.
+    // A registration with no owned host and no supervision — for peers whose
+    // lifetime and steering live elsewhere (a return edge, a test controller).
     pub fn new(controller: Controller, who: ClientIdentity) -> Self {
         Self {
             controller,
             who,
             host: None,
+            supervised: false,
         }
     }
 }
@@ -94,9 +114,52 @@ impl PeerSet {
                 who: reg.who,
                 controller: reg.controller,
                 _host: reg.host,
+                supervised: reg.supervised,
+                recent: VecDeque::new(),
             },
         );
         id
+    }
+
+    pub fn is_supervised(&self, id: PeerId) -> bool {
+        self.peers.get(&id).is_some_and(|p| p.supervised)
+    }
+
+    // Whether any held peer is supervised — gates the RespondToPeer/DismissPeer
+    // schemas (an agent that supervises nobody has no verdicts to deliver).
+    pub fn has_supervised(&self) -> bool {
+        self.peers.values().any(|p| p.supervised)
+    }
+
+    // Record one line of observed activity for a supervised peer's next check-in.
+    // No-op for unsupervised peers — this agent will never steer them, so buffering
+    // their activity would pay for context nobody spends.
+    pub fn record_activity(&mut self, id: PeerId, line: &str) {
+        let Some(p) = self.peers.get_mut(&id) else {
+            return;
+        };
+        if !p.supervised {
+            return;
+        }
+        let clipped = if line.chars().count() > RECENT_LINE_CHARS_CAP {
+            let mut c: String = line.chars().take(RECENT_LINE_CHARS_CAP).collect();
+            c.push('…');
+            c
+        } else {
+            line.to_string()
+        };
+        if p.recent.len() == RECENT_LINES_CAP {
+            p.recent.pop_front();
+        }
+        p.recent.push_back(clipped);
+    }
+
+    // Take the activity recorded since the last check-in (clears the ring).
+    pub fn drain_activity(&mut self, id: PeerId) -> Vec<String> {
+        self.peers
+            .get_mut(&id)
+            .map(|p| p.recent.drain(..).collect())
+            .unwrap_or_default()
     }
 
     // Resolve to the next event from ANY held peer, tagged by its id, or never

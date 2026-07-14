@@ -134,8 +134,10 @@ impl SessionHost {
         peers: PeerWiring,
     ) -> Self
     where
-        P: Provider + Send + 'static,
-        B: Backend + Send + 'static,
+        // Sync because the loop lends `&provider` / `&backend` to the steering turn,
+        // which holds them across its own awaits (session logging, escalation).
+        P: Provider + Send + Sync + 'static,
+        B: Backend + Send + Sync + 'static,
     {
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (loop_ui_tx, loop_ui_rx) = mpsc::channel(CHANNEL_CAPACITY);

@@ -12,16 +12,19 @@ use super::super::peer::{PeerFactory, PeerSet};
 
 pub(super) const MESSAGE_PEER: &str = "MessagePeer";
 pub(super) const SPAWN: &str = "Spawn";
+pub(super) const RESPOND_TO_PEER: &str = "RespondToPeer";
+pub(super) const DISMISS_PEER: &str = "DismissPeer";
 
 pub(super) fn is_peer_tool(name: &str) -> bool {
-    name == MESSAGE_PEER || name == SPAWN
+    name == MESSAGE_PEER || name == SPAWN || name == RESPOND_TO_PEER || name == DISMISS_PEER
 }
 
-// Spawning is autonomous token-spending — and the current placeholder supervision
-// auto-approves a child's gated calls — so the human gates every spawn. Messaging is
-// conversation; the addressee's own gates apply to whatever it causes.
+// Spawning is autonomous token-spending and dismissal destroys a child's in-memory
+// context (in-flight work stops) — the human gates both lifecycle actions. Messaging
+// is conversation (the addressee's own gates apply to whatever it causes), and a
+// RespondToPeer verdict IS the supervision decision — gating it would just re-ask.
 pub(super) fn requires_permission(name: &str) -> bool {
-    name == SPAWN
+    name == SPAWN || name == DISMISS_PEER
 }
 
 pub(super) fn permission_summary(name: &str, input: &Value) -> String {
@@ -29,6 +32,10 @@ pub(super) fn permission_summary(name: &str, input: &Value) -> String {
         SPAWN => {
             let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
             format!("spawn a subagent — task: {task}")
+        }
+        DISMISS_PEER => {
+            let peer = input.get("peer").and_then(Value::as_str).unwrap_or("?");
+            format!("dismiss subagent {peer} (ends its session; log persists)")
         }
         _ => summary(name, input),
     }
@@ -50,9 +57,11 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
                 subagent works autonomously; its activity surfaces to you as \
                 '[peer …]' notices, and you can address it with MessagePeer. It has a \
                 standing obligation to message you its result when done or blocked — \
-                still state in the task what you expect back and in what form. Use a \
-                subagent for a self-contained task that can proceed in parallel; do \
-                not spawn one for work you can do directly in a few steps.",
+                still state in the task what you expect back and in what form. Its \
+                messages and check-ins arrive on their own and wake you — never poll, \
+                sleep, or busy-wait for it; simply end your turn. Use a subagent for \
+                a self-contained task that can proceed in parallel; do not spawn one \
+                for work you can do directly in a few steps.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -94,6 +103,52 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
             }
         }));
     }
+    if peers.has_supervised() {
+        out.push(json!({
+            "name": RESPOND_TO_PEER,
+            "description": "Deliver your verdict on a subagent's pending permission \
+                check-in. Only meaningful while a check-in is being decided (the call \
+                is forced then); calling it at any other time is an error. Verdicts: \
+                'approve' lets the subagent's tool call run; 'deny' blocks it — set \
+                'message' to explain or redirect (it arrives as the subagent's next \
+                instruction); 'escalate' hands the decision to your own user when you \
+                cannot judge it (irreversible actions, unclear intent, anything \
+                destructive).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["approve", "deny", "escalate"]
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "For 'deny': the correction or redirect the \
+                            subagent should follow instead. Ignored otherwise."
+                    }
+                },
+                "required": ["verdict"]
+            }
+        }));
+        out.push(json!({
+            "name": DISMISS_PEER,
+            "description": "End a subagent you spawned. Its in-memory session ends \
+                (any in-flight work stops); its session log persists on disk and can \
+                be resumed later. Use it when the subagent's task is done and you no \
+                longer need it, or when it is stuck beyond redirection. Only \
+                subagents you spawned can be dismissed.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "peer": {
+                        "type": "string",
+                        "description": "The subagent's name, e.g. 'child-ab12cd34'."
+                    }
+                },
+                "required": ["peer"]
+            }
+        }));
+    }
     out
 }
 
@@ -104,6 +159,14 @@ pub(super) fn summary(name: &str, input: &Value) -> String {
         SPAWN => {
             let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
             truncated(task, 80)
+        }
+        RESPOND_TO_PEER => {
+            let verdict = input.get("verdict").and_then(Value::as_str).unwrap_or("?");
+            verdict.to_string()
+        }
+        DISMISS_PEER => {
+            let peer = input.get("peer").and_then(Value::as_str).unwrap_or("?");
+            format!("dismiss {peer}")
         }
         _ => {
             let peer = input.get("peer").and_then(Value::as_str).unwrap_or("?");
@@ -153,6 +216,29 @@ pub(super) async fn execute(
             peers.register(reg);
             Ok(format!(
                 "spawned peer {peer_name} (session {session_id}); it is now working on: {task}"
+            ))
+        }
+        // A RespondToPeer outside a steering turn has nothing to answer — the forced
+        // call during steering is handled by `steering::run_steering_turn`, never here.
+        RESPOND_TO_PEER => bail!("no pending peer check-in to respond to"),
+        // Dropping the Peer drops its owned SessionHost: the child's broker forwards
+        // a final Quit and the child ends cleanly; its JSONL persists on disk.
+        DISMISS_PEER => {
+            let Some(peer) = input.get("peer").and_then(Value::as_str) else {
+                bail!("DismissPeer requires a 'peer' string");
+            };
+            let Some(id) = peers.find_by_name(peer) else {
+                bail!(
+                    "no peer named '{peer}'; current peers: {}",
+                    peers.roster().join(", ")
+                );
+            };
+            if !peers.is_supervised(id) {
+                bail!("cannot dismiss '{peer}': not a subagent you spawned");
+            }
+            peers.remove(id);
+            Ok(format!(
+                "dismissed {peer}; its session ended (the session log persists on disk)"
             ))
         }
         _ => {

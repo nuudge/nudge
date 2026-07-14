@@ -8,6 +8,7 @@ mod dispatch;
 mod naming;
 mod peer_tools;
 mod session_info;
+mod steering;
 mod supervision;
 #[cfg(test)]
 mod tests;
@@ -92,6 +93,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                                         system: Vec::new(),
                                         tools: Vec::new(),
                                         tool_cache_boundary: None,
+                                        tool_choice: None,
                                         messages: &probe,
                                     };
                                     provider
@@ -127,7 +129,25 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     None => peer_register_rx = None,
                 },
                 (pid, ev) = peers.recv() => {
-                    supervise_peer_event(&mut peers, &agent_tx, pid, ev).await;
+                    // A supervised peer's check-in comes back here and is decided by
+                    // one steering inference over this agent's own transcript.
+                    if let supervision::Observed::CheckIn(checkin) =
+                        supervise_peer_event(&mut peers, &agent_tx, pid, ev).await
+                    {
+                        steering::run_steering_turn(
+                            &cfg,
+                            &provider,
+                            &backend,
+                            &mut session,
+                            &mut messages,
+                            &mut last_good_snapshot,
+                            &mut peers,
+                            &agent_tx,
+                            &peer_factory,
+                            checkin,
+                        )
+                        .await?;
+                    }
                 }
             }
         };
@@ -151,6 +171,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 system: backend.system_blocks(),
                 tools,
                 tool_cache_boundary,
+                tool_choice: None,
                 messages: &messages,
             };
 
