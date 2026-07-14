@@ -4,10 +4,10 @@ use std::future::Future;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::agent::{AgentConfig, AgentIo, Backend, run_agent};
+use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::ClientIdentity;
-use super::peer::{PeerRegistration, PeerSet};
+use super::peer::PeerWiring;
 use super::session::Session;
 use crate::llm::{Message, Provider};
 
@@ -111,17 +111,19 @@ pub struct SessionHost {
     // backgrounding again. `None` when no relay is configured (nothing to arm) and
     // in headless/daemon and remote modes.
     handoff_hook: Option<Box<dyn Fn() + Send + Sync>>,
-    // Producer half of the loop's peer-registration channel: hand it a `Controller`
-    // (obtained by attaching to a peer's broker) and the loop starts driving/observing
-    // that peer. Held for the session so the channel stays open even when childless.
-    peer_register_tx: mpsc::UnboundedSender<PeerRegistration>,
 }
 
 impl SessionHost {
     // Spawn the agent loop and a broker that mediates between it and front-ends.
     // Provider/Backend must be `Send + 'static` because the loop is spawned onto
     // the tokio runtime (their async methods already return Send futures by
-    // design — see the Provider/Backend trait docs).
+    // design — see the Provider/Backend trait docs). `peers` is what the agent is
+    // born with: `factory` = the executor behind the model-facing Spawn tool (None =
+    // this agent may not spawn — the factory itself creates children with None, so
+    // spawning doesn't recurse); `initial_peers` seeds the loop's PeerSet before its
+    // first poll, so a spawned child holds its return edge — and the MessagePeer
+    // tool — from its very first turn (no select! race between kick and
+    // registration).
     pub fn spawn<P, B>(
         cfg: AgentConfig,
         provider: P,
@@ -129,6 +131,7 @@ impl SessionHost {
         session: Session,
         initial_messages: Vec<Message>,
         seed: Vec<ControllerEvent>,
+        peers: PeerWiring,
     ) -> Self
     where
         P: Provider + Send + 'static,
@@ -136,10 +139,12 @@ impl SessionHost {
     {
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (loop_ui_tx, loop_ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        // Low-frequency control channel: the composition root hands the loop a peer
-        // (a `Controller` obtained by attaching to the peer's broker) at runtime. The
-        // loop starts with an empty `PeerSet`, so a childless session is unchanged.
-        let (peer_register_tx, peer_register_rx) = mpsc::unbounded_channel();
+        // Created before the loop so it can carry a handle to its OWN broker — the
+        // factory needs it to wire a spawned child's return edge (child → parent).
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let self_handle = BrokerHandle {
+            ctl_tx: ctl_tx.clone(),
+        };
 
         let agent_task = tokio::spawn(run_agent(
             cfg,
@@ -150,8 +155,13 @@ impl SessionHost {
             AgentIo {
                 ui_rx: loop_ui_rx,
                 agent_tx: loop_agent_tx,
-                peers: PeerSet::default(),
-                peer_register_rx: Some(peer_register_rx),
+                peers: peers.initial_peers,
+                // No runtime registrar wired yet — peers arrive at spawn (this seed)
+                // or via the loop's own Spawn tool. The AgentIo seam stays for a
+                // future producer (e.g. remotely-connected peers).
+                peer_register_rx: None,
+                peer_factory: peers.factory,
+                self_handle,
             },
         ));
 
@@ -159,7 +169,6 @@ impl SessionHost {
         // (empty for a fresh session). It primes the broker's replay buffer so
         // every controller — including a remote one that can't read the JSONL —
         // reconstructs the full history from the event stream alone.
-        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, seed));
 
         Self {
@@ -167,7 +176,6 @@ impl SessionHost {
             broker_task,
             ctl_tx,
             handoff_hook: None,
-            peer_register_tx,
         }
     }
 
@@ -187,17 +195,6 @@ impl SessionHost {
     // configured, nor in daemon / remote (`SocketClient`) modes.
     pub fn set_handoff_hook(&mut self, hook: impl Fn() + Send + Sync + 'static) {
         self.handoff_hook = Some(Box::new(hook));
-    }
-
-    // Hand this session a peer to drive/observe. `controller` is obtained by attaching
-    // to the peer's broker — locally via `SessionHost::attach`, or (step 6) remotely via
-    // `RelayClient::attach` — so `core` names no transport: the composition root creates
-    // the controller and injects it here. The loop picks it up on its next idle wait and
-    // adds it to its `PeerSet`. Fire-and-forget: a dropped send means the loop has ended.
-    pub fn register_peer(&self, controller: Controller, who: ClientIdentity) {
-        let _ = self
-            .peer_register_tx
-            .send(PeerRegistration { controller, who });
     }
 
     // End the session: ask the broker to deliver a final Quit to the loop, then
@@ -405,7 +402,7 @@ async fn recv_any_ui(
 // channels live here for the whole session, so a front-end leaving never closes
 // them — only an explicit Quit (or the loop ending on its own) stops the broker.
 async fn broker(
-    loop_ui_tx: mpsc::Sender<UiEvent>,
+    loop_ui_tx: mpsc::Sender<LoopInput>,
     mut loop_agent_rx: mpsc::Receiver<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<HostCommand>,
     seed: Vec<ControllerEvent>,
@@ -438,7 +435,7 @@ async fn broker(
                     }
                     // End the session: forward a final Quit to the loop and stop.
                     Some(HostCommand::Quit) | None => {
-                        let _ = loop_ui_tx.send(UiEvent::Quit).await;
+                        let _ = loop_ui_tx.send((None, UiEvent::Quit)).await;
                         return;
                     }
                 }
@@ -470,13 +467,17 @@ async fn broker(
                     }
                     // Drive the loop, and echo into the stream so every controller
                     // (including a later attach) reconstructs the shared transcript.
-                    // The echo is attributed to the sending controller's identity.
+                    // Both the loop forward and the echo carry the sending
+                    // controller's registry identity — stamped here, never claimed by
+                    // the client — so the loop can attribute a peer's message and the
+                    // shared transcript shows who said what.
                     Some(UiEvent::UserMessage { text }) => {
-                        let sender = attached
-                            .get(&id)
-                            .map(|c| c.who.name.clone())
+                        let who = attached.get(&id).map(|c| c.who.clone());
+                        let sender = who
+                            .as_ref()
+                            .map(|w| w.name.clone())
                             .unwrap_or_default();
-                        let _ = loop_ui_tx.send(UiEvent::UserMessage { text: text.clone() }).await;
+                        let _ = loop_ui_tx.send((who, UiEvent::UserMessage { text: text.clone() })).await;
                         let echo = ControllerEvent::UserMessage { text, sender };
                         buffer.push(echo.clone());
                         fan_out(&mut attached, &echo);
@@ -484,7 +485,8 @@ async fn broker(
                     // Pure control (SetModel / MCP load-unload-list / Quit): forward
                     // to the loop; its effects return as events.
                     Some(other) => {
-                        let _ = loop_ui_tx.send(other).await;
+                        let who = attached.get(&id).map(|c| c.who.clone());
+                        let _ = loop_ui_tx.send((who, other)).await;
                     }
                     // This controller dropped its ui_tx (detach / quit) → reap it; the
                     // loop and any other controllers live on.
@@ -508,8 +510,9 @@ pub(crate) struct BareBroker {
     // Inject loop events here; they land in the replay buffer and fan out to the
     // attached front-end, just like real loop output.
     pub agent_tx: mpsc::Sender<AgentEvent>,
-    // What the broker forwards toward the loop (user messages, model switches, …).
-    pub loop_ui_rx: mpsc::Receiver<UiEvent>,
+    // What the broker forwards toward the loop (user messages, model switches, …),
+    // each stamped with the sending controller's identity.
+    pub loop_ui_rx: mpsc::Receiver<LoopInput>,
     pub task: JoinHandle<()>,
 }
 
@@ -578,7 +581,7 @@ mod tests {
     // fulfils the loop's held oneshot, then a resolution marker is emitted.
     #[tokio::test]
     async fn forwards_echoes_and_correlates_permission() {
-        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -591,7 +594,7 @@ mod tests {
             .await
             .unwrap();
         match loop_ui_rx.recv().await {
-            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "hi"),
+            Some((_, UiEvent::UserMessage { text })) => assert_eq!(text, "hi"),
             other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
         }
         match a_events.recv().await {
@@ -647,7 +650,7 @@ mod tests {
     // One loop event fans out to every attached controller.
     #[tokio::test]
     async fn fan_out_reaches_all_controllers() {
-        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -670,7 +673,7 @@ mod tests {
     // every controller sees the echo (a shared transcript).
     #[tokio::test]
     async fn either_controller_drives_all_see_echo() {
-        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -683,7 +686,7 @@ mod tests {
             .unwrap();
 
         match loop_ui_rx.recv().await {
-            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "go"),
+            Some((_, UiEvent::UserMessage { text })) => assert_eq!(text, "go"),
             other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
         }
         for (who, ev) in [("A", a.recv().await), ("B", b.recv().await)] {
@@ -701,7 +704,7 @@ mod tests {
     // fans to every controller (so a shared session shows who said what).
     #[tokio::test]
     async fn user_message_echo_is_attributed_to_sender() {
-        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -712,9 +715,13 @@ mod tests {
         a_ui.send(UiEvent::UserMessage { text: "hi".into() })
             .await
             .unwrap();
-        // Forwarded to the loop once (the loop only needs the text, not the sender).
+        // Forwarded to the loop once, stamped with the sender's registry identity —
+        // so the loop can attribute a peer's message in the transcript.
         match loop_ui_rx.recv().await {
-            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "hi"),
+            Some((who, UiEvent::UserMessage { text })) => {
+                assert_eq!(text, "hi");
+                assert_eq!(who.expect("loop forward carries the sender").name, "alice");
+            }
             other => panic!("expected UserMessage forwarded to loop, got {other:?}"),
         }
         // Both controllers see the echo stamped with alice.
@@ -738,7 +745,7 @@ mod tests {
     // is a fresh one, not a duplicate PermissionResolved).
     #[tokio::test]
     async fn permission_first_responder_wins() {
-        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -804,7 +811,7 @@ mod tests {
     // Dropping one controller reaps it without disturbing the others or the loop.
     #[tokio::test]
     async fn dropping_one_controller_keeps_the_rest() {
-        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -834,7 +841,7 @@ mod tests {
     // fast controller or the loop — the unbounded fan-out guarantee.
     #[tokio::test]
     async fn slow_controller_does_not_block_others_or_the_loop() {
-        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
@@ -862,7 +869,7 @@ mod tests {
         .await
         .unwrap();
         match loop_ui_rx.recv().await {
-            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "drive"),
+            Some((_, UiEvent::UserMessage { text })) => assert_eq!(text, "drive"),
             other => panic!("loop expected driven UserMessage, got {other:?}"),
         }
 
@@ -874,7 +881,7 @@ mod tests {
     // another controller is already attached; then a live event reaches both.
     #[tokio::test]
     async fn late_attach_replays_with_others_present() {
-        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<UiEvent>(8);
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
         let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));

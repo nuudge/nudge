@@ -4,12 +4,15 @@ use std::future::Future;
 use tokio::sync::mpsc;
 
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
-use super::peer::{PeerId, PeerRegistration, PeerSet};
+use super::host::BrokerHandle;
+use super::identity::{ClientIdentity, ClientKind};
+use super::peer::{PeerFactory, PeerId, PeerRegistration, PeerSet};
 use crate::core::session::Session;
 use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 
 mod dispatch;
 mod naming;
+mod peer_tools;
 
 use dispatch::dispatch_tools;
 use naming::{fallback_name, short_id, title_from_response, title_prompt};
@@ -54,6 +57,12 @@ pub trait Backend {
     }
 }
 
+// One inbound event plus the identity of the client that sent it. The broker stamps
+// the identity from its registry (the attach handshake) — a client never claims its
+// own — so the loop can trust it when attributing a peer's message in the transcript.
+// `None` marks broker-internal sends (e.g. the final Quit), which need no sender.
+pub type LoopInput = (Option<ClientIdentity>, UiEvent);
+
 // The loop's I/O, bundled so the signature stays readable as it grows. `ui_rx` /
 // `agent_tx` are the inbound-drive / outbound-event halves (who drives me, what I
 // emit); `peers` is the set of agents I'm a *client* of (whom I drive/observe), and
@@ -61,10 +70,15 @@ pub trait Backend {
 // A top-level session has an empty `PeerSet` and a registrar that never fires, so the
 // two peer-related select arms are inert and behavior is byte-for-byte unchanged.
 pub struct AgentIo {
-    pub ui_rx: mpsc::Receiver<UiEvent>,
+    pub ui_rx: mpsc::Receiver<LoopInput>,
     pub agent_tx: mpsc::Sender<AgentEvent>,
     pub peers: PeerSet,
     pub peer_register_rx: Option<mpsc::UnboundedReceiver<PeerRegistration>>,
+    // Executor behind the model-facing Spawn tool (None = this agent may not spawn);
+    // `self_handle` reaches this agent's OWN broker, handed to the factory so a
+    // spawned child can attach back — the return edge.
+    pub peer_factory: Option<PeerFactory>,
+    pub self_handle: BrokerHandle,
 }
 
 pub async fn run_agent<P: Provider, B: Backend>(
@@ -80,6 +94,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
         agent_tx,
         mut peers,
         mut peer_register_rx,
+        peer_factory,
+        self_handle,
     } = io;
     let mut messages: Vec<Message> = initial_messages;
     // Index of `messages` after the last completed turn. On API error mid-turn we roll
@@ -100,8 +116,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
         let user_text = loop {
             tokio::select! {
                 ui = ui_rx.recv() => match ui {
-                Some(UiEvent::UserMessage { text }) => break text,
-                Some(UiEvent::SetModel { model }) => {
+                Some((who, UiEvent::UserMessage { text })) => break attribute(who.as_ref(), text),
+                Some((_, UiEvent::SetModel { model })) => {
                     cfg.model = model;
                     emit_session_info_if_changed(
                         &agent_tx,
@@ -112,7 +128,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     )
                     .await;
                 }
-                Some(UiEvent::RenameSession { name: requested }) => {
+                Some((_, UiEvent::RenameSession { name: requested })) => {
                     let branch = backend.git_branch();
                     let name = match requested {
                         // Tier 1: explicit name, used verbatim (trimmed).
@@ -160,14 +176,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     )
                     .await;
                 }
-                Some(UiEvent::Quit) | None => return Ok(()),
-                Some(ev) => {
+                Some((_, UiEvent::Quit)) | None => return Ok(()),
+                Some((_, ev)) => {
                     backend.handle_control(&ev, &agent_tx).await;
                 }
                 },
                 reg = recv_registration(&mut peer_register_rx) => match reg {
                     Some(reg) => {
-                        peers.register(reg.controller, reg.who);
+                        peers.register(reg);
                     }
                     None => peer_register_rx = None,
                 },
@@ -185,7 +201,10 @@ pub async fn run_agent<P: Provider, B: Backend>(
 
         // INNER loop: model + tool turns until non-tool-use stop.
         for iteration in 0..cfg.max_iterations {
-            let (tools, tool_cache_boundary) = backend.tool_schemas();
+            let (mut tools, tool_cache_boundary) = backend.tool_schemas();
+            // Loop-level peer tools ride after the backend's array (never inside the
+            // cached stable prefix); offered per capability (factory / held peers).
+            tools.extend(peer_tools::schemas(&peers, &peer_factory));
             let req = Request {
                 model: &cfg.model,
                 max_tokens: cfg.max_tokens,
@@ -257,8 +276,15 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 break;
             }
 
-            let (mut tool_results, denied) =
-                dispatch_tools(&assistant_msg, &agent_tx, &mut backend).await;
+            let (mut tool_results, denied) = dispatch_tools(
+                &assistant_msg,
+                &agent_tx,
+                &mut backend,
+                &mut peers,
+                &peer_factory,
+                &self_handle,
+            )
+            .await;
             messages.push(assistant_msg);
 
             // After a denial, pause for fresh user guidance that rides along in the
@@ -275,11 +301,13 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 .await;
                 loop {
                     match ui_rx.recv().await {
-                        Some(UiEvent::UserMessage { text }) => {
-                            tool_results.push(ContentBlock::Text { text });
+                        Some((who, UiEvent::UserMessage { text })) => {
+                            tool_results.push(ContentBlock::Text {
+                                text: attribute(who.as_ref(), text),
+                            });
                             break;
                         }
-                        Some(UiEvent::SetModel { model }) => {
+                        Some((_, UiEvent::SetModel { model })) => {
                             cfg.model = model;
                             emit_session_info_if_changed(
                                 &agent_tx,
@@ -290,8 +318,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             )
                             .await;
                         }
-                        Some(UiEvent::Quit) | None => return Ok(()),
-                        Some(ev) => {
+                        Some((_, UiEvent::Quit)) | None => return Ok(()),
+                        Some((_, ev)) => {
                             backend.handle_control(&ev, &agent_tx).await;
                         }
                     }
@@ -407,6 +435,19 @@ async fn recv_registration(
     }
 }
 
+// Fold the broker-stamped sender into the text that enters the transcript: an agent
+// peer's message is named, so the model knows which peer spoke; a human's message
+// stays bare, exactly as it always has. Keep the prefix format stable — the model
+// learns to reference it.
+fn attribute(who: Option<&ClientIdentity>, text: String) -> String {
+    match who {
+        Some(w) if w.kind == ClientKind::Agent => {
+            format!("[message from peer {}]\n{text}", w.name)
+        }
+        _ => text,
+    }
+}
+
 // Handle one event observed from a peer this agent drives. Step-3 supervision is
 // deliberately minimal: activity surfaces to this agent's own front-end as a Notice
 // (the watch substrate), and a permission check-in is auto-approved so the peer stays
@@ -513,6 +554,68 @@ mod tests {
         }
     }
 
+    // Like FakeProvider, but records the transcript of every request so tests can
+    // assert exactly what entered the model's context (e.g. attribution prefixes).
+    struct RecordingProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
+    }
+    impl Provider for RecordingProvider {
+        async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+            *self.seen.lock().unwrap() = req.messages.to_vec();
+            Ok(Response {
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                stop_reason: "end_turn".into(),
+                usage: Usage::default(),
+            })
+        }
+        async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    // Plays a fixed sequence of responses (e.g. a tool_use turn then an end_turn),
+    // recording each request's transcript and tool names — how tests script the model
+    // calling a loop-level peer tool and then assert what came back to it.
+    struct ScriptedProvider {
+        responses: std::sync::Mutex<Vec<Response>>,
+        seen_messages: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
+        seen_tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Provider for ScriptedProvider {
+        async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+            *self.seen_messages.lock().unwrap() = req.messages.to_vec();
+            *self.seen_tools.lock().unwrap() = req
+                .tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+                .collect();
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+        async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn tool_use_response(name: &str, input: Value) -> Response {
+        Response {
+            content: vec![ContentBlock::ToolUse {
+                id: "tu1".into(),
+                name: name.into(),
+                input,
+            }],
+            stop_reason: "tool_use".into(),
+            usage: Usage::default(),
+        }
+    }
+
+    fn end_turn_response(text: &str) -> Response {
+        Response {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            stop_reason: "end_turn".into(),
+            usage: Usage::default(),
+        }
+    }
+
     // A no-tool backend: the loop needs a Backend, but these tests exercise input
     // routing (peers, drive edges), not tool dispatch.
     struct FakeBackend;
@@ -573,6 +676,24 @@ mod tests {
         }
     }
 
+    // AgentIo for a direct-run loop test: no spawn factory, and a self_handle from a
+    // bare broker (only ever exercised by the Spawn tool).
+    fn mk_io(
+        ui_rx: mpsc::Receiver<LoopInput>,
+        agent_tx: mpsc::Sender<AgentEvent>,
+        peers: PeerSet,
+        peer_register_rx: Option<mpsc::UnboundedReceiver<PeerRegistration>>,
+    ) -> AgentIo {
+        AgentIo {
+            ui_rx,
+            agent_tx,
+            peers,
+            peer_register_rx,
+            peer_factory: None,
+            self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+        }
+    }
+
     // A synthetic peer: the `Controller` the loop holds, plus the far ends a test uses
     // to inject the peer's events and observe what the loop drives back to it.
     fn fake_peer() -> (
@@ -606,20 +727,12 @@ mod tests {
             FakeBackend,
             session,
             Vec::new(),
-            AgentIo {
-                ui_rx,
-                agent_tx,
-                peers: PeerSet::default(),
-                peer_register_rx: Some(reg_rx),
-            },
+            mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
         ));
 
         let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
         reg_tx
-            .send(PeerRegistration {
-                controller: peer_ctrl,
-                who: agent_who("child-1"),
-            })
+            .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
             .unwrap();
         peer_ev
             .send(ControllerEvent::AssistantText {
@@ -644,7 +757,7 @@ mod tests {
             "notice should carry the activity: {text}"
         );
 
-        ui_tx.send(UiEvent::Quit).await.unwrap();
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -664,20 +777,12 @@ mod tests {
             FakeBackend,
             session,
             Vec::new(),
-            AgentIo {
-                ui_rx,
-                agent_tx,
-                peers: PeerSet::default(),
-                peer_register_rx: Some(reg_rx),
-            },
+            mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
         ));
 
         let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
         reg_tx
-            .send(PeerRegistration {
-                controller: peer_ctrl,
-                who: agent_who("child-1"),
-            })
+            .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
             .unwrap();
         peer_ev
             .send(ControllerEvent::PermissionRequest {
@@ -695,7 +800,7 @@ mod tests {
             other => panic!("expected a PermissionResponse driven to the peer, got {other:?}"),
         }
 
-        ui_tx.send(UiEvent::Quit).await.unwrap();
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -712,16 +817,11 @@ mod tests {
             FakeBackend,
             session,
             Vec::new(),
-            AgentIo {
-                ui_rx,
-                agent_tx,
-                peers: PeerSet::default(),
-                peer_register_rx: None,
-            },
+            mk_io(ui_rx, agent_tx, PeerSet::default(), None),
         ));
 
         ui_tx
-            .send(UiEvent::UserMessage { text: "hi".into() })
+            .send((None, UiEvent::UserMessage { text: "hi".into() }))
             .await
             .unwrap();
 
@@ -738,7 +838,7 @@ mod tests {
         }
         assert!(saw_text, "expected the assistant reply for the driven turn");
 
-        ui_tx.send(UiEvent::Quit).await.unwrap();
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -758,6 +858,7 @@ mod tests {
             session,
             Vec::new(),
             Vec::new(),
+            crate::core::peer::PeerWiring::default(),
         );
 
         // The "child" attaches to the parent as an agent — this is the return edge.
@@ -811,5 +912,423 @@ mod tests {
             ),
             Some("[peer child-1] hello".to_string()),
         );
+    }
+
+    // A broker-stamped agent sender folds into the transcript *named*, so the model
+    // knows which peer spoke.
+    #[tokio::test]
+    async fn peer_message_is_attributed_in_the_transcript() {
+        let (session, dir) = mk_session();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            RecordingProvider { seen: seen.clone() },
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+        ));
+
+        ui_tx
+            .send((
+                Some(agent_who("child-1")),
+                UiEvent::UserMessage {
+                    text: "task done".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+
+        let transcript = seen.lock().unwrap().clone();
+        match &transcript[0].content[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "[message from peer child-1]\ntask done")
+            }
+            other => panic!("expected the attributed user turn, got {other:?}"),
+        }
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A human sender's message enters the transcript bare — exactly today's behavior.
+    #[tokio::test]
+    async fn human_message_stays_bare_in_the_transcript() {
+        let (session, dir) = mk_session();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            RecordingProvider { seen: seen.clone() },
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+        ));
+
+        ui_tx
+            .send((
+                Some(ClientIdentity::human("alice")),
+                UiEvent::UserMessage { text: "hi".into() },
+            ))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+
+        let transcript = seen.lock().unwrap().clone();
+        match &transcript[0].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hi"),
+            other => panic!("expected the bare user turn, got {other:?}"),
+        }
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The model calls MessagePeer → the named peer's ui_rx receives the message (the
+    // exact human input path on its side), and the ok tool_result lands in the caller's
+    // transcript. The MessagePeer schema is only offered because a peer is held.
+    #[tokio::test]
+    async fn message_peer_tool_drives_the_named_peer() {
+        let (session, dir) = mk_session();
+        let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                tool_use_response(
+                    "MessagePeer",
+                    serde_json::json!({"peer": "child-1", "message": "do X"}),
+                ),
+                end_turn_response("done"),
+            ]),
+            seen_messages: seen_messages.clone(),
+            seen_tools: seen_tools.clone(),
+        };
+
+        let mut peers = PeerSet::default();
+        let (peer_ctrl, _peer_ev, mut peer_ui) = fake_peer();
+        peers.register(PeerRegistration::new(peer_ctrl, agent_who("child-1")));
+
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            provider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, peers, None),
+        ));
+
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+
+        // The peer received the message on its human input path.
+        match peer_ui.recv().await {
+            Some(UiEvent::UserMessage { text }) => assert_eq!(text, "do X"),
+            other => panic!("peer expected the driven message, got {other:?}"),
+        }
+        // The schema was offered (a peer is held) and the ok result reached the model.
+        assert!(seen_tools.lock().unwrap().contains(&"MessagePeer".into()));
+        let transcript = seen_messages.lock().unwrap().clone();
+        assert!(
+            transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { content, is_error: false, .. }
+                    if content.contains("message sent to child-1")
+            ))),
+            "expected the ok tool_result in the transcript: {transcript:?}"
+        );
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Addressing a peer that doesn't exist returns an error tool_result carrying the
+    // current roster, so the model can self-correct on its next step.
+    #[tokio::test]
+    async fn message_peer_unknown_name_lists_roster() {
+        let (session, dir) = mk_session();
+        let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                tool_use_response(
+                    "MessagePeer",
+                    serde_json::json!({"peer": "nobody", "message": "hello"}),
+                ),
+                end_turn_response("ok"),
+            ]),
+            seen_messages: seen_messages.clone(),
+            seen_tools: seen_tools.clone(),
+        };
+
+        let mut peers = PeerSet::default();
+        let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+        peers.register(PeerRegistration::new(peer_ctrl, agent_who("child-1")));
+
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            provider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, peers, None),
+        ));
+
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+
+        let transcript = seen_messages.lock().unwrap().clone();
+        assert!(
+            transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { content, is_error: true, .. }
+                    if content.contains("no peer named 'nobody'") && content.contains("child-1")
+            ))),
+            "expected the roster-bearing error tool_result: {transcript:?}"
+        );
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A stub factory that hands out a pre-built synthetic peer, so the test controls
+    // both far ends. The slot proves whether the factory ran (denial must not call it).
+    fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> PeerFactory {
+        Box::new(move |task, _self_handle| {
+            let slot = slot.clone();
+            Box::pin(async move {
+                let controller = slot
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("factory called more than once");
+                let mut who = agent_who("child-test");
+                who.session_id = Some("sess-1".into());
+                who.task = Some(task);
+                Ok(PeerRegistration {
+                    controller,
+                    who,
+                    host: None,
+                })
+            })
+        })
+    }
+
+    // The model calls Spawn → the human gates it → on approval the factory runs, the
+    // child is registered (its later activity surfaces as a Notice), and the
+    // tool_result records name/id/task in the caller's transcript — the durable
+    // "who is child-X" record.
+    #[tokio::test]
+    async fn spawn_tool_gates_then_registers_the_child() {
+        let (session, dir) = mk_session();
+        let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                tool_use_response("Spawn", serde_json::json!({"task": "count files"})),
+                end_turn_response("spawned"),
+            ]),
+            seen_messages: seen_messages.clone(),
+            seen_tools: seen_tools.clone(),
+        };
+
+        let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(peer_ctrl)));
+
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            provider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            AgentIo {
+                ui_rx,
+                agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: None,
+                peer_factory: Some(stub_factory(slot)),
+                self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+            },
+        ));
+
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+
+        // Spawn gates: answer the permission round-trip, then run to TurnComplete.
+        loop {
+            match agent_rx.recv().await {
+                Some(AgentEvent::PermissionRequest {
+                    tool_name,
+                    summary,
+                    respond,
+                    ..
+                }) => {
+                    assert_eq!(tool_name, "Spawn");
+                    assert!(summary.contains("spawn a subagent"), "summary: {summary}");
+                    respond.send(true).unwrap();
+                }
+                Some(AgentEvent::TurnComplete) => break,
+                Some(_) => {}
+                None => panic!("loop ended early"),
+            }
+        }
+
+        // Both peer tools were offered (a factory exists), and the spawn record —
+        // name, session id, task — landed in the transcript.
+        let tools = seen_tools.lock().unwrap().clone();
+        assert!(tools.contains(&"Spawn".into()) && tools.contains(&"MessagePeer".into()));
+        let transcript = seen_messages.lock().unwrap().clone();
+        assert!(
+            transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { content, is_error: false, .. }
+                    if content.contains("spawned peer child-test (session sess-1)")
+                        && content.contains("count files")
+            ))),
+            "expected the spawn record in the transcript: {transcript:?}"
+        );
+
+        // The child is genuinely registered: its activity now drives the loop.
+        peer_ev
+            .send(ControllerEvent::AssistantText {
+                text: "child working".into(),
+            })
+            .unwrap();
+        loop {
+            match agent_rx.recv().await {
+                Some(AgentEvent::Notice { text }) if text.contains("child-test") => break,
+                Some(_) => {}
+                None => panic!("expected the registered child's Notice"),
+            }
+        }
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Denying the Spawn permission must not run the factory; the model sees the
+    // denial tool_result.
+    #[tokio::test]
+    async fn spawn_denial_does_not_run_the_factory() {
+        let (session, dir) = mk_session();
+        let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            responses: std::sync::Mutex::new(vec![
+                tool_use_response("Spawn", serde_json::json!({"task": "count files"})),
+                end_turn_response("ok"),
+            ]),
+            seen_messages: seen_messages.clone(),
+            seen_tools: seen_tools.clone(),
+        };
+
+        let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(peer_ctrl)));
+
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(16);
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            provider,
+            FakeBackend,
+            session,
+            Vec::new(),
+            AgentIo {
+                ui_rx,
+                agent_tx,
+                peers: PeerSet::default(),
+                peer_register_rx: None,
+                peer_factory: Some(stub_factory(slot.clone())),
+                self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+            },
+        ));
+
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+        loop {
+            match agent_rx.recv().await {
+                Some(AgentEvent::PermissionRequest { respond, .. }) => {
+                    respond.send(false).unwrap();
+                }
+                Some(AgentEvent::TurnComplete) => break,
+                Some(_) => {}
+                None => panic!("loop ended early"),
+            }
+        }
+
+        // A denial pauses for fresh guidance; supply it so the turn closes.
+        ui_tx
+            .send((
+                None,
+                UiEvent::UserMessage {
+                    text: "never mind".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "denial must not run the factory"
+        );
+        let transcript = seen_messages.lock().unwrap().clone();
+        assert!(
+            transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+                b,
+                ContentBlock::ToolResult { content, is_error: true, .. }
+                    if content.contains("denied")
+            ))),
+            "expected the denial tool_result: {transcript:?}"
+        );
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
