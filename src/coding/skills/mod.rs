@@ -61,7 +61,7 @@ impl SkillRegistry {
     /// Discover skills under the personal (`~/.nudge/skills/`) and project
     /// (`<cwd>/.nudge/skills/`) roots. A missing root is not an error. On a
     /// name collision, project wins over personal (closer to the work, matching
-    /// CLAUDE.md precedence). Invalid skills are skipped and logged.
+    /// AGENTS.md precedence). Invalid skills are skipped and logged.
     pub fn discover(cwd: &Path, home: Option<&Path>) -> Self {
         let mut reg = Self {
             skills: BTreeMap::new(),

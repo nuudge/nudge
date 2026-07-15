@@ -20,7 +20,7 @@ pub struct AgentConfig {
 
 // Everything the loop needs from the concrete agent (tools, prompt/context,
 // control handling). The coding agent implements this; the loop stays unaware
-// of tool implementations, MCP, CLAUDE.md, or any cwd-specific concern — that
+// of tool implementations, MCP, AGENTS.md, or any cwd-specific concern — that
 // is what keeps this module from depending on the layer above it.
 pub trait Backend {
     // Rebuilt each turn so volatile context (env, git, dir listing) stays fresh.

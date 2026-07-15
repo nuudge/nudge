@@ -1,17 +1,17 @@
 use std::path::Path;
 use std::process::Command;
 
-// Project instructions from CLAUDE.md files in cwd and its ancestors.
+// Project instructions from AGENTS.md files in cwd and its ancestors.
 // Outermost file first, so the file nearest cwd lands last and wins on
 // conflict — instructions later in the prompt take precedence, and the most
 // specific file should be the one that does. Returns None when no non-empty
-// CLAUDE.md exists, so the request omits the block instead of sending an
-// empty system entry. Framing mirrors Claude Code's claudeMd context shape.
-pub fn claude_md_block(cwd: &Path) -> Option<String> {
+// AGENTS.md exists, so the request omits the block instead of sending an
+// empty system entry.
+pub fn agents_md_block(cwd: &Path) -> Option<String> {
     let mut sections: Vec<String> = cwd
         .ancestors()
         .filter_map(|dir| {
-            let path = dir.join("CLAUDE.md");
+            let path = dir.join("AGENTS.md");
             let content = std::fs::read_to_string(&path).ok()?;
             if content.trim().is_empty() {
                 return None;

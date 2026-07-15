@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::coding::context::{
-    claude_md_block, collect_git_info, stable_env_block, volatile_env_block,
+    agents_md_block, collect_git_info, stable_env_block, volatile_env_block,
 };
 use crate::coding::file_state::FileState;
 use crate::coding::mcp::{LOAD_TOOL_NAME, McpRegistry};
@@ -21,7 +21,7 @@ use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 pub struct CodingBackend {
     system_prompt: String,
     stable_env: String,
-    claude_md: Option<String>,
+    agents_md: Option<String>,
     // The subagent contract (see `into_subagent`); None for a top-level agent.
     role_preamble: Option<String>,
     cwd: PathBuf,
@@ -36,11 +36,11 @@ impl CodingBackend {
     pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry) -> Self {
         Self {
             // Built once: the roster is derived from the compile-time tool set,
-            // and the env/CLAUDE.md are read at session start, so these stay
+            // and the env/AGENTS.md are read at session start, so these stay
             // byte-stable across the session and anchor the cached prefix.
             system_prompt: system_prompt_body(),
             stable_env: stable_env_block(&cwd),
-            claude_md: claude_md_block(&cwd),
+            agents_md: agents_md_block(&cwd),
             role_preamble: None,
             cwd,
             mcp,
@@ -51,12 +51,12 @@ impl CodingBackend {
 
     // Reconfigure this backend as a spawned subagent's: `role_preamble` (see
     // `prompt::subagent_role`) becomes a system block right after the prompt body,
-    // and CLAUDE.md is dropped — a subagent runs under its spawner's contract, and
+    // and AGENTS.md is dropped — a subagent runs under its spawner's contract, and
     // anything project-specific it needs belongs in the authored task. Role by
     // prompt, not by type: the loop and everything below stay role-free.
     pub fn into_subagent(mut self, role_preamble: String) -> Self {
         self.role_preamble = Some(role_preamble);
-        self.claude_md = None;
+        self.agents_md = None;
         self
     }
 }
@@ -67,7 +67,7 @@ impl Backend for CodingBackend {
         build_system_blocks(
             &self.system_prompt,
             &self.role_preamble,
-            &self.claude_md,
+            &self.agents_md,
             &self.stable_env,
             &volatile_env,
         )
@@ -95,7 +95,7 @@ impl Backend for CodingBackend {
             true
         } else if name == USE_SKILL_NAME {
             // Loading a skill only reads a local file the user installed into
-            // context — effectively read-only (like CLAUDE.md auto-loading and
+            // context — effectively read-only (like AGENTS.md auto-loading and
             // MCP readOnlyHint). Any script the skill names still gates at Bash.
             false
         } else if self.mcp.is_mcp_tool(name) {
@@ -179,14 +179,14 @@ async fn load_dormant(
     ))
 }
 
-// The `system` field: prompt body, then optional CLAUDE.md, then the stable
+// The `system` field: prompt body, then optional AGENTS.md, then the stable
 // and volatile env blocks. The cache breakpoints sit on the two env blocks —
-// see the breakpoint-budget note at the call site for why the body/claude_md
+// see the breakpoint-budget note at the call site for why the body/agents_md
 // blocks carry none.
 fn build_system_blocks(
     system_prompt: &str,
     role_preamble: &Option<String>,
-    claude_md: &Option<String>,
+    agents_md: &Option<String>,
     stable_env: &str,
     volatile_env: &str,
 ) -> Vec<SystemBlock> {
@@ -202,7 +202,7 @@ fn build_system_blocks(
             cache: false,
         });
     }
-    if let Some(cm) = claude_md {
+    if let Some(cm) = agents_md {
         system.push(SystemBlock {
             text: cm.clone(),
             cache: false,
@@ -266,11 +266,11 @@ pub async fn print_preamble<P: Provider>(
     let system_prompt = system_prompt_body();
     let stable_env = stable_env_block(&session.cwd);
     let volatile_env = volatile_env_block(&session.cwd);
-    let claude_md = claude_md_block(&session.cwd);
+    let agents_md = agents_md_block(&session.cwd);
     let system = build_system_blocks(
         &system_prompt,
         &None,
-        &claude_md,
+        &agents_md,
         &stable_env,
         &volatile_env,
     );
@@ -305,7 +305,7 @@ pub async fn print_preamble<P: Provider>(
         system: build_system_blocks(
             &system_prompt,
             &None,
-            &claude_md,
+            &agents_md,
             &stable_env,
             &volatile_env,
         ),
@@ -335,12 +335,12 @@ mod tests {
     use super::*;
 
     // `into_subagent` installs the role block directly after the prompt body and drops
-    // CLAUDE.md — the two halves of the subagent-contract decision.
+    // AGENTS.md — the two halves of the subagent-contract decision.
     #[tokio::test]
-    async fn into_subagent_swaps_claude_md_for_the_role_block() {
+    async fn into_subagent_swaps_agents_md_for_the_role_block() {
         let dir = std::env::temp_dir().join(format!("nudge-backend-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("CLAUDE.md"), "PROJECT CONVENTIONS").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "PROJECT CONVENTIONS").unwrap();
 
         let plain = CodingBackend::new(
             dir.clone(),
@@ -352,7 +352,7 @@ mod tests {
                 .system_blocks()
                 .iter()
                 .any(|b| b.text.contains("PROJECT CONVENTIONS")),
-            "a top-level backend loads CLAUDE.md"
+            "a top-level backend loads AGENTS.md"
         );
 
         let sub = CodingBackend::new(
@@ -370,7 +370,7 @@ mod tests {
             !blocks
                 .iter()
                 .any(|b| b.text.contains("PROJECT CONVENTIONS")),
-            "a subagent backend drops CLAUDE.md"
+            "a subagent backend drops AGENTS.md"
         );
 
         std::fs::remove_dir_all(&dir).ok();
