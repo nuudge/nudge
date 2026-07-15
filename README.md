@@ -225,7 +225,20 @@ While the child works:
 
 The economics are the point: the child burns its own context reading files and running commands, and the parent's transcript records only the spawn, compact supervision verdicts, and the final report — you get parallel work without paying twice for the same context.
 
-Under the hood there is no special subagent machinery: a subagent is *just another client* of the session protocol. It attaches to the parent exactly the way your phone does — same handshake, same identity, same event stream — and the parent attaches back. Parent/child is a property of who spawned whom, not a type in the code; the same edges will carry agents on different machines over the relay.
+### The design: an agent is just another client
+
+There is no special subagent machinery under the hood — no spawn runtime, no side-band message bus, no privileged parent object. The whole feature rests on one bet:
+
+> Whatever is on the other end of a connection — a human at a terminal, a phone over the relay, or another agent — should be **indistinguishable** to the agent loop. If you cannot tell which it is, and it doesn't change how anything behaves, the design is right.
+
+Everything above falls out of four consequences of that bet:
+
+- **One mechanism, every party.** Reaching an agent is always the same operation: attach to its session, announce who you are, receive the event stream, send input back. A subagent attaches to its parent *exactly* the way your phone does — same handshake, same identity, same protocol — which is why humans and agents can share one session with every message attributed to its sender.
+- **Connections compose; channels don't multiply.** Watching, driving, supervising, conversing, spawning — each is a composition of the two primitive half-channels every connection already has (*observe* the event stream, *drive* the input). Watch-mode isn't a mode, it's a second attach. A subagent's message to its parent isn't a new pathway — it lands on the same input as your keyboard.
+- **Bidirectional means two connections, not a special duplex.** Spawning a child mutually attaches: the parent holds an ordinary connection to the child (watch it, steer it), and the child holds one back (report, ask questions). Two one-way edges — there is no "parent/child channel" type anywhere in the code.
+- **Roles are emergent, not typed.** Parent and child run the same loop, the same tools, the same code paths. What makes the child a *subagent* is only the direction of creation (who spawned whom — which is what grants supervision and dismissal rights) and the role prompt it runs under. Swap the prompt and the same machinery is a peer, a reviewer, a pair-programmer.
+
+The payoff for the discipline: capabilities compose for free. Because a peer is just a client, agents on *different machines* need no new design — the same attach over the encrypted relay (the thing your phone already uses) will carry agent-to-agent edges across the network. That one small protocol is the entire multi-agent story.
 
 ## Development
 
