@@ -10,7 +10,7 @@ No framework, no excessive abstraction, no 50-layer call stack to trace at 2am �
 
 nudge is three parts over one session protocol — three different ways for it to reach you. The terminal agent is the whole product on its own; the rest just removes your remaining excuses.
 
-- **Terminal agent** — the core Rust binary: the agentic loop, the built-in tool surface, an MCP client, and a [ratatui](https://ratatui.rs) TUI.
+- **Terminal agent** — the core Rust binary: the agentic loop, the built-in tool surface, an MCP client, **subagent orchestration** (spawn, supervise, converse, dismiss), and a [ratatui](https://ratatui.rs) TUI.
 - **Remote control** — a session can run headless behind a daemon and be reached from elsewhere over an **end-to-end-encrypted, ciphertext-blind relay**; pairing is a single QR scan.
 - **Mobile app (Android)** — a native Kotlin + Jetpack Compose client that turns your phone into a live front-end for a running session (below).
 
@@ -196,6 +196,7 @@ Type these as a single-line message starting with `/` (multi-line input that hap
 - **Tool surface** — `Bash`, `Read`, `Edit` (modify + append modes), `CreateNew`, `Grep` (structured ripgrep), `Glob`, `TodoWrite`. Tool names and field shapes are wire-compatible with Claude Code where they overlap, so your muscle memory transfers — only the bill changes.
 - **TUI** (ratatui) — collapsed-by-default action display: each tool call is one compact group with a live status bullet (spinner → ok/error) and a one-line result row; `Ctrl-O` expands everything, including the model's thinking. Title bar shows session id, cwd, git branch, model, and platform.
 - **Permission gating** — shell-executing and file-mutating tools prompt before running; read-only tools auto-allow. For `Bash`, the model must state an *intent* ("count lines in all Rust files") shown as the action label, while the permission prompt always shows the raw command — you approve what runs, not the label.
+- **Subagents** — ask the agent to spawn a subagent and it delegates: the child is a full peer agent with its own session, working the task in parallel while the parent (and you) watch its activity stream. The parent supervises the child's gated tool calls — approving routine ones from context, denying-and-redirecting wrong turns, and **escalating anything it can't judge to you** — and the two converse both ways by messaging. The child reports its result back when done; the parent buys the conclusion without paying for the child's context. See [Subagents](#subagents).
 - **MCP client** — connect to external [Model Context Protocol](https://modelcontextprotocol.io) servers declared in a project-local `.mcp.json`. Their tools are discovered at startup and merged into the model's tool list (namespaced `server__tool`), indistinguishable from built-ins. Permission follows each tool's `readOnlyHint` annotation — read-only tools auto-allow, the rest prompt. Both local **stdio** subprocesses and remote **Streamable HTTP** servers are supported, the latter with static-token, OAuth (dynamic registration), or OAuth (pre-registered client) auth. Servers load in three layers — always-on foundational tools, always-on user servers from `.mcp.json`, and a built-in **dormant** catalog the user loads/unloads mid-session (`/mcp load <name>`) to keep the default context lean.
 - **Skills** — package reusable expertise as a folder: a `SKILL.md` (YAML frontmatter with `name` + `description`, then markdown instructions) plus optional reference files and scripts. Drop skills under `~/.nudge/skills/<name>/` (personal) or `.nudge/skills/<name>/` (project, which wins on a name collision); they're discovered at startup. Only each skill's name and description sit in context until the model decides one fits the task and loads its full instructions on demand (via a `use_skill` tool) — so you can install many skills with negligible context cost. The instructions can point at bundled files the model reads with `Read` and scripts it runs with `Bash`.
 - **Sessions** — every conversation is appended to a JSONL log under `~/.nudge/projects/<flattened-cwd>/<uuid>.jsonl`; `--resume <id>` restores it, with strict truncation of any incomplete trailing turn.
@@ -207,11 +208,37 @@ Type these as a single-line message starting with `/` (multi-line input that hap
 
 A few capabilities common to mature coding agents are deliberately absent today, called out here to set expectations. All are on the roadmap and under active development:
 
-- **Sub-agents** — spawning child agents to parallelize or isolate sub-tasks; the loop runs a single agent for now.
 - **Web access** — no built-in web fetch or search tool, so the agent can't browse the internet on its own (you can wire one up via an MCP server in the meantime).
 - **Image input** — input is text-only; pasting screenshots, diagrams, or other images isn't supported yet.
 - **Automatic context compaction** — there's prompt caching but no auto-summarization when the context window fills. A long task instead stops gracefully at the iteration budget and hands back to you, rather than compacting history to keep going.
 
+## Subagents
+
+Ask for a subagent in plain language — *"spawn a subagent to analyze the largest files in this repo"* — and the agent calls its `Spawn` tool (gated: you approve every spawn, since a subagent spends tokens autonomously). The child it creates is not a stripped-down task runner; it is **a full nudge agent**: same tools, its own conversation and session log (it shows up in `nudge --list` and can be `--resume`d later), running in the same directory under a role prompt that tells it who spawned it and that its one obligation is to deliver its result back.
+
+While the child works:
+
+- **You watch** — its activity streams into your TUI as `[peer child-…]` notices.
+- **The parent supervises** — the child's gated tool calls (shell, file writes) check in with the parent, which decides each one *with its full conversation as context*: routine calls are approved, wrong turns are **denied with a corrective instruction** the child picks up as its next input, and anything the parent can't judge — destructive, irreversible, off-task — is **escalated to your permission prompt**, named (`peer child-… — rm -rf …`), exactly like the parent's own gated calls. The parent cannot approve a spawn's way around you: escalations and spawns always terminate at a human.
+- **They converse** — either side can message the other (`MessagePeer`); a message arrives as the peer's next instruction, so you can have the parent redirect the child mid-task, or the child ask its parent a clarifying question.
+- **It reports and retires** — the child messages its result back when done (or when blocked); the parent can then keep it around for follow-ups or dismiss it (`DismissPeer`, also gated). Dismissal ends the child's process; its session log persists.
+
+The economics are the point: the child burns its own context reading files and running commands, and the parent's transcript records only the spawn, compact supervision verdicts, and the final report — you get parallel work without paying twice for the same context.
+
+### The design: an agent is just another client
+
+There is no special subagent machinery under the hood — no spawn runtime, no side-band message bus, no privileged parent object. The whole feature rests on one bet:
+
+> Whatever is on the other end of a connection — a human at a terminal, a phone over the relay, or another agent — should be **indistinguishable** to the agent loop. If you cannot tell which it is, and it doesn't change how anything behaves, the design is right.
+
+Everything above falls out of four consequences of that bet:
+
+- **One mechanism, every party.** Reaching an agent is always the same operation: attach to its session, announce who you are, receive the event stream, send input back. A subagent attaches to its parent *exactly* the way your phone does — same handshake, same identity, same protocol — which is why humans and agents can share one session with every message attributed to its sender.
+- **Connections compose; channels don't multiply.** Watching, driving, supervising, conversing, spawning — each is a composition of the two primitive half-channels every connection already has (*observe* the event stream, *drive* the input). Watch-mode isn't a mode, it's a second attach. A subagent's message to its parent isn't a new pathway — it lands on the same input as your keyboard.
+- **Bidirectional means two connections, not a special duplex.** Spawning a child mutually attaches: the parent holds an ordinary connection to the child (watch it, steer it), and the child holds one back (report, ask questions). Two one-way edges — there is no "parent/child channel" type anywhere in the code.
+- **Roles are emergent, not typed.** Parent and child run the same loop, the same tools, the same code paths. What makes the child a *subagent* is only the direction of creation (who spawned whom — which is what grants supervision and dismissal rights) and the role prompt it runs under. Swap the prompt and the same machinery is a peer, a reviewer, a pair-programmer.
+
+The payoff for the discipline: capabilities compose for free. Because a peer is just a client, agents on *different machines* need no new design — the same attach over the encrypted relay (the thing your phone already uses) will carry agent-to-agent edges across the network. That one small protocol is the entire multi-agent story.
 
 ## Development
 
@@ -314,15 +341,15 @@ Servers are launched/connected at startup; their tools appear as `server__tool`.
 
 ## How it works
 
-Three long-lived tokio tasks connected by mpsc channels: the **agent task** runs the loop and emits typed events (`AssistantText`, `ToolUseStart`, `ToolResult`, `PermissionRequest`, …); a **broker task** sits between the loop and the front-end — it buffers the event stream, admits one front-end at a time, and keeps the loop alive while front-ends attach and detach; the **front-end task** (the TUI) renders events and sends user messages back. Because the loop talks only to the broker, the session outlives any one front-end — you can detach and reattach, locally or from another process over a socket — and the agent never touches stdin/stdout directly, so the UI is swappable.
+Three long-lived tokio tasks connected by mpsc channels: the **agent task** runs the loop and emits typed events (`AssistantText`, `ToolUseStart`, `ToolResult`, `PermissionRequest`, …); a **broker task** sits between the loop and the front-ends — it buffers the event stream, fans it out to **every attached client** (your terminal, your phone, a peer agent — each announces an identity at attach, and the shared transcript shows who said what), and keeps the loop alive while clients come and go; the **front-end task** (the TUI) renders events and sends user messages back. Because the loop talks only to the broker, the session outlives any one front-end — you can detach and reattach, locally or from another process over a socket — and the agent never touches stdin/stdout directly, so the UI is swappable. The same connection works in reverse: the loop can itself attach to *other agents'* brokers, which is all a subagent is.
 
 The code is layered into five modules with a downward dependency direction — `coding → core → llm`, plus `transport → core` and `tui` on top — so each layer can be understood (and swapped) on its own:
 
 | Module | Role |
 |---|---|
-| `src/main.rs` | CLI parsing, session create/resume, run-mode wiring (in-process / daemon / connect) |
+| `src/main.rs`, `src/cli.rs`, `src/run/`, `src/spawn.rs` | the composition root: CLI parsing, session create/resume, run-mode wiring (in-process / daemon / connect), and the subagent factory |
 | `src/llm/` | provider-agnostic LLM API: a neutral message model + `Provider` trait, with `AnthropicProvider` owning all Anthropic wire shaping (cache-breakpoint placement, the floating breakpoint, the HTTP calls) |
-| `src/core/` | the generic harness: the loop (build request → call provider → dispatch tools → repeat) + a `Backend` trait, the agent↔UI event contract, the broker that decouples the loop from the front-end, and the session mechanism (JSONL persistence, resume with strict truncation) — knows nothing about concrete tools or prompts |
+| `src/core/` | the generic harness: the loop (build request → call provider → dispatch tools → repeat) + a `Backend` trait, the agent↔UI event contract, the multi-client broker that decouples the loop from front-ends, the peer system (holding/steering/messaging other agents), and the session mechanism (JSONL persistence, resume with strict truncation) — knows nothing about concrete tools or prompts |
 | `src/coding/` | the coding agent: implements `Backend` — system prompt, project/env context, the tool registry + dispatch + permission classification, the MCP client, file-state tracking, and the cwd-keyed session path policy |
 | `src/transport/` | lets a front-end drive a session from another process: a small framed wire protocol over a local socket, with daemon (host) and client ends behind a `SessionHandle` the TUI is generic over — so the same TUI code runs in-process or attached to a remote host |
 | `src/tui/` | ratatui app: semantic log entries, collapsed/expanded rendering, permission modal, session replay |
@@ -336,7 +363,8 @@ The `core` loop is generic over both the `Provider` and the `Backend`, so a diff
 - **Crash-safe conversation state.** On API failure mid-turn, the in-memory message vec rolls back to the last completed turn so the conversation always stays on a valid alternating-role boundary. The JSONL log is independent and append-only — it's the audit trail, not the API payload.
 - **Floating cache breakpoint.** Model output never changes once emitted, so each request moves a `cache_control` marker to the latest assistant message; the entire stable history is then a cache read (~0.1× input price) and only the newest messages pay full price.
 - **TUI stores meaning, not pixels.** The log holds semantic entries (`ToolCall { id, name, summary, result }`), re-rendered per frame — that's what makes expand/collapse instant and lets session replay render identically to live. All foreign text (tool output, summaries, model text) is sanitized before it reaches a terminal cell, because cell-grid renderers don't interpret control characters.
-- **A broker decouples the loop from the front-end.** The loop's event/command channels terminate at a long-lived broker rather than the UI, so attaching or detaching a front-end never ends the session — only an explicit quit does. The broker buffers the event stream (a reattaching front-end replays the whole transcript) and admits one controller at a time. The TUI also renders user turns and allow/deny lines *from that stream*, not optimistically on the keypress, so one code path serves both live input and replay — and `/background` plus the `--daemon`/`--connect` split fall out of it without the loop knowing which front-end, if any, is watching.
+- **A broker decouples the loop from the front-end.** The loop's event/command channels terminate at a long-lived broker rather than the UI, so attaching or detaching a front-end never ends the session — only an explicit quit does. The broker buffers the event stream (a reattaching front-end replays the whole transcript) and fans it out to every attached client; each attach announces an identity, so a shared session attributes every message to its sender. The TUI also renders user turns and allow/deny lines *from that stream*, not optimistically on the keypress, so one code path serves both live input and replay — and `/background` plus the `--daemon`/`--connect` split fall out of it without the loop knowing which front-end, if any, is watching.
+- **A subagent is just another client.** There is no bespoke sub-agent runtime: spawning a child means standing up a second session and mutually attaching — the parent attaches to the child the same way your phone attaches to the parent, and the child attaches back. Roles (who supervises whom, who may dismiss whom) follow from who spawned whom, not from a type in the code, so the same mechanism extends unchanged to peers on other machines. Supervision is context-frugal by design: the parent decides a child's permission check-ins with one inference over its own (cached) transcript, and records only a one-line verdict — a subagent's whole value is that you buy its conclusion without buying its context.
 
 ## Status
 
