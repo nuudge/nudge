@@ -1,6 +1,7 @@
 # Architecture
 
-`nudge` is a Claude-Code-style coding agent. It's organized as strict
+`nudge` is a from-scratch coding agent in Rust — the loop, the tool-use protocol,
+and the wire protocol all hand-rolled, no agent SDK underneath. It's organized as strict
 dependency layers: every arrow points **down**, and no lower layer ever names a
 higher one. The agent loop (`core`) is UI- and tool-agnostic; the concrete
 coding behavior (`coding`) and the wire protocol (`transport`) are both built on
@@ -166,3 +167,73 @@ tools. It owns:
   and directory context each turn.
 - **`file_state`** - tracks read files to enforce the read-before-edit
   invariant.
+
+## Module map
+
+Three long-lived tokio tasks connected by mpsc channels: the **agent task** runs the loop
+and emits typed events (`AssistantText`, `ToolUseStart`, `ToolResult`, `PermissionRequest`,
+…); a **broker task** sits between the loop and the front-ends — it buffers the event
+stream, fans it out to **every attached client** (your terminal, your phone, a peer agent —
+each announces an identity at attach, and the shared transcript shows who said what), and
+keeps the loop alive while clients come and go; the **front-end task** (the TUI) renders
+events and sends user messages back. Because the loop talks only to the broker, the session
+outlives any one front-end — you can detach and reattach, locally or from another process
+over a socket — and the agent never touches stdin/stdout directly, so the UI is swappable.
+The same connection works in reverse: the loop can itself attach to *other agents'* brokers,
+which is all a subagent is.
+
+The code is layered into five modules with a downward dependency direction — `coding → core
+→ llm`, plus `transport → core` and `tui` on top — so each layer can be understood (and
+swapped) on its own:
+
+| Module | Role |
+|---|---|
+| `src/main.rs`, `src/cli.rs`, `src/run/`, `src/spawn.rs` | the composition root: CLI parsing, session create/resume, run-mode wiring (in-process / daemon / connect), and the subagent factory |
+| `src/llm/` | provider-agnostic LLM API: a neutral message model + `Provider` trait, with `AnthropicProvider` owning all Anthropic wire shaping (cache-breakpoint placement, the floating breakpoint, the HTTP calls) |
+| `src/core/` | the generic harness: the loop (build request → call provider → dispatch tools → repeat) + a `Backend` trait, the agent↔UI event contract, the multi-client broker that decouples the loop from front-ends, the peer system (holding/steering/messaging other agents), and the session mechanism (JSONL persistence, resume with strict truncation) — knows nothing about concrete tools or prompts |
+| `src/coding/` | the coding agent: implements `Backend` — system prompt, project/env context, the tool registry + dispatch + permission classification, the MCP client, file-state tracking, and the cwd-keyed session path policy |
+| `src/transport/` | lets a front-end drive a session from another process: a small framed wire protocol over a local socket, with daemon (host) and client ends behind a `SessionHandle` the TUI is generic over — so the same TUI code runs in-process or attached to a remote host |
+| `src/tui/` | ratatui app: semantic log entries, collapsed/expanded rendering, permission modal, session replay |
+
+The `core` loop is generic over both the `Provider` and the `Backend`, so a different model
+backend or a non-coding agent could reuse it untouched.
+
+## Selected design decisions
+
+- **Permission prompts await a typed reply.** The `PermissionRequest` event embeds a
+  `oneshot::Sender<bool>`; the agent literally `.await`s your decision. A denial cancels the
+  rest of the tool batch and pauses for your next instruction, which rides back in the same
+  turn — denial means "I want something different", not "retry".
+- **`Edit`/`CreateNew` instead of a `Write` tool.** Tools partition by file-state
+  precondition: `Edit` requires an existing file, `CreateNew` requires a non-existing path.
+  There is deliberately no create-or-overwrite primitive — wholesale-overwriting a file the
+  model hasn't read would let it silently destroy content.
+- **Crash-safe conversation state.** On API failure mid-turn, the in-memory message vec
+  rolls back to the last completed turn so the conversation always stays on a valid
+  alternating-role boundary. The JSONL log is independent and append-only — it's the audit
+  trail, not the API payload.
+- **Floating cache breakpoint.** Model output never changes once emitted, so each request
+  moves a `cache_control` marker to the latest assistant message; the entire stable history
+  is then a cache read (~0.1× input price) and only the newest messages pay full price.
+- **TUI stores meaning, not pixels.** The log holds semantic entries (`ToolCall { id, name,
+  summary, result }`), re-rendered per frame — that's what makes expand/collapse instant and
+  lets session replay render identically to live. All foreign text (tool output, summaries,
+  model text) is sanitized before it reaches a terminal cell, because cell-grid renderers
+  don't interpret control characters.
+- **A broker decouples the loop from the front-end.** The loop's event/command channels
+  terminate at a long-lived broker rather than the UI, so attaching or detaching a front-end
+  never ends the session — only an explicit quit does. The broker buffers the event stream
+  (a reattaching front-end replays the whole transcript) and fans it out to every attached
+  client; each attach announces an identity, so a shared session attributes every message to
+  its sender. The TUI also renders user turns and allow/deny lines *from that stream*, not
+  optimistically on the keypress, so one code path serves both live input and replay — and
+  `/background` plus the `--daemon`/`--connect` split fall out of it without the loop knowing
+  which front-end, if any, is watching.
+- **A subagent is just another client.** There is no bespoke sub-agent runtime: spawning a
+  child means standing up a second session and mutually attaching — the parent attaches to
+  the child the same way your phone attaches to the parent, and the child attaches back.
+  Roles (who supervises whom, who may dismiss whom) follow from who spawned whom, not from a
+  type in the code, so the same mechanism extends unchanged to peers on other machines.
+  Supervision is context-frugal by design: the parent decides a child's permission check-ins
+  with one inference over its own (cached) transcript, and records only a one-line verdict —
+  a subagent's whole value is that you buy its conclusion without buying its context.
