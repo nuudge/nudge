@@ -25,6 +25,12 @@ machine you own never sees your plaintext.
 Shell-executing and file-mutating tools prompt before running; read-only tools
 (`Read`/`Grep`/`Glob`/`TodoWrite`) auto-allow.
 
+<p align="center">
+  <img src="assets/tui_screen_shot_tool_approval.png" alt="the nudge TUI showing a tool approval prompt: the model's stated intent as the action label, the raw command it wants to run, and allow/deny options" width="800">
+  <br>
+  <em>A permission prompt: the model's stated intent as the label, the raw command it will run, and your allow/deny.</em>
+</p>
+
 - **`Bash` declares its intent.** Before running a command the model must state an *intent*
   ("count lines in all Rust files"), shown as the action label — while the permission prompt
   always shows the raw command. You approve what runs, not the label.

@@ -15,9 +15,10 @@ and follows you home.
   <em>A live session hands off to a phone: scan the QR, approve an edit from your pocket, reattach on the laptop.</em>
 </p>
 
-Under the hood that's one small idea taken seriously: **an agent is just another client.**
-Humans and agents reach a session through the exact same handshake and wire — which is why a
-subagent is just a client too, and the entire multi-agent story is one tiny protocol.
+Under the hood that's one simple idea: **agent communications are symmetric.** You're just a
+client, your phone is just a client, and a subagent is just a client too. Every client
+reaches a session through the exact same handshake and wire — so the entire multi-agent
+story, and multi-attach co-op, is one tiny protocol.
 
 Written in Rust from scratch — no agent SDK, no framework, no abstraction tax, just the raw
 LLM API over HTTP. Every moving part is out in the open: the loop, the tool-use protocol,
@@ -25,7 +26,9 @@ prompt-cache economics, session persistence, permission gating. No 50-layer call
 trace at 2am; just readable code, easy to see when and where it decides to `rm -rf` your
 weekend.
 
-<!-- screenshot: TUI mid-task -->
+<p align="center">
+  <img src="docs/assets/tui_screenshot_basic.png" alt="the nudge TUI overview: the header shows model, git branch, cwd, and session id; a per-turn line shows token usage (input, output, cache read/write); tool calls render as collapsed action groups" width="800">
+</p>
 
 ## What makes nudge different
 
