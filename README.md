@@ -26,11 +26,22 @@ prompt-cache economics, session persistence, permission gating. No 50-layer call
 trace at 2am; just readable code, easy to see when and where it decides to `rm -rf` your
 weekend.
 
-<p align="center">
-  <img src="docs/assets/tui_screenshot_basic.png" alt="the nudge TUI overview: the header shows model, git branch, cwd, and session id; a per-turn line shows token usage (input, output, cache read/write); tool calls render as collapsed action groups" width="800">
-  <br>
-  <em>The nudge TUI: model, branch, cwd, and session id in the header; per-turn token usage; collapsed tool-call groups.</em>
-</p>
+<table align="center">
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <img src="docs/assets/tui_screenshot_basic.png" alt="the nudge TUI overview: the header shows model, git branch, cwd, and session id; a per-turn line shows token usage (input, output, cache read/write); tool calls render as collapsed action groups">
+      <br>
+      <em>On your laptop — the TUI: model, branch, cwd, and session id in the header; per-turn token usage; collapsed tool-call groups.</em>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <img src="docs/assets/phone_basic.png" alt="the nudge Android app: waiting to attach before pairing, then attached and streaming the same live conversation as the terminal">
+      <br>
+      <em>On your phone — the same live session, streamed and driveable after a QR scan.</em>
+    </td>
+  </tr>
+</table>
+
+<p align="center"><em>One session, two clients — your laptop and your phone see the same stream, and either can drive.</em></p>
 
 ## What makes nudge different
 

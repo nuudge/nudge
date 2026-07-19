@@ -5,7 +5,11 @@ becomes a live controller for the running session — the office is now wherever
 it never closes. It's a native Kotlin + Jetpack Compose client that turns your phone into a
 live front-end for a session running on your machine.
 
-<!-- screenshot: the Android app showing a streamed session + a permission prompt -->
+<p align="center">
+  <img src="assets/phone_basic.png" alt="the nudge Android app in two states: waiting to attach before pairing, and attached — streaming the same live conversation as the terminal" width="800">
+  <br>
+  <em>The Android app before and after pairing: waiting to attach, then streaming the same live session as the terminal.</em>
+</p>
 
 ## What it does
 

@@ -5,7 +5,11 @@ detach it, reattach from another terminal, hand it off to your phone, or have se
 clients drive it at once — all over an end-to-end-encrypted link that only ever sees
 ciphertext.
 
-<!-- screenshot: the /background pair screen showing a QR code -->
+<p align="center">
+  <img src="assets/tui_handoff.png" alt="the nudge TUI pair screen after /background: a QR code encoding the relay URL, rendezvous id, and end-to-end key, plus the pairing code to scan or paste" width="800">
+  <br>
+  <em>After <code>/background</code>: the pair screen shows a QR (and pairing code) to hand the live session to a phone (or another TUI of your teammate).</em>
+</p>
 
 ## Detaching a session
 
