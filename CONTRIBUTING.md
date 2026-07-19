@@ -38,7 +38,7 @@ since Clippy's lints evolve between releases. The lint job runs Clippy with
 Contributing to the Android client (`android/`) additionally needs the
 **Android SDK** and a **JDK 21** (minimum device API is 26 / Android 8.0). The
 simplest path is to open `android/` in Android Studio. See the
-[README](README.md#the-android-app-optional) for the command-line build.
+[mobile app docs](docs/mobile-app.md#build-from-source) for the command-line build.
 
 ### Relay / deployment
 
@@ -54,8 +54,9 @@ cargo run                # run the agent from the current directory
 cargo build -p relay     # build just the relay
 ```
 
-The agent needs an `ANTHROPIC_API_KEY`; see the
-[README quick start](README.md#quick-start) for how to provide it. `.env` and
+The agent needs an `ANTHROPIC_API_KEY`; see
+[Getting started](docs/getting-started.md#configure-your-api-key) for how to provide it.
+`.env` and
 `.mcp.json` are gitignored — never commit secrets.
 
 ## Checks before you push
@@ -98,9 +99,9 @@ approach before investing the work.
 
 ## Where things live
 
-The codebase is layered — `coding → core → llm`, plus `transport` and `tui`. The
-[How it works](README.md#how-it-works) section of the README has a module map
-that's the fastest way to find where a change belongs.
+The codebase is layered — `coding → core → llm`, plus `transport` and `tui`.
+[ARCHITECTURE.md](ARCHITECTURE.md#module-map) has a module map that's the fastest way to
+find where a change belongs.
 
 ## Reporting bugs and security issues
 
