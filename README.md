@@ -71,7 +71,7 @@ Requires Rust (edition 2024, via [rustup](https://rustup.rs)) and an Anthropic A
 
 ```bash
 git clone https://github.com/nuudge/nudge.git && cd nudge
-echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored
+mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
 cargo run
 ```
 

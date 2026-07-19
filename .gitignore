@@ -3,3 +3,5 @@
 *.log
 # Per-project MCP config — may carry tokens / loopback secrets.
 .mcp.json
+# macOS finder metadata
+.DS_Store
