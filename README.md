@@ -28,6 +28,8 @@ weekend.
 
 <p align="center">
   <img src="docs/assets/tui_screenshot_basic.png" alt="the nudge TUI overview: the header shows model, git branch, cwd, and session id; a per-turn line shows token usage (input, output, cache read/write); tool calls render as collapsed action groups" width="800">
+  <br>
+  <em>The nudge TUI: model, branch, cwd, and session id in the header; per-turn token usage; collapsed tool-call groups.</em>
 </p>
 
 ## What makes nudge different
