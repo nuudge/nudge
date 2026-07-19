@@ -1,7 +1,8 @@
-# An agent is just another client
+# Symmetric agent communications
 
-The design philosophy behind nudge's remote control, multi-client co-op, and subagents.
-Where the [Subagents](subagents.md) doc covers *what the feature does* and
+The design philosophy behind nudge's remote control, multi-client co-op, and subagents:
+a human, a phone, and an agent all reach a session the same way. Where the
+[Subagents](subagents.md) doc covers *what the feature does* and
 [Architecture](../ARCHITECTURE.md) covers *how the code is laid out*, this doc explains the
 single idea all of it falls out of — and why the same small protocol that lets you drive an
 agent from your phone is also the entire multi-agent story.
