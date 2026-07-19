@@ -9,7 +9,11 @@ redirect it from the couch. Your laptop, your phone, and your teammate can all a
 clears everywhere. It's co-op mode for a coding agent — one that doesn't sleep, doesn't quit,
 and follows you home.
 
-<!-- demo video: laptop task → scan QR → approve an edit from the phone → it clears on the laptop -->
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/17d6523d-d66f-4ec2-b3eb-6075815539a2" controls width="800"></video>
+  <br>
+  <em>A live session hands off to a phone: scan the QR, approve an edit from your pocket, reattach on the laptop.</em>
+</p>
 
 Under the hood that's one small idea taken seriously: **an agent is just another client.**
 Humans and agents reach a session through the exact same handshake and wire — which is why a
