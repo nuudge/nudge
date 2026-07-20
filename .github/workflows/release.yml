@@ -58,10 +58,54 @@ jobs:
           path: dist/nudge-${{ matrix.target }}
           if-no-files-found: error
 
+  # The Android client ships as a signed APK for manual download (pre-Play).
+  # versionName/versionCode are derived from the tag so every release is distinctly
+  # numbered, and the release keystore is rebuilt from repo secrets — the .jks and
+  # keystore.properties are gitignored and never reach CI any other way.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+      - name: Version from tag
+        run: |
+          name="${GITHUB_REF_NAME#v}"
+          IFS=. read -r major minor patch <<< "$name"
+          echo "VERSION_NAME=$name" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$(( ${major:-0} * 1000000 + ${minor:-0} * 1000 + ${patch:-0} ))" >> "$GITHUB_ENV"
+      - name: Materialize signing config
+        working-directory: android
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > nudge-release.jks
+          cat > keystore.properties <<EOF
+          storeFile=nudge-release.jks
+          storePassword=$STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          EOF
+      - name: Build signed release APK
+        working-directory: android
+        run: ./gradlew :app:assembleRelease
+      - run: mkdir -p dist && cp android/app/build/outputs/apk/release/app-release.apk "dist/nudge-${VERSION_NAME}.apk"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: apk
+          path: dist/nudge-*.apk
+          if-no-files-found: error
+
   # Collect every built binary, checksum them uniformly on one Linux host
   # (macOS lacks `sha256sum`), and attach the lot to the tag's GitHub Release.
   release:
-    needs: [relay, agent]
+    needs: [relay, agent, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
