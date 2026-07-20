@@ -24,8 +24,10 @@ android {
         applicationId = "io.gitlab.hongtao1207.nudge"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1"
+        // CI injects VERSION_CODE/VERSION_NAME derived from the release tag; the
+        // fallbacks keep local and fresh-checkout builds working with no setup.
+        versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.1"
     }
 
     buildFeatures {
