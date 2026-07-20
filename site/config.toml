@@ -4,7 +4,7 @@
 # pages that's https://<user>.github.io/<repo> (note the /<repo> path prefix). Once you
 # point a custom domain at it, change this to the domain root (e.g. https://nudge.dev)
 # so image and link paths resolve without the subpath.
-base_url = "https://nuudge.github.io/nudge"
+base_url = "https://blog.nuudge.workers.dev"
 title = "nudge build log"
 description = "Notes from building a coding agent from scratch in Rust — phone control, multi-client co-op, and an agent that's just another client."
 default_language = "en"
