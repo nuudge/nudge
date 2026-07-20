@@ -95,11 +95,11 @@ jobs:
       - name: Build signed release APK
         working-directory: android
         run: ./gradlew :app:assembleRelease
-      - run: mkdir -p dist && cp android/app/build/outputs/apk/release/app-release.apk "dist/nudge-${VERSION_NAME}.apk"
+      - run: mkdir -p dist && cp android/app/build/outputs/apk/release/app-release.apk dist/nudge.apk
       - uses: actions/upload-artifact@v7
         with:
           name: apk
-          path: dist/nudge-*.apk
+          path: dist/nudge.apk
           if-no-files-found: error
 
   # Collect every built binary, checksum them uniformly on one Linux host
