@@ -1,9 +1,8 @@
 # Zola config for the nudge build log.
 #
-# base_url must match where the site is actually served. For GitHub Pages *project*
-# pages that's https://<user>.github.io/<repo> (note the /<repo> path prefix). Once you
-# point a custom domain at it, change this to the domain root (e.g. https://nudge.dev)
-# so image and link paths resolve without the subpath.
+# base_url must match where the site is served (used for canonical links, the
+# sitemap, and internal @/ links). Deployed on Cloudflare Workers; update this if
+# you attach a custom domain later.
 base_url = "https://blog.nuudge.workers.dev"
 title = "nudge build log"
 description = "Notes from building a coding agent from scratch in Rust — phone control, multi-client co-op, and an agent that's just another client."
