@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="{{ lang | default(value="en") }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ config.title }}{% endblock title %}</title>
+  <meta name="description" content="{% block description %}{{ config.description }}{% endblock description %}">
+  <style>
+    :root { --fg:#1a1a1a; --muted:#666; --bg:#fff; --accent:#c0392b; --code-bg:#f4f4f4; --rule:rgba(128,128,128,.2); }
+    @media (prefers-color-scheme: dark){ :root{ --fg:#e6e6e6; --muted:#9aa0a6; --bg:#161616; --accent:#ff6b5e; --code-bg:#222; } }
+    * { box-sizing: border-box; }
+    body { margin:0; color:var(--fg); background:var(--bg);
+      font: 17px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    a { color: var(--accent); }
+    header.site { padding: 1.1rem 1.25rem; border-bottom: 1px solid var(--rule); }
+    header.site a { font-weight: 700; text-decoration: none; color: var(--fg); }
+    .wrap { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1,h2,h3 { line-height: 1.25; }
+    time { color: var(--muted); font-size: .9rem; }
+    pre { background: var(--code-bg); padding: 1rem; overflow: auto; border-radius: 6px; }
+    code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+    pre code { background: none; padding: 0; }
+    ul.posts { list-style: none; padding: 0; }
+    ul.posts li { margin: .6rem 0; display: flex; justify-content: space-between; gap: 1rem; }
+    img, video { max-width: 100%; height: auto; }
+    blockquote { border-left: 3px solid var(--accent); margin: 1rem 0; padding: .2rem 1rem; color: var(--muted); }
+    figure { margin: 1.5rem 0; text-align: center; }
+    figcaption { color: var(--muted); font-size: .9rem; font-style: italic; }
+  </style>
+</head>
+<body>
+  <header class="site"><a href="{{ get_url(path='/') }}">{{ config.title }}</a></header>
+  <div class="wrap">
+    {% block content %}{% endblock content %}
+  </div>
+</body>
+</html>
