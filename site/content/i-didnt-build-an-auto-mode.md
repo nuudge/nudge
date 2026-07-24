@@ -8,7 +8,7 @@ description = "Auto mode in today's coding agents means vacating the reviewer se
 
 ## Auto mode is a permission bypass
 
-Every coding agent has some version of auto mode, and they're all the same trade. claude-code gives you auto-accept for edits, allowlist rules, and `--dangerously-skip-permissions` — the name says it all. You want throughput, so you remove the reviewer. The gate is either a static rule or nothing.
+Every coding agent has some version of auto mode, and they're mostly the same trade. claude-code gives you auto-accept for edits, allowlist rules, and `--dangerously-skip-permissions` — the name says it all. You want throughput, so you remove the reviewer. The gate is either a static rule or nothing.
 
 The problem is that a rule sees strings, not situations. It can't tell `rm -rf` on a scratch clone (fine) from `rm -rf` on the source repo (disaster). Both match the same pattern. So you either approve everything by hand, or you close your eyes and hope.
 
@@ -91,7 +91,7 @@ The traffic itself is trivial. The worker's tool outputs never reach the supervi
 
 The real cost is elsewhere: every check-in is a full inference for the supervisor, re-reading its whole context. Since the supervisor wakes for every worker tool call, it makes about as many LLM calls as the worker does — so the overhead ratio is roughly *supervisor context size versus worker context size*. In this session the supervisor carried the entire planning conversation, so its context rivaled the worker's, and supervision added roughly **60% to total spend** (with prompt caching; without it, this pattern would be a non-starter).
 
-That 60% is not intrinsic. It scales with how much the supervisor holds in its head, not with how much work the worker does. A lean supervisor — context of just the plan and running summaries — drops the same 170 approvals to roughly **20% overhead**. Twenty percent for a reviewer that reads every action and knows the plan is a trade I'll take on any task where the blast radius is real.
+That 60% is not intrinsic. It scales with how much the supervisor holds in its head, not with how much work the worker does. A lean supervisor — context of just the plan and running summaries — drops the same 170 approvals to roughly **20% overhead**. 20% more cost for a reviewer that reads every action and knows the plan is a tradeoff I'll take on any task where the blast radius is real.
 
 ## The honest limits
 
