@@ -1,0 +1,21 @@
+{# Template for non-articles (About Me, Privacy…) #}
+
+{% extends "base.html" %}
+
+{%- block main_content %}
+
+{%- set page_or_section = page | default(value=section) -%}
+
+{{ macros_page_header::page_header(title=page_or_section.title) }}
+
+<div id="page-content">
+    <main>
+        {# The replace pattern is used to enable arbitrary locations for the Table of Contents #}
+        {# This is Philipp Oppermann's workaround: https://github.com/getzola/zola/issues/584#issuecomment-474329637 #}
+        {{ page_or_section.content | replace(from="<!-- toc -->", to=macros_toc::toc(page=page_or_section, header=false, language_strings=language_strings)) | safe }}
+    </main>
+</div>
+
+{%- include "partials/extra_features.html" -%}
+
+{%- endblock main_content %}

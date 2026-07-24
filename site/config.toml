@@ -7,11 +7,22 @@ base_url = "https://blog.nuudge.workers.dev"
 title = "nudge build log"
 description = "Notes from building a coding agent from scratch in Rust — phone control, multi-client co-op, and an agent that's just another client."
 default_language = "en"
-compile_sass = false
+theme = "tabi"
+compile_sass = true
 build_search_index = false
+generate_feeds = true
 
-# Zola 0.22 groups code-highlighting under a [markdown.highlighting] sub-table
-# (the old top-level highlight_code / highlight_theme keys were removed).
+# Class-based highlighting, as tabi requires: the theme ships its own
+# light/dark syntax CSS keyed to these classes.
 [markdown.highlighting]
 enabled = true
-theme = "dracula"
+theme = "catppuccin-frappe"
+style = "class"
+
+[extra]
+# Override tabi's default nav (blog/archive/tags/projects) — homepage only.
+menu = []
+socials = [
+    { name = "github", url = "https://github.com/nuudge/nudge", icon = "github" },
+]
+feed_icon = true
