@@ -97,7 +97,7 @@ That 60% is not intrinsic. It scales with how much the supervisor holds in its h
 
 Two caveats, so this doesn't read like marketing.
 
-**The supervisor can rubber-stamp.** It approved 170 out of 170 tool calls here. If you're counting vetoes, the reviewer looks idle. But the value never was vetoes — it was judgment at the decision points: the checkpoint rulings, the token scrub, knowing which eight things to escalate. The mandatory checkpoints are what force substantive review; a supervisor without them is just latency.
+**The supervisor can rubber-stamp.** It approved 170 out of 170 tool calls here. If you're counting rejections, the reviewer looks idle. But the value never was in rejecting actions — it was judgment at the decision points: the checkpoint rulings, the token scrub, knowing which eight things to escalate. The mandatory checkpoints are what force substantive review; a supervisor without them is just latency.
 
 **The constraints are prompt-level.** "Never push, never touch the source repo" lived in the brief, not in an enforcement layer. It held, this time. Hard guardrails under the soft ones are still worth building.
 
