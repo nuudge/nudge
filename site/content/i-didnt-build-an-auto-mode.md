@@ -8,11 +8,11 @@ description = "Auto mode in today's coding agents means vacating the reviewer se
 
 ## Auto mode is a permission bypass
 
-Every coding agent has some version of auto mode, and they're mostly the same trade. claude-code gives you auto-accept for edits, allowlist rules, and `--dangerously-skip-permissions` — the name says it all. You want throughput, so you remove the reviewer. The gate is either a static rule or nothing.
+Most coding agents' auto modes are the same trade: to go faster, you remove the reviewer. claude-code is explicit about it — auto-accept for edits, allowlist rules, or `--dangerously-skip-permissions`, a flag that turns off every permission prompt. What's left guarding your machine is a static rule, or nothing.
 
-The problem is that a rule sees strings, not situations. It can't tell `rm -rf` on a scratch clone (fine) from `rm -rf` on the source repo (disaster). Both match the same pattern. So you either approve everything by hand, or you close your eyes and hope.
+And a rule sees strings, not situations. `rm -rf` on a scratch clone is fine; `rm -rf` on the source repo is a disaster; a pattern matcher can't tell them apart. So you either approve everything by hand, or you close your eyes and hope.
 
-I was planning to add an auto mode to [nudge](https://github.com/nuudge/nudge), my from-scratch coding agent. Then I used sub-agents on a real task at my day job, and realized I don't need one. The agent I was already talking to spawned a worker, kept the reviewer seat for itself, and *became* the auto mode — a reviewer that actually reads what it approves.
+I was planning to add an auto mode to [nudge](https://github.com/nuudge/nudge), my from-scratch coding agent. Then a real task at my day job changed my mind: the agent I was already talking to spawned a worker, kept the reviewer seat for itself, and *became* the auto mode — a reviewer that actually reads what it approves.
 
 ## The task
 
