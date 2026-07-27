@@ -11,4 +11,4 @@ pub use events::{AgentEvent, ControllerEvent, McpServerInfo, ModelInfo, UiEvent}
 pub use host::{BrokerHandle, Controller, HandoffStatus, SessionHandle, SessionHost};
 pub use identity::{ClientIdentity, ClientKind};
 pub use peer::{PeerFactory, PeerRegistration, PeerWiring};
-pub use profile::{ClientProfile, CommandScope};
+pub use profile::ClientProfile;
