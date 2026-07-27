@@ -44,15 +44,27 @@ impl ClientProfile {
     }
 
     // A peer agent attached over a plain edge: it drives and observes, but does not end
-    // the session, does not receive supervision chatter, and issues no commands. Whether
-    // it may answer permissions is the one bit that varies by direction — the supervisor
-    // edge (`supervisor()`) may; a bare peer edge may not.
+    // the session, does not receive supervision chatter, issues no commands, and may not
+    // answer permission prompts. The last bit is what stops a child rubber-stamping its
+    // parent's gated calls over the return edge (first-responder-wins would otherwise let
+    // it beat the human); the supervisor edge uses `supervisor()` instead.
     pub fn agent_peer() -> Self {
         Self {
             may_quit: false,
             commands: CommandScope::None,
             receives_supervision: false,
+            may_answer_permissions: false,
+        }
+    }
+
+    // The edge from a spawner to the child it supervises: an agent peer that additionally
+    // may answer the child's permission check-ins (that IS supervision — the parent
+    // steers its child's gated calls). Assigned by direction at spawn time, which the
+    // spawner alone knows; a peer never claims it.
+    pub fn supervisor() -> Self {
+        Self {
             may_answer_permissions: true,
+            ..Self::agent_peer()
         }
     }
 }

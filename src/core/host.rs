@@ -540,9 +540,22 @@ async fn broker(
                     // a resolution marker, fanned to all controllers so every UI
                     // clears its prompt. First responder wins — a second answer for
                     // the same id finds nothing in `pending` and no-ops. Never
-                    // forwarded to the loop.
+                    // forwarded to the loop. Gated by profile: a client that may not
+                    // answer (a bare peer agent — e.g. a child over its return edge) is
+                    // ignored with a direct Notice back to just it, so it cannot
+                    // rubber-stamp a gate via first-responder-wins.
                     Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
-                        if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
+                        let may_answer = attached
+                            .get(&id)
+                            .map(|c| c.profile.may_answer_permissions)
+                            .unwrap_or(false);
+                        if !may_answer {
+                            if let Some(c) = attached.get(&id) {
+                                let _ = c.event_tx.send(ControllerEvent::Notice {
+                                    text: "answering permission prompts is not permitted for this client".into(),
+                                });
+                            }
+                        } else if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
                             let _ = tx.send(allow);
                             let resolved = ControllerEvent::PermissionResolved { tool_name, allow };
                             buffer.push(resolved.clone());
@@ -711,6 +724,38 @@ mod tests {
         (event_rx, ui_tx)
     }
 
+    // Attach an agent-kind controller with an explicit profile — for the permission
+    // gate tests, which need a bare peer vs. a supervisor edge (same kind, different
+    // rights, exactly the distinction ClientKind can't make).
+    async fn try_attach_with(
+        ctl_tx: &mpsc::UnboundedSender<HostCommand>,
+        profile: ClientProfile,
+    ) -> (
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        mpsc::Sender<UiEvent>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity {
+            kind: ClientKind::Agent,
+            name: "peer".into(),
+            session_id: None,
+            task: None,
+        };
+        ctl_tx
+            .send(HostCommand::Attach {
+                ui_rx,
+                event_tx,
+                who,
+                profile,
+                ack: ack_tx,
+            })
+            .unwrap();
+        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        (event_rx, ui_tx)
+    }
+
     // Supervision chatter (Notice) is withheld from an agent-kind controller but still
     // reaches a human — this is what lets the loop narrate peer activity without the
     // old re-narration hack. A following AssistantText proves the agent's stream simply
@@ -776,6 +821,109 @@ mod tests {
             Some((_, UiEvent::Quit)) => {}
             other => panic!("loop expected human Quit, got {other:?}"),
         }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A bare peer agent (agent_peer profile, may_answer_permissions=false) cannot answer
+    // a permission prompt: its PermissionResponse doesn't fulfil the loop's oneshot and
+    // it gets a refusal Notice; a human's subsequent answer still wins. Closes the
+    // first-responder-wins hole where a child could rubber-stamp its parent's gate.
+    #[tokio::test]
+    async fn agent_peer_cannot_answer_permissions_but_human_can() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut agent, a_ui) = try_attach_with(&ctl_tx, ClientProfile::agent_peer()).await;
+        let (mut human, h_ui) = try_attach(&ctl_tx).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
+        loop_agent_tx
+            .send(AgentEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                respond: resp_tx,
+            })
+            .await
+            .unwrap();
+        // The human sees the prompt; the agent does not answer-gate on seeing it.
+        match human.recv().await {
+            Some(ControllerEvent::PermissionRequest { tool_use_id, .. }) => {
+                assert_eq!(tool_use_id, "t1")
+            }
+            other => panic!("human expected PermissionRequest, got {other:?}"),
+        }
+        let _ = agent.recv().await; // drain the agent's copy of the prompt
+
+        // The agent tries to approve: refused with a Notice, oneshot NOT fulfilled.
+        a_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        match agent.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("agent expected refusal Notice, got {other:?}"),
+        }
+
+        // The human's answer wins: the oneshot resolves and a resolution is fanned out.
+        h_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            resp_rx.await.unwrap(),
+            "human's answer must fulfil the oneshot"
+        );
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // The supervisor edge (agent kind, but may_answer_permissions=true) IS honored — this
+    // is the parent steering its child's gated calls (steering.rs drives the verdict down
+    // this edge), which must keep working alongside the gate above.
+    #[tokio::test]
+    async fn supervisor_can_answer_permissions() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut supervisor, s_ui) = try_attach_with(&ctl_tx, ClientProfile::supervisor()).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
+        loop_agent_tx
+            .send(AgentEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                respond: resp_tx,
+            })
+            .await
+            .unwrap();
+        match supervisor.recv().await {
+            Some(ControllerEvent::PermissionRequest { .. }) => {}
+            other => panic!("supervisor expected PermissionRequest, got {other:?}"),
+        }
+
+        s_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            resp_rx.await.unwrap(),
+            "supervisor's answer must fulfil the oneshot"
+        );
 
         ctl_tx.send(HostCommand::Quit).unwrap();
         broker_task.await.unwrap();
