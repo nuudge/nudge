@@ -288,14 +288,15 @@ impl App {
         }
     }
 
-    // Client-local commands only. `/model` opens the picker (rendered from the
+    // Client-local commands only. A bare `/model` opens the picker (rendered from the
     // daemon's Capabilities) and `/background` detaches — both are front-end UI. Every
-    // other `/…` line is a session-level command parsed server-side, so it's sent
-    // verbatim as UiEvent::Command and works identically on any front-end.
+    // other `/…` line — including `/model <id>` — is a session-level command parsed
+    // server-side, so it's sent verbatim as UiEvent::Command and works identically on
+    // any front-end.
     fn handle_command(&mut self, cmd: &str, ui_tx: &mpsc::Sender<UiEvent>) {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
-            Some("/model") => {
+            Some("/model") if parts.next().is_none() => {
                 if self.models.is_empty() {
                     self.push(LogEntry::Warn("model list not available yet".into()));
                     self.push(LogEntry::Blank);
