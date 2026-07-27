@@ -130,6 +130,12 @@ impl App {
                 self.session_id = session_id;
                 self.session_name = session_name;
             }
+            // The daemon's capability surface — the /model picker renders from this
+            // (replayed first on attach), not a compiled-in list. commands/mcp aren't
+            // surfaced in the TUI yet.
+            ControllerEvent::Capabilities { models, .. } => {
+                self.models = models.into_iter().map(|m| (m.label, m.id)).collect();
+            }
         }
     }
 }

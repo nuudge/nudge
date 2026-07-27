@@ -321,4 +321,42 @@ mod tests {
             other => panic!("expected Attach, got {other:?}"),
         }
     }
+
+    // Exact wire bytes for the new control-plane variants, pinned against serde's
+    // external tagging so the Kotlin mirror (FramesTest) can assert the same strings.
+    // A UiEvent::Command inside ClientFrame::Command double-nests the tag — the frame
+    // wrapper and the event share the name "Command", which is fine (distinct enums).
+    #[test]
+    fn command_and_capabilities_wire_bytes() {
+        use crate::core::events::CommandInfo;
+        use crate::core::{ControllerEvent, McpServerInfo, ModelInfo};
+
+        let cmd = ClientFrame::Command(UiEvent::Command {
+            line: "/model x".into(),
+        });
+        assert_eq!(
+            serde_json::to_string(&cmd).unwrap(),
+            r#"{"Command":{"Command":{"line":"/model x"}}}"#
+        );
+
+        let cap = ControllerEvent::Capabilities {
+            commands: vec![CommandInfo {
+                name: "/model".into(),
+                usage: "u".into(),
+            }],
+            models: vec![ModelInfo {
+                id: "id1".into(),
+                label: "L1".into(),
+            }],
+            mcp: vec![McpServerInfo {
+                name: "gitlab".into(),
+                description: Some("d".into()),
+                loaded: false,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&cap).unwrap(),
+            r#"{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}]}}"#
+        );
+    }
 }

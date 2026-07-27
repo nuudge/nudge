@@ -106,13 +106,32 @@ things one agent does with another:
 | Half-channel | Direction | Carries | Purpose |
 | --- | --- | --- | --- |
 | **observe** (`ControllerEvent`) | peer → me | `AssistantText`, `ToolUseStart`, `ToolResult`, `PermissionRequest` | **supervision** — watch the peer work; answer its permission check-ins |
-| **drive** (`UiEvent`) | me → peer | `UserMessage`, `PermissionResponse` | **conversation & control** — send instructions/replies; return verdicts |
+| **drive** (`UiEvent`) | me → peer | `UserMessage`, `Command`, `PermissionResponse` | **conversation & control** — send instructions/replies; slash-commands; return verdicts |
 
 This split is why discussion "just works." When B wants to *address* A, it sends a
 `UserMessage` up A's drive channel — the exact path a human's message takes. That already
 folds into the agent's context **and** triggers a turn, so no special "fold the peer's words
 into my transcript and wake me up" machinery is needed; it's the human input path, reused
 unchanged. Supervision stays on the observe channel and never entangles with it.
+
+Control is symmetric the same way. A `/…` line rides the drive channel as
+`Command { line }` and is parsed **server-side** — so a phone, a `--connect` TUI, and a peer
+agent all reach every command by sending the line they typed, with no per-front-end grammar.
+What each client can *render* (a model picker, the MCP catalog) comes back on the observe
+channel as `Capabilities`, seeded into the replay buffer so menus are built from the daemon's
+own data, not a compiled-in copy.
+
+## Identity at the boundary, not in the loop
+
+The `ClientKind` announced at attach is not a branch inside the agent loop — principle 1
+holds, there is still no `if peer` in the loop. It is a **routing and authority policy at the
+broker boundary**: the broker withholds supervision chatter (`Notice`) from agent-kind
+controllers, which is what lets an agent narrate a peer's activity to its own front-end
+without that narration amplifying back around a mutual attach — no special-casing in the
+supervision path is needed. The same boundary gates verbs by identity: `Quit` ends the
+session, so it is admitted only from a human client. The policy table stays minimal — only
+the verbs that exist today — and lives in exactly one place.
+
 
 ## The handshake
 

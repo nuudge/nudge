@@ -4,6 +4,7 @@ use super::events::{AgentEvent, UiEvent};
 use crate::core::session::Session;
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
+mod command;
 mod dispatch;
 mod naming;
 mod peer_tools;
@@ -14,8 +15,10 @@ mod supervision;
 mod tests;
 mod types;
 
+pub use command::{McpCommand, command_catalog};
 pub use types::{AgentConfig, AgentIo, Backend, LoopInput};
 
+use command::Command;
 use dispatch::dispatch_tools;
 use naming::{fallback_name, short_id, title_from_response, title_prompt};
 use session_info::{emit_session_info_if_changed, finalize_rename};
@@ -57,70 +60,22 @@ pub async fn run_agent<P: Provider, B: Backend>(
             tokio::select! {
                 ui = ui_rx.recv() => match ui {
                 Some((who, UiEvent::UserMessage { text })) => break attribute(who.as_ref(), text),
-                Some((_, UiEvent::SetModel { model })) => {
-                    cfg.model = model;
-                    emit_session_info_if_changed(
-                        &agent_tx,
-                        &cfg.model,
-                        backend.git_branch(),
-                        &session,
-                        &mut last_session_ctx,
-                    )
-                    .await;
-                }
-                Some((_, UiEvent::RenameSession { name: requested })) => {
-                    let branch = backend.git_branch();
-                    let name = match requested {
-                        // Tier 1: explicit name, used verbatim (trimmed).
-                        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-                        // Tier 2: inside a git repo, branch + a short id so two
-                        // sessions on the same branch don't share a label.
-                        _ => match &branch {
-                            Some(b) => format!("{}-{}", b, short_id(&session.id)),
-                            // Tier 3: no repo — ask the model for a title. Awaited
-                            // inline (not via a `&P`-capturing helper) to keep the loop
-                            // future `Send`.
-                            None => match title_prompt(&messages) {
-                                Some(prompt) => {
-                                    let probe = [Message {
-                                        role: "user".into(),
-                                        content: vec![ContentBlock::Text { text: prompt }],
-                                    }];
-                                    let req = Request {
-                                        model: &cfg.model,
-                                        max_tokens: 1024,
-                                        thinking_display: "omitted",
-                                        system: Vec::new(),
-                                        tools: Vec::new(),
-                                        tool_cache_boundary: None,
-                                        tool_choice: None,
-                                        messages: &probe,
-                                    };
-                                    provider
-                                        .complete(&req)
-                                        .await
-                                        .ok()
-                                        .and_then(|r| title_from_response(&r))
-                                        .unwrap_or_else(|| fallback_name(&session))
-                                }
-                                None => fallback_name(&session),
-                            },
-                        },
-                    };
-                    finalize_rename(
-                        name,
-                        branch,
-                        &cfg,
+                Some((_, UiEvent::Command { line })) => {
+                    dispatch_command(
+                        &line,
+                        &mut cfg,
+                        &provider,
+                        &mut backend,
                         &mut session,
+                        &messages,
                         &agent_tx,
                         &mut last_session_ctx,
                     )
                     .await;
                 }
                 Some((_, UiEvent::Quit)) | None => return Ok(()),
-                Some((_, ev)) => {
-                    backend.handle_control(&ev, &agent_tx).await;
-                }
+                // Terminated at the broker; never forwarded to the loop.
+                Some((_, UiEvent::PermissionResponse { .. })) => {}
                 },
                 reg = recv_registration(&mut peer_register_rx) => match reg {
                     Some(reg) => {
@@ -267,21 +222,21 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             });
                             break;
                         }
-                        Some((_, UiEvent::SetModel { model })) => {
-                            cfg.model = model;
-                            emit_session_info_if_changed(
+                        Some((_, UiEvent::Command { line })) => {
+                            dispatch_command(
+                                &line,
+                                &mut cfg,
+                                &provider,
+                                &mut backend,
+                                &mut session,
+                                &messages,
                                 &agent_tx,
-                                &cfg.model,
-                                backend.git_branch(),
-                                &session,
                                 &mut last_session_ctx,
                             )
                             .await;
                         }
                         Some((_, UiEvent::Quit)) | None => return Ok(()),
-                        Some((_, ev)) => {
-                            backend.handle_control(&ev, &agent_tx).await;
-                        }
+                        Some((_, UiEvent::PermissionResponse { .. })) => {}
                     }
                 }
             }
@@ -323,6 +278,109 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 )
                 .await;
             }
+        }
+    }
+}
+
+// The Capabilities event, assembled from the static command grammar, the resolved
+// model catalog, and the backend's live MCP catalog. Re-emitted when the MCP
+// catalog changes so clients re-render menus.
+fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B) -> AgentEvent {
+    AgentEvent::Capabilities {
+        commands: command_catalog(),
+        models: cfg.models.clone(),
+        mcp: backend.mcp_catalog(),
+    }
+}
+
+// Execute one parsed `/…` command against the loop's state. Results ride back as
+// Notice/SessionInfo/Capabilities events — the same shape a human, a --connect TUI,
+// and the phone all see, since the parse lives here rather than in any front-end.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_command<P: Provider, B: Backend>(
+    line: &str,
+    cfg: &mut AgentConfig,
+    provider: &P,
+    backend: &mut B,
+    session: &mut Session,
+    messages: &[Message],
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    last_session_ctx: &mut (String, Option<String>, Option<String>),
+) {
+    match command::parse(line) {
+        Command::SetModel(model) => {
+            cfg.model = model;
+            emit_session_info_if_changed(
+                agent_tx,
+                &cfg.model,
+                backend.git_branch(),
+                session,
+                last_session_ctx,
+            )
+            .await;
+        }
+        Command::Rename(requested) => {
+            let branch = backend.git_branch();
+            let name = match requested {
+                // Tier 1: explicit name, used verbatim (trimmed).
+                Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+                // Tier 2: inside a git repo, branch + a short id so two sessions on
+                // the same branch don't share a label.
+                _ => match &branch {
+                    Some(b) => format!("{}-{}", b, short_id(&session.id)),
+                    // Tier 3: no repo — ask the model for a title. Awaited inline to
+                    // keep the loop future `Send`.
+                    None => match title_prompt(messages) {
+                        Some(prompt) => {
+                            let probe = [Message {
+                                role: "user".into(),
+                                content: vec![ContentBlock::Text { text: prompt }],
+                            }];
+                            let req = Request {
+                                model: &cfg.model,
+                                max_tokens: 1024,
+                                thinking_display: "omitted",
+                                system: Vec::new(),
+                                tools: Vec::new(),
+                                tool_cache_boundary: None,
+                                tool_choice: None,
+                                messages: &probe,
+                            };
+                            provider
+                                .complete(&req)
+                                .await
+                                .ok()
+                                .and_then(|r| title_from_response(&r))
+                                .unwrap_or_else(|| fallback_name(session))
+                        }
+                        None => fallback_name(session),
+                    },
+                },
+            };
+            finalize_rename(name, branch, cfg, session, agent_tx, last_session_ctx).await;
+        }
+        Command::Mcp(mcp) => {
+            let text = backend.handle_mcp(&mcp, agent_tx).await;
+            let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            // A load/unload mutates the tool surface — re-advertise the catalog. A
+            // bare list doesn't change anything, so it doesn't.
+            if matches!(mcp, McpCommand::Load(_) | McpCommand::Unload(_)) {
+                let _ = agent_tx.send(capabilities_event(cfg, backend)).await;
+            }
+        }
+        Command::ModelUsage => {
+            let _ = agent_tx
+                .send(AgentEvent::Notice {
+                    text: "usage: /model <id>".into(),
+                })
+                .await;
+        }
+        Command::Unknown(cmd) => {
+            let _ = agent_tx
+                .send(AgentEvent::Notice {
+                    text: format!("unknown command: {cmd}"),
+                })
+                .await;
         }
     }
 }

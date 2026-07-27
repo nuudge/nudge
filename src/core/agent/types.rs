@@ -3,11 +3,13 @@ use serde_json::Value;
 use std::future::Future;
 use tokio::sync::mpsc;
 
-use crate::core::events::{AgentEvent, UiEvent};
+use crate::core::events::{AgentEvent, McpServerInfo, ModelInfo, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
 use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet};
 use crate::llm::SystemBlock;
+
+use super::command::McpCommand;
 
 pub struct AgentConfig {
     pub model: String,
@@ -16,6 +18,9 @@ pub struct AgentConfig {
     // "summarized" (default) shows thinking text; "omitted" sends signature only
     // (faster TTFT). Cost is identical — this only changes wire-level visibility.
     pub thinking_display: String,
+    // The model catalog advertised in Capabilities (resolved from the provider at
+    // startup). Static for the session; the loop reads it to (re)build Capabilities.
+    pub models: Vec<ModelInfo>,
 }
 
 // Everything the loop needs from the concrete agent (tools, prompt/context,
@@ -37,12 +42,16 @@ pub trait Backend {
         input: &Value,
         notify: &mpsc::Sender<AgentEvent>,
     ) -> impl Future<Output = Result<String>> + Send;
-    // A control event the loop doesn't own (e.g. MCP load/unload/list); true if consumed.
-    fn handle_control(
+    // A mid-session MCP command (load / unload / list). Returns the outcome text
+    // for the loop to surface as a Notice. The registry is the backend's; the loop
+    // stays unaware of MCP.
+    fn handle_mcp(
         &mut self,
-        ev: &UiEvent,
+        cmd: &McpCommand,
         notify: &mpsc::Sender<AgentEvent>,
-    ) -> impl Future<Output = bool> + Send;
+    ) -> impl Future<Output = String> + Send;
+    // The MCP catalog (loaded + dormant) for the Capabilities event.
+    fn mcp_catalog(&self) -> Vec<McpServerInfo>;
     // Re-read each turn boundary so a mid-session `git checkout` reaches the header.
     fn git_branch(&self) -> Option<String> {
         None

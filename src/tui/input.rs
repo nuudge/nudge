@@ -166,7 +166,9 @@ impl App {
                         self.push(LogEntry::Info(format!("model set to {label} ({id})")));
                         self.push(LogEntry::Blank);
                         self.auto_scroll = true;
-                        let _ = ui_tx.try_send(UiEvent::SetModel { model: id });
+                        let _ = ui_tx.try_send(UiEvent::Command {
+                            line: format!("/model {id}"),
+                        });
                     }
                 }
                 KeyCode::Esc => self.model_picker = None,
@@ -286,10 +288,21 @@ impl App {
         }
     }
 
+    // Client-local commands only. A bare `/model` opens the picker (rendered from the
+    // daemon's Capabilities) and `/background` detaches — both are front-end UI. Every
+    // other `/…` line — including `/model <id>` — is a session-level command parsed
+    // server-side, so it's sent verbatim as UiEvent::Command and works identically on
+    // any front-end.
     fn handle_command(&mut self, cmd: &str, ui_tx: &mpsc::Sender<UiEvent>) {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
-            Some("/model") => {
+            Some("/model") if parts.next().is_none() => {
+                if self.models.is_empty() {
+                    self.push(LogEntry::Warn("model list not available yet".into()));
+                    self.push(LogEntry::Blank);
+                    self.auto_scroll = true;
+                    return;
+                }
                 let current = self
                     .models
                     .iter()
@@ -297,43 +310,14 @@ impl App {
                     .unwrap_or(0);
                 self.model_picker = Some(current);
             }
-            // The registry lives in the agent task, so results come back as a Notice.
-            Some("/mcp") => {
-                let event = match (parts.next(), parts.next()) {
-                    (None, _) => Some(UiEvent::ListServers),
-                    (Some("load"), Some(name)) => Some(UiEvent::LoadServer {
-                        name: name.to_string(),
-                    }),
-                    (Some("unload"), Some(name)) => Some(UiEvent::UnloadServer {
-                        name: name.to_string(),
-                    }),
-                    _ => {
-                        self.push(LogEntry::Warn(
-                            "usage: /mcp | /mcp load <name> | /mcp unload <name>".into(),
-                        ));
-                        self.push(LogEntry::Blank);
-                        self.auto_scroll = true;
-                        None
-                    }
-                };
-                if let Some(event) = event {
-                    let _ = ui_tx.try_send(event);
-                }
-            }
-            // Bare = daemon derives the name; the final label returns via Notice + SessionInfo.
-            Some("/session-rename") => {
-                let arg = cmd["/session-rename".len()..].trim();
-                let name = (!arg.is_empty()).then(|| arg.to_string());
-                let _ = ui_tx.try_send(UiEvent::RenameSession { name });
-            }
             // The run loop performs the detach (it holds the SessionHost).
             Some("/background") | Some("/bg") => {
                 self.pending_transition = Some(Mode::Background);
             }
             _ => {
-                self.push(LogEntry::Warn(format!("unknown command: {cmd}")));
-                self.push(LogEntry::Blank);
-                self.auto_scroll = true;
+                let _ = ui_tx.try_send(UiEvent::Command {
+                    line: cmd.to_string(),
+                });
             }
         }
     }

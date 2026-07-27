@@ -59,10 +59,21 @@ pub async fn host(cli: Cli) -> Result<()> {
         max_tokens: MAX_TOKENS,
         max_iterations: MAX_ITERATIONS,
         thinking_display,
+        // Filled from the resolved catalog just below, once the provider exists.
+        models: Vec::new(),
     };
     let provider = llm::AnthropicProvider::new(config.anthropic_api_key);
 
     ui_cfg.models = resolve_models(&provider, MODELS).await;
+    let mut cfg = cfg;
+    cfg.models = ui_cfg
+        .models
+        .iter()
+        .map(|(label, id)| core::ModelInfo {
+            id: id.clone(),
+            label: label.clone(),
+        })
+        .collect();
 
     // Connect to MCP servers declared in the project-local `.mcp.json` before
     // the TUI takes the screen, so connection logs print cleanly to stderr.
@@ -111,6 +122,17 @@ pub async fn host(cli: Cli) -> Result<()> {
             git_branch: backend.git_branch(),
             session_id: session.id.clone(),
             session_name: session.name.clone(),
+        },
+    );
+    // Seed the capability surface next to SessionInfo so every attach renders menus
+    // (model picker, MCP catalog) from the daemon's data on its very first frame. The
+    // loop re-emits it when the MCP catalog changes.
+    seed.insert(
+        1,
+        core::ControllerEvent::Capabilities {
+            commands: core::agent::command_catalog(),
+            models: cfg.models.clone(),
+            mcp: backend.mcp_catalog(),
         },
     );
     // The executor behind the model-facing Spawn tool: this session may create

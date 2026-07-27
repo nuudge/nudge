@@ -11,8 +11,9 @@ use crate::coding::mcp::{LOAD_TOOL_NAME, McpRegistry};
 use crate::coding::prompt::system_prompt_body;
 use crate::coding::skills::{SkillRegistry, USE_SKILL_NAME};
 use crate::coding::tools;
+use crate::core::agent::McpCommand;
 use crate::core::session::Session;
-use crate::core::{AgentConfig, AgentEvent, Backend, UiEvent};
+use crate::core::{AgentConfig, AgentEvent, Backend, McpServerInfo};
 use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 
 // The coding agent: it supplies the loop (in `core`) with the system prompt,
@@ -137,25 +138,35 @@ impl Backend for CodingBackend {
         }
     }
 
-    async fn handle_control(&mut self, ev: &UiEvent, notify: &mpsc::Sender<AgentEvent>) -> bool {
-        // Mid-session MCP control (load / unload / list), reported as a Notice
-        // for the transcript. Anything else is not ours to handle.
-        let text = match ev {
-            UiEvent::LoadServer { name } => match self.mcp.load(name, Some(notify)).await {
+    async fn handle_mcp(&mut self, cmd: &McpCommand, notify: &mpsc::Sender<AgentEvent>) -> String {
+        // Mid-session MCP control (load / unload / list). Returns the outcome text;
+        // the loop surfaces it as a Notice (and re-emits Capabilities on a change).
+        match cmd {
+            McpCommand::Load(name) => match self.mcp.load(name, Some(notify)).await {
                 Ok(n) => format!("[mcp] loaded '{name}' ({n} tools) — available next turn"),
                 Err(e) => format!("[mcp] load '{name}' failed: {e:#}"),
             },
-            UiEvent::UnloadServer { name } => match self.mcp.unload(name) {
+            McpCommand::Unload(name) => match self.mcp.unload(name) {
                 Ok(()) => format!("[mcp] unloaded '{name}'"),
                 Err(e) => format!("[mcp] unload '{name}' failed: {e:#}"),
             },
-            UiEvent::ListServers => {
+            McpCommand::List => {
                 format!("[mcp] servers:\n{}", self.mcp.status_lines().join("\n"))
             }
-            _ => return false,
-        };
-        let _ = notify.send(AgentEvent::Notice { text }).await;
-        true
+            McpCommand::Usage => "usage: /mcp | /mcp load <name> | /mcp unload <name>".into(),
+        }
+    }
+
+    fn mcp_catalog(&self) -> Vec<McpServerInfo> {
+        self.mcp
+            .catalog()
+            .into_iter()
+            .map(|(name, description, loaded)| McpServerInfo {
+                name,
+                description,
+                loaded,
+            })
+            .collect()
     }
 }
 

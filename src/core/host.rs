@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 
 use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
-use super::identity::ClientIdentity;
+use super::identity::{ClientIdentity, ClientKind};
 use super::peer::PeerWiring;
 use super::session::Session;
 use crate::llm::{Message, Provider};
@@ -312,6 +312,15 @@ fn translate(
             session_id,
             session_name,
         },
+        AgentEvent::Capabilities {
+            commands,
+            models,
+            mcp,
+        } => ControllerEvent::Capabilities {
+            commands,
+            models,
+            mcp,
+        },
         AgentEvent::Usage {
             in_tokens,
             out_tokens,
@@ -357,14 +366,37 @@ fn translate(
     }
 }
 
-// Send an event to every attached controller, reaping any whose receiver has
-// dropped (an unbounded send only fails when the `Controller.events` end is gone).
-// The event channel is unbounded, so this never blocks the broker on a slow
-// consumer — one stalled controller can't hold up delivery to the others or the
+// Broker-boundary routing policy: whether one event should reach a controller of
+// this identity. Supervision chatter (`Notice`) is never delivered to an agent-kind
+// controller — under mutual attach an agent is a controller of its peer, so echoing
+// a Notice back would amplify into an unbounded `[peer a] [peer b] …` cascade. This
+// is the whole reason the loop can narrate peer activity without a special case.
+fn deliver_to(who: &ClientIdentity, ev: &ControllerEvent) -> bool {
+    !(who.kind == ClientKind::Agent && matches!(ev, ControllerEvent::Notice { .. }))
+}
+
+// Broker-boundary authority policy: whether a controller of this identity may issue
+// a verb. Kept minimal — only the verbs that exist today. `Quit` ends the session,
+// so it's restricted to human clients; a peer agent can't tear down the session it
+// is a client of.
+fn verb_allowed(who: &ClientIdentity, ev: &UiEvent) -> bool {
+    match ev {
+        UiEvent::Quit => who.kind == ClientKind::Human,
+        _ => true,
+    }
+}
+
+// Send an event to every attached controller the routing policy admits, reaping any
+// whose receiver has dropped (an unbounded send only fails when the `Controller.events`
+// end is gone). The event channel is unbounded, so this never blocks the broker on a
+// slow consumer — one stalled controller can't hold up delivery to the others or the
 // loop.
 fn fan_out(attached: &mut HashMap<ControllerId, ControllerChannels>, ev: &ControllerEvent) {
     let mut dead: Vec<ControllerId> = Vec::new();
     for (id, c) in attached.iter() {
+        if !deliver_to(&c.who, ev) {
+            continue;
+        }
         if c.event_tx.send(ev.clone()).is_err() {
             dead.push(*id);
         }
@@ -422,13 +454,17 @@ async fn broker(
                 match cmd {
                     Some(HostCommand::Attach { ui_rx, event_tx, who, ack }) => {
                         // Replay the full history to this controller before any live
-                        // event. This handler has no await point, so no other arm can
+                        // event, filtered by the same routing policy as live fan-out
+                        // (so an agent controller's replay omits supervision Notices
+                        // too). This handler has no await point, so no other arm can
                         // interleave — replayed events strictly precede live ones for
                         // this controller. Unbounded send only errors if the
                         // controller already vanished (harmless — reaped on the next
                         // poll / fan-out).
                         for ev in &buffer {
-                            let _ = event_tx.send(ev.clone());
+                            if deliver_to(&who, ev) {
+                                let _ = event_tx.send(ev.clone());
+                            }
                         }
                         let id = next_id;
                         next_id += 1;
@@ -484,8 +520,27 @@ async fn broker(
                         buffer.push(echo.clone());
                         fan_out(&mut attached, &echo);
                     }
-                    // Pure control (SetModel / MCP load-unload-list / Quit): forward
-                    // to the loop; its effects return as events.
+                    // End the session — gated to human clients by broker policy. A
+                    // refused Quit gets a direct Notice back to just that controller
+                    // (bypassing the fan-out policy, which would otherwise withhold a
+                    // Notice from an agent), so the sender learns why nothing happened.
+                    Some(UiEvent::Quit) => {
+                        let who = attached.get(&id).map(|c| c.who.clone());
+                        match &who {
+                            Some(w) if !verb_allowed(w, &UiEvent::Quit) => {
+                                if let Some(c) = attached.get(&id) {
+                                    let _ = c.event_tx.send(ControllerEvent::Notice {
+                                        text: "quit is not permitted for agent clients".into(),
+                                    });
+                                }
+                            }
+                            _ => {
+                                let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
+                            }
+                        }
+                    }
+                    // A slash-command line: forward to the loop; its effects return as
+                    // Notice / SessionInfo / Capabilities events.
                     Some(other) => {
                         let who = attached.get(&id).map(|c| c.who.clone());
                         let _ = loop_ui_tx.send((who, other)).await;
@@ -576,6 +631,103 @@ mod tests {
             Some(ControllerEvent::AssistantText { text }) if text == want => {}
             other => panic!("expected AssistantText({want:?}), got {other:?}"),
         }
+    }
+
+    // Attach an agent-kind controller, so policy tests can distinguish it from a human.
+    async fn try_attach_agent(
+        ctl_tx: &mpsc::UnboundedSender<HostCommand>,
+    ) -> (
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        mpsc::Sender<UiEvent>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        ctl_tx
+            .send(HostCommand::Attach {
+                ui_rx,
+                event_tx,
+                who: ClientIdentity {
+                    kind: ClientKind::Agent,
+                    name: "peer".into(),
+                    session_id: None,
+                    task: None,
+                },
+                ack: ack_tx,
+            })
+            .unwrap();
+        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        (event_rx, ui_tx)
+    }
+
+    // Supervision chatter (Notice) is withheld from an agent-kind controller but still
+    // reaches a human — this is what lets the loop narrate peer activity without the
+    // old re-narration hack. A following AssistantText proves the agent's stream simply
+    // skipped the Notice (didn't stall).
+    #[tokio::test]
+    async fn notices_are_withheld_from_agent_controllers() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut human, _h_ui) = try_attach(&ctl_tx).await;
+        let (mut agent, _a_ui) = try_attach_agent(&ctl_tx).await;
+
+        loop_agent_tx
+            .send(AgentEvent::Notice {
+                text: "peer did a thing".into(),
+            })
+            .await
+            .unwrap();
+        loop_agent_tx
+            .send(AgentEvent::AssistantText {
+                text: "next".into(),
+            })
+            .await
+            .unwrap();
+
+        // Human sees the Notice, then the text.
+        match human.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert_eq!(text, "peer did a thing"),
+            other => panic!("human expected Notice, got {other:?}"),
+        }
+        expect_text(&mut human, "next").await;
+        // Agent's stream skipped the Notice entirely — the text is its first event.
+        expect_text(&mut agent, "next").await;
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // Quit is gated at the broker boundary: a human's Quit reaches the loop; an agent's
+    // is refused with a direct Notice back to it, and never forwarded.
+    #[tokio::test]
+    async fn quit_is_gated_to_human_clients() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut agent, a_ui) = try_attach_agent(&ctl_tx).await;
+        let (_human, h_ui) = try_attach(&ctl_tx).await;
+
+        // Agent's Quit is refused: it gets a Notice, the loop gets nothing.
+        a_ui.send(UiEvent::Quit).await.unwrap();
+        match agent.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("agent expected refusal Notice, got {other:?}"),
+        }
+
+        // Human's Quit is forwarded to the loop.
+        h_ui.send(UiEvent::Quit).await.unwrap();
+        match loop_ui_rx.recv().await {
+            Some((_, UiEvent::Quit)) => {}
+            other => panic!("loop expected human Quit, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
     }
 
     // User messages are forwarded to the loop AND echoed into the stream; a
