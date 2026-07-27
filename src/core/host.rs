@@ -8,6 +8,7 @@ use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::{ClientIdentity, ClientKind};
 use super::peer::PeerWiring;
+use super::profile::ClientProfile;
 use super::session::Session;
 use crate::llm::{Message, Provider};
 
@@ -74,8 +75,12 @@ struct ControllerChannels {
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
     // The attaching party's announced identity. Recorded at attach and read when the
     // broker stamps this controller's messages, so a shared session attributes each
-    // turn to a named party.
+    // turn to a named party. Attribution only — never rights (see `profile`).
     who: ClientIdentity,
+    // The attaching party's rights, assigned by provenance at attach (never claimed by
+    // the client). Read by the broker's routing (`deliver_to`) and verb gating
+    // (`verb_allowed`); the loop never sees it.
+    profile: ClientProfile,
 }
 
 // Control messages from `SessionHost`'s methods to the broker task.
@@ -88,6 +93,7 @@ enum HostCommand {
         ui_rx: mpsc::Receiver<UiEvent>,
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
         who: ClientIdentity,
+        profile: ClientProfile,
         ack: oneshot::Sender<bool>,
     },
     // End the session: the broker forwards a final UiEvent::Quit to the loop.
@@ -208,6 +214,18 @@ impl SessionHost {
         let _ = self.broker_task.await;
         loop_result
     }
+    // Attach with an explicit profile, assigned by whoever knows the provenance of the
+    // edge (e.g. `spawn.rs` gives a spawned child's supervisor edge a supervisor
+    // profile). `SessionHandle::attach` is the identity-only door that derives an
+    // interim profile from `who.kind`; this is the door for callers that assign rights
+    // directly.
+    pub async fn attach_as(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
+        self.broker_handle().attach_as(who, profile).await
+    }
 }
 
 impl SessionHandle for SessionHost {
@@ -245,12 +263,16 @@ impl BrokerHandle {
         !self.ctl_tx.is_closed()
     }
 
-    // Shared body of attach / attach_force. The event stream is unbounded so the
-    // broker's fan-out never blocks on this controller; the ui channel stays
+    // Shared body of attach / attach_force / attach_as. The event stream is unbounded
+    // so the broker's fan-out never blocks on this controller; the ui channel stays
     // bounded (this direction is one controller → the broker, so local backpressure
     // on a flooding sender is the right behaviour). `who` is the attaching party's
-    // identity, recorded by the broker.
-    async fn attach_inner(&self, who: ClientIdentity) -> Option<Controller> {
+    // identity and `profile` its rights, both recorded by the broker.
+    async fn attach_inner(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -260,6 +282,7 @@ impl BrokerHandle {
                 ui_rx,
                 event_tx,
                 who,
+                profile,
                 ack: ack_tx,
             })
             .is_err()
@@ -274,6 +297,28 @@ impl BrokerHandle {
             _ => None, // broker gone
         }
     }
+
+    // Attach with an explicit profile — the door for callers that assign rights by
+    // provenance rather than deriving them from the claimable `who.kind`.
+    pub async fn attach_as(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
+        self.attach_inner(who, profile).await
+    }
+}
+
+// The interim rights a client gets when it comes in through the identity-only
+// `SessionHandle::attach` door (a local TUI, or a remote client whose Attach frame the
+// daemon relays). Derived from the *claimed* `kind` — a known interim: it is a default,
+// never the thing a security decision depends on. Real provenance (a spawned edge's
+// direction; later, a pairing's baked-in scope) is assigned via `attach_as`.
+fn default_profile(who: &ClientIdentity) -> ClientProfile {
+    match who.kind {
+        ClientKind::Human => ClientProfile::human(),
+        ClientKind::Agent => ClientProfile::agent_peer(),
+    }
 }
 
 impl SessionHandle for BrokerHandle {
@@ -281,7 +326,8 @@ impl SessionHandle for BrokerHandle {
     // The controller's event stream begins with a replay of the full history, then
     // live events. `attach_force` uses the trait default (== `attach`).
     async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
-        self.attach_inner(who).await
+        let profile = default_profile(&who);
+        self.attach_inner(who, profile).await
     }
 
     // Detach is drop-based: a controller leaves by dropping its `Controller`, whose
@@ -366,22 +412,22 @@ fn translate(
     }
 }
 
-// Broker-boundary routing policy: whether one event should reach a controller of
-// this identity. Supervision chatter (`Notice`) is never delivered to an agent-kind
-// controller — under mutual attach an agent is a controller of its peer, so echoing
-// a Notice back would amplify into an unbounded `[peer a] [peer b] …` cascade. This
-// is the whole reason the loop can narrate peer activity without a special case.
-fn deliver_to(who: &ClientIdentity, ev: &ControllerEvent) -> bool {
-    !(who.kind == ClientKind::Agent && matches!(ev, ControllerEvent::Notice { .. }))
+// Broker-boundary routing policy: whether one event should reach a controller with
+// this profile. Supervision chatter (`Notice`) is withheld from a client that doesn't
+// receive supervision (a peer agent) — under mutual attach an agent is a controller of
+// its peer, so echoing a Notice back would amplify into an unbounded
+// `[peer a] [peer b] …` cascade. This is the whole reason the loop can narrate peer
+// activity without a special case.
+fn deliver_to(profile: &ClientProfile, ev: &ControllerEvent) -> bool {
+    profile.receives_supervision || !matches!(ev, ControllerEvent::Notice { .. })
 }
 
-// Broker-boundary authority policy: whether a controller of this identity may issue
-// a verb. Kept minimal — only the verbs that exist today. `Quit` ends the session,
-// so it's restricted to human clients; a peer agent can't tear down the session it
-// is a client of.
-fn verb_allowed(who: &ClientIdentity, ev: &UiEvent) -> bool {
+// Broker-boundary authority policy: whether a controller with this profile may issue a
+// verb. Kept minimal — only the verbs that exist today. `Quit` ends the session, so a
+// client without that right (a peer agent) can't tear down a session it is a client of.
+fn verb_allowed(profile: &ClientProfile, ev: &UiEvent) -> bool {
     match ev {
-        UiEvent::Quit => who.kind == ClientKind::Human,
+        UiEvent::Quit => profile.may_quit,
         _ => true,
     }
 }
@@ -394,7 +440,7 @@ fn verb_allowed(who: &ClientIdentity, ev: &UiEvent) -> bool {
 fn fan_out(attached: &mut HashMap<ControllerId, ControllerChannels>, ev: &ControllerEvent) {
     let mut dead: Vec<ControllerId> = Vec::new();
     for (id, c) in attached.iter() {
-        if !deliver_to(&c.who, ev) {
+        if !deliver_to(&c.profile, ev) {
             continue;
         }
         if c.event_tx.send(ev.clone()).is_err() {
@@ -452,7 +498,7 @@ async fn broker(
         tokio::select! {
             cmd = ctl_rx.recv() => {
                 match cmd {
-                    Some(HostCommand::Attach { ui_rx, event_tx, who, ack }) => {
+                    Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
                         // Replay the full history to this controller before any live
                         // event, filtered by the same routing policy as live fan-out
                         // (so an agent controller's replay omits supervision Notices
@@ -462,13 +508,13 @@ async fn broker(
                         // controller already vanished (harmless — reaped on the next
                         // poll / fan-out).
                         for ev in &buffer {
-                            if deliver_to(&who, ev) {
+                            if deliver_to(&profile, ev) {
                                 let _ = event_tx.send(ev.clone());
                             }
                         }
                         let id = next_id;
                         next_id += 1;
-                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who });
+                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who, profile });
                         let _ = ack.send(true);
                     }
                     // End the session: forward a final Quit to the loop and stop.
@@ -520,23 +566,22 @@ async fn broker(
                         buffer.push(echo.clone());
                         fan_out(&mut attached, &echo);
                     }
-                    // End the session — gated to human clients by broker policy. A
+                    // End the session — gated by broker policy (profile.may_quit). A
                     // refused Quit gets a direct Notice back to just that controller
                     // (bypassing the fan-out policy, which would otherwise withhold a
                     // Notice from an agent), so the sender learns why nothing happened.
                     Some(UiEvent::Quit) => {
-                        let who = attached.get(&id).map(|c| c.who.clone());
-                        match &who {
-                            Some(w) if !verb_allowed(w, &UiEvent::Quit) => {
-                                if let Some(c) = attached.get(&id) {
-                                    let _ = c.event_tx.send(ControllerEvent::Notice {
-                                        text: "quit is not permitted for agent clients".into(),
-                                    });
-                                }
-                            }
-                            _ => {
-                                let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
-                            }
+                        let allowed = attached
+                            .get(&id)
+                            .map(|c| verb_allowed(&c.profile, &UiEvent::Quit))
+                            .unwrap_or(false);
+                        if allowed {
+                            let who = attached.get(&id).map(|c| c.who.clone());
+                            let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
+                        } else if let Some(c) = attached.get(&id) {
+                            let _ = c.event_tx.send(ControllerEvent::Notice {
+                                text: "quit is not permitted for agent clients".into(),
+                            });
                         }
                     }
                     // A slash-command line: forward to the loop; its effects return as
@@ -614,11 +659,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity::human(name);
+        let profile = default_profile(&who);
         ctl_tx
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                who: ClientIdentity::human(name),
+                who,
+                profile,
                 ack: ack_tx,
             })
             .unwrap();
@@ -643,16 +691,19 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity {
+            kind: ClientKind::Agent,
+            name: "peer".into(),
+            session_id: None,
+            task: None,
+        };
+        let profile = default_profile(&who);
         ctl_tx
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                who: ClientIdentity {
-                    kind: ClientKind::Agent,
-                    name: "peer".into(),
-                    session_id: None,
-                    task: None,
-                },
+                who,
+                profile,
                 ack: ack_tx,
             })
             .unwrap();
