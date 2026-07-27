@@ -61,6 +61,9 @@ data class ChatUiState(
     val turnInFlight: Boolean = false,
     val pendingPermission: PendingPermission? = null,
     val sessionInfo: SessionContext? = null,
+    // The daemon's capability surface (models, commands, MCP catalog), from the
+    // Capabilities event (replayed first on attach). Drives the model picker.
+    val capabilities: ControllerEvent.Capabilities? = null,
 )
 
 // Bridges the pure-JVM RelayClient to Compose. RelayClient's listener callbacks fire on
@@ -134,6 +137,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 lines = emptyList(),
                 pendingPermission = null,
                 sessionInfo = null,
+                capabilities = null,
             )
         }
         val decoded = try {
@@ -223,6 +227,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 turnInFlight = false,
                 pendingPermission = null,
                 sessionInfo = null,
+                capabilities = null,
             )
         }
     }
@@ -230,8 +235,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun send(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || client == null) return
+        // Mirror the TUI: a single-line leading-`/` input is a slash command parsed
+        // server-side (its effects return as Notice/SessionInfo/Capabilities, not a
+        // turn); a multi-line `/…` is an ordinary message. So a command shouldn't
+        // flip turnInFlight — there's no TurnComplete coming to clear it.
+        if (trimmed.startsWith("/") && !trimmed.contains("\n")) {
+            client?.send(UiEvent.Command(trimmed))
+            return
+        }
         _state.update { it.copy(turnInFlight = true) }
         client?.send(UiEvent.UserMessage(trimmed))
+    }
+
+    // Switch the API model via the shared command surface (rendered from Capabilities).
+    fun selectModel(id: String) {
+        client?.send(UiEvent.Command("/model $id"))
     }
 
     // Answer the tool-call permission the agent is blocked on. The daemon then streams a
@@ -309,6 +327,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         ),
                     )
                 }
+                is ControllerEvent.Capabilities -> _state.update { it.copy(capabilities = event) }
                 is ControllerEvent.Usage -> Unit // not surfaced in the UI yet
             }
         }

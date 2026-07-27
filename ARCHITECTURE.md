@@ -77,15 +77,21 @@ graph LR
 
 ### Event vocabulary (`core/events.rs`)
 
-- **`UiEvent`** - front-end → loop: `UserMessage`, `SetModel`, `LoadServer` /
-  `UnloadServer` / `ListServers`, `PermissionResponse`, `Quit`.
+- **`UiEvent`** - front-end → loop: `UserMessage`, `Command { line }` (a raw
+  `/…` slash-command line parsed and executed server-side, in
+  `core/agent/command.rs`), `PermissionResponse`, `Quit`. One command surface for
+  every client — the grammar lives in one place, not re-implemented per front-end.
 - **`AgentEvent`** - loop → broker: assistant text/thinking, tool start/result,
-  usage, `PermissionRequest` (carries a `oneshot` reply slot), `Notice`,
-  `Error`. Deliberately **not** serializable.
+  usage, `PermissionRequest` (carries a `oneshot` reply slot), `SessionInfo`,
+  `Capabilities` (the daemon's command/model/MCP catalog), `Notice`, `Error`.
+  Deliberately **not** serializable.
 - **`ControllerEvent`** - broker → front-end: a `Clone + Serialize` mirror of
   `AgentEvent` with the `oneshot` terminated and `UserMessage` echoes +
   `PermissionResolved` markers injected, so any controller (live or
-  attach-replay) reconstructs the whole transcript from this one stream.
+  attach-replay) reconstructs the whole transcript from this one stream. The
+  broker routes it by the attaching client's `ClientIdentity`: supervision
+  `Notice`s are never delivered to agent-kind controllers, and `Quit` is gated to
+  human clients.
 
 ## How a front-end reaches the session: `SessionHandle`
 

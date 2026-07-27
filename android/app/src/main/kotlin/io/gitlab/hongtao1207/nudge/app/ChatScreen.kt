@@ -30,6 +30,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -57,6 +59,8 @@ import androidx.compose.ui.unit.dp
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import io.gitlab.hongtao1207.nudge.protocol.ControllerEvent
+import io.gitlab.hongtao1207.nudge.protocol.ModelInfo
 
 @Composable
 fun ChatScreen(viewModel: ChatViewModel) {
@@ -85,8 +89,11 @@ fun ChatScreen(viewModel: ChatViewModel) {
         )
 
         // Session context (from the daemon's SessionInfo event). Cleared on disconnect,
-        // so it never shows on the pairing screen; kept while detached.
-        state.sessionInfo?.let { ContextBar(it) }
+        // so it never shows on the pairing screen; kept while detached. The model is a
+        // picker rendered from the daemon's Capabilities (not a compiled-in list).
+        state.sessionInfo?.let {
+            ContextBar(it, state.capabilities, viewModel::selectModel)
+        }
 
         // The scanner/paste screen is only for the *unbound* states; a detached (bound)
         // session reattaches to the same daemon via the status-bar Reattach button.
@@ -186,33 +193,46 @@ private fun StatusIndicator(connection: Connection) {
     Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(dot))
 }
 
-// Collapsible session context. The glance line (model · branch) is always shown and
-// costs one thin line; tapping it reveals the full cwd + session label (with copy), which
-// are reference info you rarely need at a glance on a phone. The label is the human name
-// once renamed, else the uuid — both are valid `--resume` references.
+// Collapsible session context. The glance line (model picker · branch) is always
+// shown and costs one thin line; tapping the chevron reveals the full cwd + session
+// label (with copy). The model is a dropdown rendered from the daemon's Capabilities,
+// so switching models uses the same command surface as the TUI. The label is the
+// human name once renamed, else the uuid — both are valid `--resume` references.
 @Composable
-private fun ContextBar(info: SessionContext) {
+private fun ContextBar(
+    info: SessionContext,
+    capabilities: ControllerEvent.Capabilities?,
+    onSelectModel: (String) -> Unit,
+) {
     var expanded by rememberSaveable { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val sessionLabel = info.sessionName ?: info.sessionId
     Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)) {
             Row(
-                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(
-                    text = info.model + (info.gitBranch?.let { " · $it" } ?: ""),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                ModelPicker(
+                    current = info.model,
+                    models = capabilities?.models.orEmpty(),
+                    onSelect = onSelectModel,
                     modifier = Modifier.weight(1f),
                 )
+                info.gitBranch?.let {
+                    Text(
+                        text = " · $it",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
                 Text(
-                    text = if (expanded) "⌃" else "⌄",
+                    text = if (expanded) "  ⌃" else "  ⌄",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable { expanded = !expanded },
                 )
             }
             if (expanded) {
@@ -238,6 +258,40 @@ private fun ContextBar(info: SessionContext) {
                         Text("Copy", style = MaterialTheme.typography.labelMedium)
                     }
                 }
+            }
+        }
+    }
+}
+
+// The model as a dropdown anchor. Tapping it lists the daemon's models (from
+// Capabilities) and sends `/model <id>` on selection; with no catalog yet it's inert
+// plain text. The `▾` only shows when there's a menu to open.
+@Composable
+private fun ModelPicker(
+    current: String,
+    models: List<ModelInfo>,
+    onSelect: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box(modifier = modifier) {
+        Text(
+            text = current + if (models.isNotEmpty()) " ▾" else "",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.clickable(enabled = models.isNotEmpty()) { open = true },
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            models.forEach { model ->
+                DropdownMenuItem(
+                    text = { Text(model.label) },
+                    onClick = {
+                        open = false
+                        onSelect(model.id)
+                    },
+                )
             }
         }
     }

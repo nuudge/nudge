@@ -358,6 +358,27 @@ impl McpRegistry {
         lines
     }
 
+    /// The MCP catalog for capability discovery: every dormant server (with its
+    /// blurb + loaded state) plus any loaded user-specified server. Sorted, stable
+    /// order so clients render a steady menu. `(name, description, loaded)`.
+    pub fn catalog(&self) -> Vec<(String, Option<String>, bool)> {
+        let mut out = Vec::new();
+        // Loaded user-specified servers (from .mcp.json) aren't in the dormant catalog.
+        for (name, conn) in &self.servers {
+            if conn.layer == Layer::UserSpecified {
+                out.push((name.clone(), None, true));
+            }
+        }
+        for (name, spec) in &self.dormant {
+            out.push((
+                name.clone(),
+                spec.description.clone(),
+                self.servers.contains_key(name),
+            ));
+        }
+        out
+    }
+
     /// Schema for the `load_tool` meta-tool. The dormant catalog (name +
     /// description) is baked into the tool's `description`, so the model knows
     /// what it can pull in without a separate discovery round-trip. The catalog

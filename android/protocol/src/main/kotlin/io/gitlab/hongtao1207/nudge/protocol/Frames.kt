@@ -59,6 +59,17 @@ private fun splitTagged(decoder: JsonDecoder): Pair<String, JsonElement?> =
     }
 
 // ── ControllerEvent (core -> client) ─────────────────────────────────────────
+// The daemon's capability surface, carried in ControllerEvent.Capabilities. Field
+// order mirrors the Rust serde structs exactly (byte-pinned in FramesTest).
+@Serializable
+data class ModelInfo(val id: String, val label: String)
+
+@Serializable
+data class CommandInfo(val name: String, val usage: String)
+
+@Serializable
+data class McpServerInfo(val name: String, val description: String?, val loaded: Boolean)
+
 @Serializable(with = ControllerEventSerializer::class)
 sealed class ControllerEvent {
     @Serializable
@@ -71,6 +82,15 @@ sealed class ControllerEvent {
         // a daemon that predates the field still decodes. The header prefers it over
         // the uuid. serde emits it as null (not absent) when None, so it's normally present.
         @SerialName("session_name") val sessionName: String? = null,
+    ) : ControllerEvent()
+
+    // The daemon's capabilities: command grammar, model catalog, MCP catalog. Seeded
+    // next to SessionInfo and re-emitted on catalog change; menus render from it.
+    @Serializable
+    data class Capabilities(
+        val commands: List<CommandInfo>,
+        val models: List<ModelInfo>,
+        val mcp: List<McpServerInfo>,
     ) : ControllerEvent()
 
     @Serializable
@@ -136,6 +156,7 @@ object ControllerEventSerializer : KSerializer<ControllerEvent> {
         val j = encoder as? JsonEncoder ?: error("ControllerEvent requires a JSON encoder")
         when (value) {
             is ControllerEvent.SessionInfo -> emitTagged(j, "SessionInfo", ControllerEvent.SessionInfo.serializer(), value)
+            is ControllerEvent.Capabilities -> emitTagged(j, "Capabilities", ControllerEvent.Capabilities.serializer(), value)
             is ControllerEvent.Usage -> emitTagged(j, "Usage", ControllerEvent.Usage.serializer(), value)
             is ControllerEvent.AssistantText -> emitTagged(j, "AssistantText", ControllerEvent.AssistantText.serializer(), value)
             is ControllerEvent.AssistantThinking -> emitTagged(j, "AssistantThinking", ControllerEvent.AssistantThinking.serializer(), value)
@@ -158,6 +179,7 @@ object ControllerEventSerializer : KSerializer<ControllerEvent> {
         fun <T> dec(ser: DeserializationStrategy<T>): T = j.json.decodeFromJsonElement(ser, inner!!)
         return when (tag) {
             "SessionInfo" -> dec(ControllerEvent.SessionInfo.serializer())
+            "Capabilities" -> dec(ControllerEvent.Capabilities.serializer())
             "Usage" -> dec(ControllerEvent.Usage.serializer())
             "AssistantText" -> dec(ControllerEvent.AssistantText.serializer())
             "AssistantThinking" -> dec(ControllerEvent.AssistantThinking.serializer())
@@ -182,22 +204,12 @@ sealed class UiEvent {
     @Serializable
     data class UserMessage(val text: String) : UiEvent()
 
+    // A raw slash-command line (`/model …`, `/mcp …`, `/session-rename …`). The
+    // daemon parses and executes it; results return as Notice/SessionInfo/Capabilities
+    // events. One surface for every front-end — the phone gets every command by
+    // sending the line it typed, with no per-command app code.
     @Serializable
-    data class SetModel(val model: String) : UiEvent()
-
-    // Rename the session. name = null asks the daemon to derive one (git branch +
-    // short id, else an LLM-suggested summary); a value is used verbatim. Mirrors the
-    // Rust UiEvent::RenameSession { name: Option<String> }.
-    @Serializable
-    data class RenameSession(val name: String?) : UiEvent()
-
-    @Serializable
-    data class LoadServer(val name: String) : UiEvent()
-
-    @Serializable
-    data class UnloadServer(val name: String) : UiEvent()
-
-    object ListServers : UiEvent()
+    data class Command(val line: String) : UiEvent()
 
     @Serializable
     data class PermissionResponse(
@@ -215,11 +227,7 @@ object UiEventSerializer : KSerializer<UiEvent> {
         val j = encoder as? JsonEncoder ?: error("UiEvent requires a JSON encoder")
         when (value) {
             is UiEvent.UserMessage -> emitTagged(j, "UserMessage", UiEvent.UserMessage.serializer(), value)
-            is UiEvent.SetModel -> emitTagged(j, "SetModel", UiEvent.SetModel.serializer(), value)
-            is UiEvent.RenameSession -> emitTagged(j, "RenameSession", UiEvent.RenameSession.serializer(), value)
-            is UiEvent.LoadServer -> emitTagged(j, "LoadServer", UiEvent.LoadServer.serializer(), value)
-            is UiEvent.UnloadServer -> emitTagged(j, "UnloadServer", UiEvent.UnloadServer.serializer(), value)
-            UiEvent.ListServers -> emitTag(j, "ListServers")
+            is UiEvent.Command -> emitTagged(j, "Command", UiEvent.Command.serializer(), value)
             is UiEvent.PermissionResponse -> emitTagged(j, "PermissionResponse", UiEvent.PermissionResponse.serializer(), value)
             UiEvent.Quit -> emitTag(j, "Quit")
         }
@@ -231,11 +239,7 @@ object UiEventSerializer : KSerializer<UiEvent> {
         fun <T> dec(ser: DeserializationStrategy<T>): T = j.json.decodeFromJsonElement(ser, inner!!)
         return when (tag) {
             "UserMessage" -> dec(UiEvent.UserMessage.serializer())
-            "SetModel" -> dec(UiEvent.SetModel.serializer())
-            "RenameSession" -> dec(UiEvent.RenameSession.serializer())
-            "LoadServer" -> dec(UiEvent.LoadServer.serializer())
-            "UnloadServer" -> dec(UiEvent.UnloadServer.serializer())
-            "ListServers" -> UiEvent.ListServers
+            "Command" -> dec(UiEvent.Command.serializer())
             "PermissionResponse" -> dec(UiEvent.PermissionResponse.serializer())
             "Quit" -> UiEvent.Quit
             else -> error("unknown UiEvent variant: $tag")

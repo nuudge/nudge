@@ -53,15 +53,11 @@ class FramesTest {
             """{"Command":{"PermissionResponse":{"tool_use_id":"t1","allow":true}}}""",
             enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.PermissionResponse("t1", true))),
         )
-        // RenameSession mirrors Rust's Option<String>: a name verbatim, or null to let
-        // the daemon derive one. serde emits the `name` key either way (not omitted).
+        // A slash-command line. Both the frame wrapper and the UiEvent are named
+        // "Command" (distinct enums), so the tag nests — this pins that exact shape.
         assertEquals(
-            """{"Command":{"RenameSession":{"name":"auth-fix"}}}""",
-            enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.RenameSession("auth-fix"))),
-        )
-        assertEquals(
-            """{"Command":{"RenameSession":{"name":null}}}""",
-            enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.RenameSession(null))),
+            """{"Command":{"Command":{"line":"/model x"}}}""",
+            enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.Command("/model x"))),
         )
     }
 
@@ -132,10 +128,9 @@ class FramesTest {
             ClientFrame.Attach(42, ClientIdentity.human("alice")),
             ClientFrame.Detach,
             ClientFrame.Command(UiEvent.UserMessage("go")),
-            ClientFrame.Command(UiEvent.SetModel("claude-opus-4-8")),
-            ClientFrame.Command(UiEvent.RenameSession("my-name")),
-            ClientFrame.Command(UiEvent.RenameSession(null)),
-            ClientFrame.Command(UiEvent.ListServers),
+            ClientFrame.Command(UiEvent.Command("/model claude-opus-4-8")),
+            ClientFrame.Command(UiEvent.Command("/session-rename my-name")),
+            ClientFrame.Command(UiEvent.Command("/mcp")),
             ClientFrame.Command(UiEvent.Quit),
         )
         for (f in frames) {
@@ -143,6 +138,36 @@ class FramesTest {
             val back = WireJson.decodeFromString(ClientFrame.serializer(), json)
             assertEquals(f, back, "round-trip changed $f (json=$json)")
         }
+    }
+
+    @Test
+    fun capabilitiesDecodesAndRoundTrips() {
+        // Exact bytes serde emits for ControllerEvent::Capabilities — the field order
+        // (commands, models, mcp) and the struct shapes are byte-pinned so a phone
+        // menu built from this can't silently drift from the daemon.
+        val decoded = WireJson.decodeFromString(
+            ServerFrame.serializer(),
+            """{"Event":{"seq":1,"event":{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}]}}}}""",
+        )
+        assertEquals(
+            ServerFrame.Event(
+                1,
+                ControllerEvent.Capabilities(
+                    listOf(CommandInfo("/model", "u")),
+                    listOf(ModelInfo("id1", "L1")),
+                    listOf(McpServerInfo("gitlab", "d", false)),
+                ),
+            ),
+            decoded,
+        )
+
+        // A dormant server with no blurb → description null (serde emits the key).
+        val cap = ControllerEvent.Capabilities(
+            listOf(CommandInfo("/mcp", "usage")),
+            listOf(ModelInfo("m", "Model")),
+            listOf(McpServerInfo("everything", null, true)),
+        )
+        assertEquals(cap, WireJson.decodeFromString(ControllerEvent.serializer(), enc(ControllerEvent.serializer(), cap)))
     }
 
     @Test

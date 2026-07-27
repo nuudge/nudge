@@ -118,8 +118,15 @@ impl Backend for FakeBackend {
     ) -> Result<String> {
         Ok(String::new())
     }
-    async fn handle_control(&mut self, _ev: &UiEvent, _notify: &mpsc::Sender<AgentEvent>) -> bool {
-        false
+    async fn handle_mcp(
+        &mut self,
+        _cmd: &super::McpCommand,
+        _notify: &mpsc::Sender<AgentEvent>,
+    ) -> String {
+        String::new()
+    }
+    fn mcp_catalog(&self) -> Vec<crate::core::McpServerInfo> {
+        Vec::new()
     }
 }
 
@@ -129,6 +136,7 @@ fn mk_cfg() -> AgentConfig {
         max_tokens: 64,
         max_iterations: 4,
         thinking_display: "omitted".into(),
+        models: Vec::new(),
     }
 }
 

@@ -60,6 +60,9 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
                 max_tokens: MAX_TOKENS,
                 max_iterations: MAX_ITERATIONS,
                 thinking_display: "omitted".into(),
+                // A subagent's only controller is its spawner (an agent), which renders
+                // no picker; the model catalog is a human-front-end concern.
+                models: Vec::new(),
             };
             let provider = llm::AnthropicProvider::new(api_key);
 

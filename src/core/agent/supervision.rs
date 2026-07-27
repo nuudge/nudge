@@ -154,14 +154,6 @@ pub(super) fn peer_notice(name: &str, ev: &ControllerEvent) -> Option<String> {
             "[peer {name}] {} {tool_name}",
             if *allow { "allowed" } else { "denied" }
         )),
-        // A peer's own Notices are deliberately NOT re-narrated. Under mutual attach I am
-        // an attached controller of my peer, so a Notice I emit about it is fanned back
-        // to it; if it re-narrated my Notices (and I its), one event would amplify into an
-        // unbounded `[peer a] [peer b] [peer a] …` cascade. Every re-narration is itself a
-        // Notice, so refusing to re-narrate Notices breaks the cycle at one hop. (The real
-        // fix is identity-aware fan-out that never routes supervision chatter to peer
-        // agents — deferred; see docs/symmetric-communication.md open questions.)
-        ControllerEvent::Notice { .. } => None,
         ControllerEvent::Error { message } => Some(format!("[peer {name}] error: {message}")),
         _ => None,
     }

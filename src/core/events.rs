@@ -1,6 +1,28 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+// The daemon's capability surface, carried in `Capabilities` so clients render
+// pickers/menus from the daemon's data instead of a compiled-in list. Serialized
+// as plain structs (not tuples) so the Kotlin mirror stays a data class.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub usage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub loaded: bool,
+}
+
 // IDs are carried on every tool-related event so the UI can correlate updates:
 // the TUI resolves a pending ToolCall entry in place when its ToolResult
 // arrives. PermissionRequest's tool_use_id is still unused (the pending prompt
@@ -21,6 +43,14 @@ pub enum AgentEvent {
         // still nameless. Controllers prefer it over `session_id` in the header.
         session_name: Option<String>,
     },
+    // The daemon's capability surface (commands, models, MCP catalog). Seeded into
+    // the replay buffer next to SessionInfo and re-emitted when the catalog changes
+    // (an MCP load/unload), so every client renders menus from live daemon data.
+    Capabilities {
+        commands: Vec<CommandInfo>,
+        models: Vec<ModelInfo>,
+        mcp: Vec<McpServerInfo>,
+    },
     Usage {
         in_tokens: u64,
         out_tokens: u64,
@@ -30,7 +60,6 @@ pub enum AgentEvent {
     AssistantText {
         text: String,
     },
-    // Emitted for each non-empty `thinking` block in the assistant response.
     // Empty (when display: "omitted") and redacted_thinking blocks are skipped.
     AssistantThinking {
         text: String,
@@ -95,6 +124,13 @@ pub enum ControllerEvent {
         // place of the uuid in the header so a resumed session is recognizable.
         session_name: Option<String>,
     },
+    // The daemon's capability surface — see AgentEvent::Capabilities. Seeded into
+    // the replay buffer next to SessionInfo and re-emitted on catalog change.
+    Capabilities {
+        commands: Vec<CommandInfo>,
+        models: Vec<ModelInfo>,
+        mcp: Vec<McpServerInfo>,
+    },
     Usage {
         in_tokens: u64,
         out_tokens: u64,
@@ -157,24 +193,15 @@ pub enum ControllerEvent {
 
 // Serialize/Deserialize: the client→core half of the wire protocol, carried
 // inside `wire::ClientFrame::Command`. The broker maps these to loop actions or
-// terminates them locally (PermissionResponse).
+// terminates them locally (PermissionResponse / a gated Quit).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum UiEvent {
     UserMessage { text: String },
-    // Switch the API model. Applied at the next turn boundary — requests
-    // already in flight finish on the old model.
-    SetModel { model: String },
-    // Rename the session. `name: Some` is the explicit name; `None` asks the loop
-    // to derive one (git branch + short id in a repo, else an LLM-suggested
-    // summary). Handled at a turn boundary, where it persists the label and
-    // re-emits SessionInfo so every controller's header updates.
-    RenameSession { name: Option<String> },
-    // Connect a dormant MCP server by name (from the built-in catalog).
-    LoadServer { name: String },
-    // Disconnect a previously-loaded dormant server by name.
-    UnloadServer { name: String },
-    // Report loaded + available-dormant servers back as a Notice.
-    ListServers,
+    // A raw slash-command line (`/model …`, `/session-rename …`, `/mcp …`). The
+    // loop parses and executes it server-side; results return as Notice/SessionInfo/
+    // Capabilities events. One surface for every client — the grammar lives in one
+    // place (`core::agent::command`), not re-implemented per front-end.
+    Command { line: String },
     // Answer to a ControllerEvent::PermissionRequest, correlated by tool_use_id.
     // The broker holds the loop's oneshot Sender and fulfils it; this never
     // reaches the loop.

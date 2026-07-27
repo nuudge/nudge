@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::cli::Cli;
-use crate::models::{DEFAULT_MODEL, MODELS, owned_models};
+use crate::models::DEFAULT_MODEL;
 use crate::run::local_identity;
 use crate::transport;
 use crate::tui;
@@ -25,9 +25,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,
         user_name: who.name.clone(),
-        // A guest has no local API key to fetch a fresh list with; the daemon
-        // (the owner process) is the one that talks to the provider.
-        models: owned_models(MODELS),
+        // A guest renders its model picker from the daemon's Capabilities event
+        // (replayed first on attach), not a compiled-in list — so it shows the
+        // daemon's real models. Empty until that arrives.
+        models: Vec::new(),
     };
     // Use each client's `connect` rather than the silent `SessionHandle::attach` for
     // this first attach: it runs before the TUI owns the screen, so a connection
