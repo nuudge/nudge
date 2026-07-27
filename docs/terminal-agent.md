@@ -68,14 +68,34 @@ The `--daemon` / `--connect` / `--pair-code` flags are about detaching and remot
 
 ## TUI controls
 
+Message input (readline-style editing):
+
 | Key | Action |
 |---|---|
 | `Enter` | send message |
-| `Alt+Enter` / `Ctrl+Enter` / trailing `\` + `Enter` | insert newline (paste keeps newlines) |
+| `Alt+Enter` / `Ctrl+Enter` / `Ctrl-J` / trailing `\` + `Enter` | insert newline (paste keeps newlines) |
+| `←` `→` | move cursor one character |
+| `↑` `↓` | move cursor one display row (follows wrapped lines; the input box scrolls to keep the cursor visible) |
+| `Ctrl-A` / `Ctrl-E` | jump to start / end of line |
+| `Ctrl-U` | delete from cursor to start of line |
+| `Ctrl-K` | delete from cursor to end of line |
+| `Ctrl-W` | delete the previous word |
+
+Everything else:
+
+| Key | Action |
+|---|---|
 | `Ctrl-O` | expand / collapse tool results and thinking |
-| mouse wheel / `PgUp` `PgDn` / `Home` `End` | scroll / jump / resume tail-follow |
-| `y` / `n` / `Esc` | answer permission prompt |
+| mouse wheel / `PgUp` `PgDn` / `Home` `End` | scroll the log / jump / resume tail-follow |
+| `y` / `n` / `Esc` | answer permission prompt (`↑` `↓` `PgUp` `PgDn` scroll its detail popup) |
+| `↑` `↓` then `Enter` / `Esc` | choose / cancel in the model picker (`/model`) |
+| `Enter` (while backgrounded) | return to the foreground |
 | `Ctrl-C` (or `Ctrl-D` on empty input) | quit |
+
+> **tmux users**: plugins that bind `C-h/j/k/l` for pane navigation (e.g.
+> vim-tmux-navigator) intercept `Ctrl-J`/`Ctrl-K` before nudge sees them. Add `nudge` to
+> the plugin's pass-through pattern, e.g.
+> `set -g @vim_navigator_pattern '(\S+/)?g?\.?(view|l?n?vim?x?|fzf|nudge)(diff)?(-wrapped)?'`.
 
 ## Slash commands
 

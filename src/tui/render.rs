@@ -240,7 +240,13 @@ impl App {
         let total_input_lines = input_rows.len();
         let visible_input_lines = total_input_lines.clamp(1, MAX_INPUT_LINES);
         let input_height = (visible_input_lines as u16) + 2;
-        let input_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES) as u16;
+        // Scroll follows the cursor: keep it on the last visible row when below the
+        // window, never past the end. Typing at the end still bottom-pins as before.
+        let max_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES);
+        let input_scroll = cursor_row
+            .saturating_sub(MAX_INPUT_LINES - 1)
+            .min(max_scroll) as u16;
+        self.input_view_width = input_inner_width;
 
         // Once the relay connects, /background swaps the input box for the QR panel; the
         // log shrinks (Min(0)) rather than being taken over. Else a short banner.
@@ -380,7 +386,7 @@ impl App {
                 .scroll((input_scroll, 0))
                 .block(
                     Block::default().borders(Borders::ALL).title(
-                        "message (Enter=send · Alt+Enter or \\<Enter>=newline · Ctrl-O=expand · /background · Ctrl-C=quit)",
+                        "message (Enter=send · Alt+Enter or \\<Enter>=newline · Ctrl-U/K/W=delete · Ctrl-O=expand · /background · Ctrl-C=quit)",
                     ),
                 );
             f.render_widget(input, input_area);
