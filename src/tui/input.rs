@@ -45,6 +45,48 @@ impl App {
         self.cursor = 0;
     }
 
+    // Byte offset for an arbitrary char index; clamps to the end so it can't panic.
+    fn byte_at(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
+    }
+
+    // Remove chars [start, end) and leave the cursor at start.
+    fn delete_chars(&mut self, start: usize, end: usize) {
+        let range = self.byte_at(start)..self.byte_at(end);
+        self.input.replace_range(range, "");
+        self.cursor = start;
+    }
+
+    // Char index of the previous word's start: skip trailing whitespace, then the
+    // word itself (readline Ctrl-W semantics).
+    fn prev_word_start(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().take(self.cursor).collect();
+        let mut i = chars.len();
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    // Move the cursor one wrapped display row up/down, keeping the column where
+    // possible (clamped to the target row's length).
+    fn move_cursor_row(&mut self, delta: isize) {
+        let width = self.input_view_width.max(1);
+        let (rows, row, col) = wrap_input(&self.input, self.cursor, width);
+        let target = row as isize + delta;
+        if target < 0 || target as usize >= rows.len() {
+            return;
+        }
+        self.cursor = char_index_at(&self.input, target as usize, col, width);
+    }
+
     // Char index of the cursor's line start (powers Ctrl-A).
     fn line_start(&self) -> usize {
         let mut start = 0;
@@ -205,6 +247,17 @@ impl App {
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor = self.line_end();
             }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_chars(self.line_start(), self.cursor);
+            }
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_chars(self.cursor, self.line_end());
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_chars(self.prev_word_start(), self.cursor);
+            }
+            KeyCode::Up => self.move_cursor_row(-1),
+            KeyCode::Down => self.move_cursor_row(1),
             KeyCode::Left => {
                 self.cursor = self.cursor.saturating_sub(1);
             }
@@ -374,6 +427,26 @@ pub(super) fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<Strin
     (rows, cursor_row, cursor_col)
 }
 
+// Inverse of wrap_input's cursor mapping: char index for a (display row, col),
+// using the same char-wrap. col is clamped to the row's length.
+fn char_index_at(input: &str, row: usize, col: usize, width: usize) -> usize {
+    let width = width.max(1);
+    let mut char_pos = 0;
+    let mut first_row = 0;
+    for logical in input.split('\n') {
+        let len = logical.chars().count();
+        let line_rows = if len == 0 { 1 } else { len.div_ceil(width) };
+        if row < first_row + line_rows {
+            let row_start = (row - first_row) * width;
+            let row_len = (len - row_start).min(width);
+            return char_pos + row_start + col.min(row_len);
+        }
+        first_row += line_rows;
+        char_pos += len + 1; // line chars plus the '\n' separator
+    }
+    input.chars().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::app::UiConfig;
@@ -410,5 +483,86 @@ mod tests {
             assert!(app.quit);
             assert!(matches!(rx.try_recv(), Ok(UiEvent::Quit)));
         }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn app_with_input(text: &str, cursor: usize, width: usize) -> App {
+        let mut app = test_app();
+        app.input = text.into();
+        app.cursor = cursor;
+        app.input_view_width = width;
+        app
+    }
+
+    #[tokio::test]
+    async fn up_down_move_across_logical_lines() {
+        let mut app = app_with_input("abc\ndef", 5, 80);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(press(KeyCode::Up), &tx);
+        assert_eq!(app.cursor, 1);
+        app.handle_key(press(KeyCode::Down), &tx);
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn up_down_move_across_wrapped_rows() {
+        // width 4 wraps "abcdefghij" into "abcd" / "efgh" / "ij"
+        let mut app = app_with_input("abcdefghij", 9, 4);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(press(KeyCode::Up), &tx);
+        assert_eq!(app.cursor, 5);
+        app.handle_key(press(KeyCode::Up), &tx);
+        assert_eq!(app.cursor, 1);
+        app.handle_key(press(KeyCode::Down), &tx);
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn down_clamps_to_short_row() {
+        let mut app = app_with_input("abcdefghij", 7, 4);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(press(KeyCode::Down), &tx);
+        assert_eq!(app.cursor, 10);
+    }
+
+    #[tokio::test]
+    async fn up_at_top_and_down_at_bottom_are_noops() {
+        let mut app = app_with_input("abc\ndef", 1, 80);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(press(KeyCode::Up), &tx);
+        assert_eq!(app.cursor, 1);
+        app.cursor = 5;
+        app.handle_key(press(KeyCode::Down), &tx);
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn ctrl_u_deletes_to_line_start() {
+        let mut app = app_with_input("ab\ncdef", 5, 80);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(ctrl('u'), &tx);
+        assert_eq!(app.input, "ab\nef");
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn ctrl_k_deletes_to_line_end() {
+        let mut app = app_with_input("hello world\nnext", 5, 80);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(ctrl('k'), &tx);
+        assert_eq!(app.input, "hello\nnext");
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[tokio::test]
+    async fn ctrl_w_deletes_previous_word() {
+        let mut app = app_with_input("hello world ", 12, 80);
+        let (tx, _rx) = mpsc::channel(4);
+        app.handle_key(ctrl('w'), &tx);
+        assert_eq!(app.input, "hello ");
+        assert_eq!(app.cursor, 6);
     }
 }

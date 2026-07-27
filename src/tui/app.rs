@@ -56,6 +56,8 @@ pub(super) struct App {
     pub(super) input: String,
     // Char index (not byte); all edits go through the cursor helpers to stay in sync.
     pub(super) cursor: usize,
+    // Input-box wrap width from the last render; Up/Down need it to map wrapped rows.
+    pub(super) input_view_width: usize,
     // Empty = idle; non-empty drives the spinner.
     pub(super) status: String,
     pub(super) session_id: String,
@@ -112,6 +114,7 @@ impl App {
             log: Vec::new(),
             input: String::new(),
             cursor: 0,
+            input_view_width: 0,
             status: String::new(),
             session_id: cfg.session_id,
             session_name: cfg.session_name,
