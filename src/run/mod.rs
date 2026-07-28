@@ -158,7 +158,7 @@ pub async fn host(cli: Cli) -> Result<()> {
     let relay = config.relay;
 
     if cli.daemon {
-        daemon::run(host, cli.socket, relay).await
+        daemon::run(host, cli.socket, relay, cli.watch).await
     } else {
         local::run(host, ui_cfg, who, relay).await
     }

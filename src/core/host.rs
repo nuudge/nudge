@@ -437,12 +437,14 @@ fn project(profile: &ClientProfile, ev: &ControllerEvent) -> Option<ControllerEv
 }
 
 // Broker-boundary authority policy: whether a controller with this profile may issue a
-// verb. Kept minimal — only the verbs that exist today. `Quit` ends the session and
-// `Command` runs a slash-command; a client without the right (a peer agent) can do
-// neither. `commands` is a scope so a future watch-only human is one `Only([...])` away.
+// verb. Kept minimal — only the verbs that exist today. `UserMessage` drives a turn,
+// `Command` runs a slash-command, `Quit` ends the session; a client without the right
+// (a watch-only spectator, a peer agent) is refused. `commands` is a scope so a future
+// partly-restricted client is one `Only([...])` away.
 fn verb_allowed(profile: &ClientProfile, ev: &UiEvent) -> bool {
     match ev {
         UiEvent::Quit => profile.may_quit,
+        UiEvent::UserMessage { .. } => profile.may_drive,
         UiEvent::Command { .. } => matches!(profile.commands, CommandScope::All),
         _ => true,
     }
@@ -583,17 +585,30 @@ async fn broker(
                     // Both the loop forward and the echo carry the sending
                     // controller's registry identity — stamped here, never claimed by
                     // the client — so the loop can attribute a peer's message and the
-                    // shared transcript shows who said what.
+                    // shared transcript shows who said what. Gated by profile.may_drive:
+                    // a watch-only client is refused with a direct Notice, and its
+                    // message is neither forwarded to the loop nor echoed to anyone.
                     Some(UiEvent::UserMessage { text }) => {
-                        let who = attached.get(&id).map(|c| c.who.clone());
-                        let sender = who
-                            .as_ref()
-                            .map(|w| w.name.clone())
-                            .unwrap_or_default();
-                        let _ = loop_ui_tx.send((who, UiEvent::UserMessage { text: text.clone() })).await;
-                        let echo = ControllerEvent::UserMessage { text, sender };
-                        buffer.push(echo.clone());
-                        fan_out(&mut attached, &echo);
+                        let allowed = attached
+                            .get(&id)
+                            .map(|c| verb_allowed(&c.profile, &UiEvent::UserMessage { text: text.clone() }))
+                            .unwrap_or(false);
+                        if !allowed {
+                            if let Some(c) = attached.get(&id) {
+                                let _ = c.event_tx.send(ControllerEvent::Notice {
+                                    text: "this client is watch-only and cannot send messages".into(),
+                                });
+                            }
+                        } else {
+                            let who = attached.get(&id).map(|c| c.who.clone());
+                            let sender = who.as_ref().map(|w| w.name.clone()).unwrap_or_default();
+                            let _ = loop_ui_tx
+                                .send((who, UiEvent::UserMessage { text: text.clone() }))
+                                .await;
+                            let echo = ControllerEvent::UserMessage { text, sender };
+                            buffer.push(echo.clone());
+                            fan_out(&mut attached, &echo);
+                        }
                     }
                     // End the session — gated by broker policy (profile.may_quit). A
                     // refused Quit gets a direct Notice back to just that controller
@@ -1038,6 +1053,49 @@ mod tests {
         match loop_ui_rx.recv().await {
             Some((_, UiEvent::Command { line })) => assert_eq!(line, "/mcp"),
             other => panic!("loop expected human Command, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A watch-only client cannot drive: its UserMessage is refused with a Notice, never
+    // forwarded to the loop and never echoed to anyone. Its observe stream still receives
+    // another (driving) client's turn — watch-only means spectate, not silence.
+    #[tokio::test]
+    async fn watch_only_cannot_send_messages_but_still_observes() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut watcher, w_ui) = try_attach_with(&ctl_tx, ClientProfile::watch_only()).await;
+        let (_driver, d_ui) = try_attach(&ctl_tx).await;
+
+        // The watcher tries to drive: refused with a Notice, nothing forwarded.
+        w_ui.send(UiEvent::UserMessage {
+            text: "let me steer".into(),
+        })
+        .await
+        .unwrap();
+        match watcher.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("watch-only")),
+            other => panic!("watcher expected refusal Notice, got {other:?}"),
+        }
+
+        // A real driver's message IS forwarded and echoed — and the watcher observes it.
+        d_ui.send(UiEvent::UserMessage { text: "go".into() })
+            .await
+            .unwrap();
+        match loop_ui_rx.recv().await {
+            Some((_, UiEvent::UserMessage { text })) => assert_eq!(text, "go"),
+            other => panic!("loop expected the driver's message, got {other:?}"),
+        }
+        // The next thing the watcher sees is the driver's echoed turn, not its own
+        // (refused) message — proving observe survives while drive is gated.
+        match watcher.recv().await {
+            Some(ControllerEvent::UserMessage { text, .. }) => assert_eq!(text, "go"),
+            other => panic!("watcher expected to observe the driver's turn, got {other:?}"),
         }
 
         ctl_tx.send(HostCommand::Quit).unwrap();

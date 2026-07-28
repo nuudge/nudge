@@ -11,7 +11,7 @@ use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
 };
-use crate::core::{BrokerHandle, HandoffStatus, SessionHandle, UiEvent};
+use crate::core::{BrokerHandle, ClientProfile, HandoffStatus, SessionHandle, UiEvent};
 
 // How one client connection ended — decides what the accept loop does next.
 enum ConnOutcome {
@@ -91,19 +91,35 @@ pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHan
     Ok(())
 }
 
+// One relay leg the daemon parks: a room (dial URL) + its E2E key + the profile every
+// client arriving through it is attached with. Full and watch-only are separate rooms,
+// so the profile follows the room — the client can't move between them.
+pub struct RelayLeg {
+    pub dial_url: String,
+    pub cipher: Cipher,
+    pub profile: ClientProfile,
+}
+
 // Headless daemon hosting the session over the relay (the `--daemon --relay`
 // process). Unlike the Unix daemon it does not listen — it dials OUT to the relay
 // (the only direction that crosses NAT) as this session's single host, parking one
-// spare connection and opening one more per attached client (see `relay_dial_loop`).
-// A controller's Quit is just a detach; the session ends only when this daemon
-// process is stopped, which the caller turns into a graceful host shutdown.
-pub async fn run_relay_daemon(
-    relay_url: String,
-    cipher: Cipher,
-    broker: BrokerHandle,
-) -> Result<()> {
-    eprintln!("[daemon] hosting over relay at {relay_url}");
-    relay_dial_loop(relay_url, cipher, broker, None).await;
+// spare connection per leg and opening one more per attached client (see
+// `relay_dial_loop`). A controller's Quit is just a detach; the session ends only when
+// this daemon process is stopped, which the caller turns into a graceful host shutdown.
+// Usually one leg (a full-rights code); with a watch-only code minted too, two legs run
+// concurrently, each parking its own spare so either code pairs immediately.
+pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Result<()> {
+    let mut tasks = Vec::new();
+    for leg in legs {
+        eprintln!("[daemon] hosting over relay at {}", leg.dial_url);
+        let broker = broker.clone();
+        tasks.push(tokio::spawn(async move {
+            relay_dial_loop(leg.dial_url, leg.cipher, broker, None, leg.profile).await;
+        }));
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
     Ok(())
 }
 
@@ -111,14 +127,22 @@ pub async fn run_relay_daemon(
 // arm phone pairing. It shares the process with the local TUI, so it never writes
 // stderr — instead it reports progress over `status`, which the TUI renders on the
 // background pair screen. The session is never ended by this loop, only by the local
-// owner quitting (which tears the process down).
+// owner quitting (which tears the process down). The co-located handoff is always a
+// full-rights pairing (your own phone), so it attaches with `ClientProfile::human()`.
 pub async fn serve_relay_handoff(
     relay_url: String,
     cipher: Cipher,
     broker: BrokerHandle,
     status: mpsc::Sender<HandoffStatus>,
 ) {
-    relay_dial_loop(relay_url, cipher, broker, Some(status)).await;
+    relay_dial_loop(
+        relay_url,
+        cipher,
+        broker,
+        Some(status),
+        ClientProfile::human(),
+    )
+    .await;
 }
 
 // Keep one spare host connection parked on the relay at all times. Each iteration
@@ -140,6 +164,7 @@ async fn relay_dial_loop(
     cipher: Cipher,
     broker: BrokerHandle,
     status: Option<mpsc::Sender<HandoffStatus>>,
+    profile: ClientProfile,
 ) {
     let mut announced = false;
     loop {
@@ -169,8 +194,12 @@ async fn relay_dial_loop(
                 // recv_attach yields None and we just loop to re-dial.
                 if let Some((after_seq, who)) = recv_attach(&mut reader).await {
                     let broker = broker.clone();
+                    // Every client through this leg is attached with the leg's profile —
+                    // the rights are the room's, minted by the daemon, never presented by
+                    // the client (which only sends its identity in the Attach frame).
+                    let profile = profile.clone();
                     tokio::spawn(async move {
-                        bridge(reader, writer, &broker, after_seq, who).await;
+                        bridge(reader, writer, &broker, after_seq, who, Some(profile)).await;
                     });
                 }
             }
@@ -216,26 +245,35 @@ where
     W: FrameWriter<ServerFrame>,
 {
     match recv_attach(&mut reader).await {
-        Some((after_seq, who)) => bridge(reader, writer, broker, after_seq, who).await,
+        // The Unix debug host keeps the interim kind-derived profile (None): it's a
+        // localhost debugging transport, not the relay leg this phase hardens.
+        Some((after_seq, who)) => bridge(reader, writer, broker, after_seq, who, None).await,
         None => ConnOutcome::Disconnected,
     }
 }
 
 // Bridge one attached client to the broker: register the controller, stream its
 // replay+live events out, and forward its commands in, until it leaves. `after_seq`
-// and `who` come from the already-read Attach frame.
+// and `who` come from the already-read Attach frame. `profile` is the rights the accept
+// path assigns by provenance: `Some(p)` from a relay leg (the pairing decides), `None`
+// on the Unix debug host (falls back to the kind-derived interim in `attach`).
 async fn bridge<R, W>(
     mut reader: R,
     mut writer: W,
     broker: &BrokerHandle,
     after_seq: Option<u64>,
     who: crate::core::ClientIdentity,
+    profile: Option<ClientProfile>,
 ) -> ConnOutcome
 where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
-    let controller = match broker.attach(who).await {
+    let attached = match profile {
+        Some(profile) => broker.attach_as(who, profile).await,
+        None => broker.attach(who).await,
+    };
+    let controller = match attached {
         Some(c) => c,
         None => {
             // There is no single-attach lock — attach fails only if the broker is
