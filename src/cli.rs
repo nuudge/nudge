@@ -70,4 +70,9 @@ pub struct Cli {
         conflicts_with = "socket"
     )]
     pub pair_code: Option<String>,
+
+    /// (--daemon, relay) Also mint a watch-only pairing code: a second QR whose holder
+    /// observes the session but cannot drive it, run commands, answer prompts, or quit.
+    #[arg(long, requires = "daemon", conflicts_with = "socket")]
+    pub watch: bool,
 }

@@ -13,10 +13,10 @@ use tokio::time::timeout;
 
 use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
-use super::{RelayClient, SocketClient, bind_listener, run_daemon, run_relay_daemon};
+use super::{RelayClient, RelayLeg, SocketClient, bind_listener, run_daemon, run_relay_daemon};
 use crate::core::host::spawn_bare_broker;
 use crate::core::{
-    AgentEvent, ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent,
+    AgentEvent, ClientIdentity, ClientProfile, Controller, ControllerEvent, SessionHandle, UiEvent,
 };
 
 // A collision-free socket path under the system temp dir. The name is kept short
@@ -173,8 +173,11 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
     let cipher = Cipher::generate();
     let bb = spawn_bare_broker(Vec::new());
     let daemon = tokio::spawn(run_relay_daemon(
-        url.clone(),
-        cipher.clone(),
+        vec![RelayLeg {
+            dial_url: url.clone(),
+            cipher: cipher.clone(),
+            profile: ClientProfile::human(),
+        }],
         bb.handle.clone(),
     ));
 
@@ -276,8 +279,11 @@ async fn relay_sees_only_ciphertext() {
 
     let bb = spawn_bare_broker(Vec::new());
     let daemon = tokio::spawn(run_relay_daemon(
-        url.clone(),
-        cipher.clone(),
+        vec![RelayLeg {
+            dial_url: url.clone(),
+            cipher: cipher.clone(),
+            profile: ClientProfile::human(),
+        }],
         bb.handle.clone(),
     ));
 
@@ -442,8 +448,11 @@ async fn relay_two_clients_attach_concurrently() {
     let cipher = Cipher::generate();
     let bb = spawn_bare_broker(Vec::new());
     let daemon = tokio::spawn(run_relay_daemon(
-        host_url,
-        cipher.clone(),
+        vec![RelayLeg {
+            dial_url: host_url,
+            cipher: cipher.clone(),
+            profile: ClientProfile::human(),
+        }],
         bb.handle.clone(),
     ));
 

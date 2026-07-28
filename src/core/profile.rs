@@ -17,10 +17,13 @@ pub enum CommandScope {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientProfile {
     // May end the session (UiEvent::Quit).
     pub may_quit: bool,
+    // May drive the agent — send a UserMessage that folds into context and triggers a
+    // turn. False for a watch-only client, which observes but cannot steer or spend.
+    pub may_drive: bool,
     // Which slash-commands (UiEvent::Command) the broker forwards to the loop, and
     // which appear in this client's Capabilities.
     pub commands: CommandScope,
@@ -37,6 +40,7 @@ impl ClientProfile {
     pub fn human() -> Self {
         Self {
             may_quit: true,
+            may_drive: true,
             commands: CommandScope::All,
             receives_supervision: true,
             may_answer_permissions: true,
@@ -51,6 +55,7 @@ impl ClientProfile {
     pub fn agent_peer() -> Self {
         Self {
             may_quit: false,
+            may_drive: true,
             commands: CommandScope::None,
             receives_supervision: false,
             may_answer_permissions: false,
@@ -65,6 +70,20 @@ impl ClientProfile {
         Self {
             may_answer_permissions: true,
             ..Self::agent_peer()
+        }
+    }
+
+    // A watch-only client (a teammate's restricted pairing): it observes everything —
+    // full transcript, supervision chatter, permission prompts — but cannot drive a turn,
+    // run a command, answer a prompt, or quit. Pure spectator. Assigned by provenance (a
+    // watch-scoped pairing), never claimed.
+    pub fn watch_only() -> Self {
+        Self {
+            may_quit: false,
+            may_drive: false,
+            commands: CommandScope::None,
+            receives_supervision: true,
+            may_answer_permissions: false,
         }
     }
 }

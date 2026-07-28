@@ -16,8 +16,8 @@ pub mod pairing;
 pub mod wire;
 
 pub use client::{RelayClient, SocketClient};
-pub use daemon::{bind_listener, run_daemon, run_relay_daemon, serve_relay_handoff};
-pub use pairing::Pairing;
+pub use daemon::{RelayLeg, bind_listener, run_daemon, run_relay_daemon, serve_relay_handoff};
+pub use pairing::{Pairing, PairingScope};
 
 #[cfg(test)]
 mod tests;
