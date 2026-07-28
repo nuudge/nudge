@@ -876,6 +876,24 @@ async fn peer_message_is_attributed_in_the_transcript() {
         other => panic!("expected the attributed user turn, got {other:?}"),
     }
 
+    // The log stores the other half of the invariant: clean text + the sender,
+    // so resume can re-derive exactly the attributed form the provider saw.
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .expect("session log written");
+    let first = std::fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let envelope: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(envelope["message"]["content"][0]["text"], "task done");
+    assert_eq!(envelope["sender"]["name"], "child-1");
+
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
@@ -1253,4 +1271,49 @@ async fn spawn_denial_does_not_run_the_factory() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// resume_messages derives attribution at build time from each entry's persisted
+// sender: an agent sender gets the `[message from peer …]` prefix, a human stays
+// bare, and a pre-sender entry (None — its text may carry an already-baked prefix)
+// passes through untouched.
+#[test]
+fn resume_messages_applies_attribution_from_persisted_sender() {
+    use crate::core::session::LoggedMessage;
+
+    let user = |text: &str| Message {
+        role: "user".into(),
+        content: vec![ContentBlock::Text { text: text.into() }],
+    };
+    let entries = vec![
+        LoggedMessage {
+            message: user("do it"),
+            sender: Some(ClientIdentity {
+                kind: ClientKind::Agent,
+                name: "child-x".into(),
+                session_id: None,
+                task: None,
+            }),
+        },
+        LoggedMessage {
+            message: user("hello"),
+            sender: Some(ClientIdentity::human("alice")),
+        },
+        LoggedMessage {
+            message: user("[message from peer old]\nlegacy"),
+            sender: None,
+        },
+    ];
+
+    let msgs = super::resume_messages(&entries);
+    let texts: Vec<&str> = msgs
+        .iter()
+        .map(|m| match &m.content[0] {
+            ContentBlock::Text { text } => text.as_str(),
+            other => panic!("expected text block, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts[0], "[message from peer child-x]\ndo it");
+    assert_eq!(texts[1], "hello");
+    assert_eq!(texts[2], "[message from peer old]\nlegacy");
 }

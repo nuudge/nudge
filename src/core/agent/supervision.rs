@@ -18,13 +18,25 @@ pub(super) async fn recv_registration(
 // Fold the broker-stamped sender into the text that enters the transcript: an agent
 // peer's message is named, so the model knows which peer spoke; a human's message
 // stays bare, exactly as it always has. Keep the prefix format stable — the model
-// learns to reference it.
+// learns to reference it. Applied at payload-build time (live arrival and resume
+// rebuild); the session log stores the clean text plus the sender (see
+// `session::LoggedMessage`).
 pub(super) fn attribute(who: Option<&ClientIdentity>, text: String) -> String {
     match who {
         Some(w) if w.kind == ClientKind::Agent => {
             format!("[message from peer {}]\n{text}", w.name)
         }
         _ => text,
+    }
+}
+
+// Apply `attribute` to a logged user message's typed text blocks (tool_result
+// blocks are untouched) — the model-facing form of a clean logged entry.
+pub(super) fn attribute_message(who: Option<&ClientIdentity>, msg: &mut crate::llm::Message) {
+    for block in &mut msg.content {
+        if let crate::llm::ContentBlock::Text { text } = block {
+            *text = attribute(who, std::mem::take(text));
+        }
     }
 }
 
