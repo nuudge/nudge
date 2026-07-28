@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use crate::coding;
-use crate::core::{self, AgentConfig, ClientIdentity, ClientKind, SessionHandle};
+use crate::core::{self, AgentConfig, ClientIdentity, ClientKind};
 use crate::llm;
 use crate::models::DEFAULT_MODEL;
 use crate::run::{MAX_ITERATIONS, MAX_TOKENS};
@@ -76,9 +76,11 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
             // Return edge (child → parent), seeded into the child's PeerSet at spawn
             // (not raced through a runtime registration), so the child can address
             // its spawner via MessagePeer from its very first turn. The child is the
-            // attacher here, so it announces child_who.
+            // attacher here, so it announces child_who — and gets a bare agent_peer
+            // profile on the parent's broker: it may drive/observe the parent but may
+            // NOT answer the parent's permission prompts (that's the human's/parent's).
             let parent_ctrl = parent
-                .attach(child_who.clone())
+                .attach_as(child_who.clone(), core::ClientProfile::agent_peer())
                 .await
                 .context("child could not attach back to its spawner")?;
             let mut child_peers = core::peer::PeerSet::default();
@@ -100,9 +102,11 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
 
             // Spawner's edge (parent → child): the parent is the attacher, so it
             // announces parent_who; then it kicks the child with the task. Events
-            // buffer until the spawner's loop drains them.
+            // buffer until the spawner's loop drains them. It gets a supervisor profile
+            // on the child's broker — the one edge allowed to answer the child's
+            // permission check-ins (steering.rs drives the verdict down this edge).
             let child_ctrl = child
-                .attach(parent_who.clone())
+                .attach_as(parent_who.clone(), core::ClientProfile::supervisor())
                 .await
                 .context("could not attach to the spawned child")?;
             let _ = child_ctrl

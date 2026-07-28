@@ -8,6 +8,7 @@ use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::{ClientIdentity, ClientKind};
 use super::peer::PeerWiring;
+use super::profile::{ClientProfile, CommandScope};
 use super::session::Session;
 use crate::llm::{Message, Provider};
 
@@ -74,8 +75,12 @@ struct ControllerChannels {
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
     // The attaching party's announced identity. Recorded at attach and read when the
     // broker stamps this controller's messages, so a shared session attributes each
-    // turn to a named party.
+    // turn to a named party. Attribution only — never rights (see `profile`).
     who: ClientIdentity,
+    // The attaching party's rights, assigned by provenance at attach (never claimed by
+    // the client). Read by the broker's routing (`deliver_to`) and verb gating
+    // (`verb_allowed`); the loop never sees it.
+    profile: ClientProfile,
 }
 
 // Control messages from `SessionHost`'s methods to the broker task.
@@ -88,6 +93,7 @@ enum HostCommand {
         ui_rx: mpsc::Receiver<UiEvent>,
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
         who: ClientIdentity,
+        profile: ClientProfile,
         ack: oneshot::Sender<bool>,
     },
     // End the session: the broker forwards a final UiEvent::Quit to the loop.
@@ -208,6 +214,18 @@ impl SessionHost {
         let _ = self.broker_task.await;
         loop_result
     }
+    // Attach with an explicit profile, assigned by whoever knows the provenance of the
+    // edge (e.g. `spawn.rs` gives a spawned child's supervisor edge a supervisor
+    // profile). `SessionHandle::attach` is the identity-only door that derives an
+    // interim profile from `who.kind`; this is the door for callers that assign rights
+    // directly.
+    pub async fn attach_as(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
+        self.broker_handle().attach_as(who, profile).await
+    }
 }
 
 impl SessionHandle for SessionHost {
@@ -245,12 +263,16 @@ impl BrokerHandle {
         !self.ctl_tx.is_closed()
     }
 
-    // Shared body of attach / attach_force. The event stream is unbounded so the
-    // broker's fan-out never blocks on this controller; the ui channel stays
+    // Shared body of attach / attach_force / attach_as. The event stream is unbounded
+    // so the broker's fan-out never blocks on this controller; the ui channel stays
     // bounded (this direction is one controller → the broker, so local backpressure
     // on a flooding sender is the right behaviour). `who` is the attaching party's
-    // identity, recorded by the broker.
-    async fn attach_inner(&self, who: ClientIdentity) -> Option<Controller> {
+    // identity and `profile` its rights, both recorded by the broker.
+    async fn attach_inner(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -260,6 +282,7 @@ impl BrokerHandle {
                 ui_rx,
                 event_tx,
                 who,
+                profile,
                 ack: ack_tx,
             })
             .is_err()
@@ -274,6 +297,28 @@ impl BrokerHandle {
             _ => None, // broker gone
         }
     }
+
+    // Attach with an explicit profile — the door for callers that assign rights by
+    // provenance rather than deriving them from the claimable `who.kind`.
+    pub async fn attach_as(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
+        self.attach_inner(who, profile).await
+    }
+}
+
+// The interim rights a client gets when it comes in through the identity-only
+// `SessionHandle::attach` door (a local TUI, or a remote client whose Attach frame the
+// daemon relays). Derived from the *claimed* `kind` — a known interim: it is a default,
+// never the thing a security decision depends on. Real provenance (a spawned edge's
+// direction; later, a pairing's baked-in scope) is assigned via `attach_as`.
+fn default_profile(who: &ClientIdentity) -> ClientProfile {
+    match who.kind {
+        ClientKind::Human => ClientProfile::human(),
+        ClientKind::Agent => ClientProfile::agent_peer(),
+    }
 }
 
 impl SessionHandle for BrokerHandle {
@@ -281,7 +326,8 @@ impl SessionHandle for BrokerHandle {
     // The controller's event stream begins with a replay of the full history, then
     // live events. `attach_force` uses the trait default (== `attach`).
     async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
-        self.attach_inner(who).await
+        let profile = default_profile(&who);
+        self.attach_inner(who, profile).await
     }
 
     // Detach is drop-based: a controller leaves by dropping its `Controller`, whose
@@ -366,38 +412,54 @@ fn translate(
     }
 }
 
-// Broker-boundary routing policy: whether one event should reach a controller of
-// this identity. Supervision chatter (`Notice`) is never delivered to an agent-kind
-// controller — under mutual attach an agent is a controller of its peer, so echoing
-// a Notice back would amplify into an unbounded `[peer a] [peer b] …` cascade. This
-// is the whole reason the loop can narrate peer activity without a special case.
-fn deliver_to(who: &ClientIdentity, ev: &ControllerEvent) -> bool {
-    !(who.kind == ClientKind::Agent && matches!(ev, ControllerEvent::Notice { .. }))
+// Adapt an event to a controller's profile before delivery. Supervision chatter
+// (`Notice`) is dropped for a client that doesn't receive it (a peer agent) — the
+// boundary that breaks the mutual-attach amplification cascade, so the loop can narrate
+// peer activity without a special case. A `Capabilities` event has its command list
+// emptied for a client with no command rights, so the menu a client is shown ("what I'm
+// told I can do") matches the verbs the broker will accept from it ("what I may do") and
+// the two cannot drift; `models`/`mcp` stay — they're render info, only `commands` is
+// rights-bearing. `None` = drop the event entirely.
+fn project(profile: &ClientProfile, ev: &ControllerEvent) -> Option<ControllerEvent> {
+    match ev {
+        ControllerEvent::Notice { .. } if !profile.receives_supervision => None,
+        ControllerEvent::Capabilities { models, mcp, .. }
+            if profile.commands == CommandScope::None =>
+        {
+            Some(ControllerEvent::Capabilities {
+                commands: Vec::new(),
+                models: models.clone(),
+                mcp: mcp.clone(),
+            })
+        }
+        _ => Some(ev.clone()),
+    }
 }
 
-// Broker-boundary authority policy: whether a controller of this identity may issue
-// a verb. Kept minimal — only the verbs that exist today. `Quit` ends the session,
-// so it's restricted to human clients; a peer agent can't tear down the session it
-// is a client of.
-fn verb_allowed(who: &ClientIdentity, ev: &UiEvent) -> bool {
+// Broker-boundary authority policy: whether a controller with this profile may issue a
+// verb. Kept minimal — only the verbs that exist today. `Quit` ends the session and
+// `Command` runs a slash-command; a client without the right (a peer agent) can do
+// neither. `commands` is a scope so a future watch-only human is one `Only([...])` away.
+fn verb_allowed(profile: &ClientProfile, ev: &UiEvent) -> bool {
     match ev {
-        UiEvent::Quit => who.kind == ClientKind::Human,
+        UiEvent::Quit => profile.may_quit,
+        UiEvent::Command { .. } => matches!(profile.commands, CommandScope::All),
         _ => true,
     }
 }
 
-// Send an event to every attached controller the routing policy admits, reaping any
-// whose receiver has dropped (an unbounded send only fails when the `Controller.events`
-// end is gone). The event channel is unbounded, so this never blocks the broker on a
-// slow consumer — one stalled controller can't hold up delivery to the others or the
-// loop.
+// Send an event to every attached controller, projected through each one's profile
+// (supervision Notices dropped, Capabilities command-lists emptied), reaping any whose
+// receiver has dropped (an unbounded send only fails when the `Controller.events` end is
+// gone). The event channel is unbounded, so this never blocks the broker on a slow
+// consumer — one stalled controller can't hold up delivery to the others or the loop.
 fn fan_out(attached: &mut HashMap<ControllerId, ControllerChannels>, ev: &ControllerEvent) {
     let mut dead: Vec<ControllerId> = Vec::new();
     for (id, c) in attached.iter() {
-        if !deliver_to(&c.who, ev) {
+        let Some(projected) = project(&c.profile, ev) else {
             continue;
-        }
-        if c.event_tx.send(ev.clone()).is_err() {
+        };
+        if c.event_tx.send(projected).is_err() {
             dead.push(*id);
         }
     }
@@ -452,23 +514,23 @@ async fn broker(
         tokio::select! {
             cmd = ctl_rx.recv() => {
                 match cmd {
-                    Some(HostCommand::Attach { ui_rx, event_tx, who, ack }) => {
+                    Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
                         // Replay the full history to this controller before any live
-                        // event, filtered by the same routing policy as live fan-out
-                        // (so an agent controller's replay omits supervision Notices
-                        // too). This handler has no await point, so no other arm can
-                        // interleave — replayed events strictly precede live ones for
-                        // this controller. Unbounded send only errors if the
-                        // controller already vanished (harmless — reaped on the next
-                        // poll / fan-out).
+                        // event, projected through its profile just like live fan-out
+                        // (so its replay drops supervision Notices and empties the
+                        // Capabilities command list identically). This handler has no
+                        // await point, so no other arm can interleave — replayed events
+                        // strictly precede live ones for this controller. Unbounded send
+                        // only errors if the controller already vanished (harmless —
+                        // reaped on the next poll / fan-out).
                         for ev in &buffer {
-                            if deliver_to(&who, ev) {
-                                let _ = event_tx.send(ev.clone());
+                            if let Some(projected) = project(&profile, ev) {
+                                let _ = event_tx.send(projected);
                             }
                         }
                         let id = next_id;
                         next_id += 1;
-                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who });
+                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who, profile });
                         let _ = ack.send(true);
                     }
                     // End the session: forward a final Quit to the loop and stop.
@@ -494,9 +556,22 @@ async fn broker(
                     // a resolution marker, fanned to all controllers so every UI
                     // clears its prompt. First responder wins — a second answer for
                     // the same id finds nothing in `pending` and no-ops. Never
-                    // forwarded to the loop.
+                    // forwarded to the loop. Gated by profile: a client that may not
+                    // answer (a bare peer agent — e.g. a child over its return edge) is
+                    // ignored with a direct Notice back to just it, so it cannot
+                    // rubber-stamp a gate via first-responder-wins.
                     Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
-                        if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
+                        let may_answer = attached
+                            .get(&id)
+                            .map(|c| c.profile.may_answer_permissions)
+                            .unwrap_or(false);
+                        if !may_answer {
+                            if let Some(c) = attached.get(&id) {
+                                let _ = c.event_tx.send(ControllerEvent::Notice {
+                                    text: "answering permission prompts is not permitted for this client".into(),
+                                });
+                            }
+                        } else if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
                             let _ = tx.send(allow);
                             let resolved = ControllerEvent::PermissionResolved { tool_name, allow };
                             buffer.push(resolved.clone());
@@ -520,30 +595,41 @@ async fn broker(
                         buffer.push(echo.clone());
                         fan_out(&mut attached, &echo);
                     }
-                    // End the session — gated to human clients by broker policy. A
+                    // End the session — gated by broker policy (profile.may_quit). A
                     // refused Quit gets a direct Notice back to just that controller
                     // (bypassing the fan-out policy, which would otherwise withhold a
                     // Notice from an agent), so the sender learns why nothing happened.
                     Some(UiEvent::Quit) => {
-                        let who = attached.get(&id).map(|c| c.who.clone());
-                        match &who {
-                            Some(w) if !verb_allowed(w, &UiEvent::Quit) => {
-                                if let Some(c) = attached.get(&id) {
-                                    let _ = c.event_tx.send(ControllerEvent::Notice {
-                                        text: "quit is not permitted for agent clients".into(),
-                                    });
-                                }
-                            }
-                            _ => {
-                                let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
-                            }
+                        let allowed = attached
+                            .get(&id)
+                            .map(|c| verb_allowed(&c.profile, &UiEvent::Quit))
+                            .unwrap_or(false);
+                        if allowed {
+                            let who = attached.get(&id).map(|c| c.who.clone());
+                            let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
+                        } else if let Some(c) = attached.get(&id) {
+                            let _ = c.event_tx.send(ControllerEvent::Notice {
+                                text: "quit is not permitted for agent clients".into(),
+                            });
                         }
                     }
-                    // A slash-command line: forward to the loop; its effects return as
-                    // Notice / SessionInfo / Capabilities events.
-                    Some(other) => {
-                        let who = attached.get(&id).map(|c| c.who.clone());
-                        let _ = loop_ui_tx.send((who, other)).await;
+                    // A slash-command line — gated by profile.commands. Allowed: forward
+                    // to the loop; its effects return as Notice / SessionInfo /
+                    // Capabilities events. Refused: a direct Notice back to just this
+                    // controller (same bypass as the refused Quit).
+                    Some(UiEvent::Command { line }) => {
+                        let allowed = attached
+                            .get(&id)
+                            .map(|c| verb_allowed(&c.profile, &UiEvent::Command { line: line.clone() }))
+                            .unwrap_or(false);
+                        if allowed {
+                            let who = attached.get(&id).map(|c| c.who.clone());
+                            let _ = loop_ui_tx.send((who, UiEvent::Command { line })).await;
+                        } else if let Some(c) = attached.get(&id) {
+                            let _ = c.event_tx.send(ControllerEvent::Notice {
+                                text: "commands are not permitted for this client".into(),
+                            });
+                        }
                     }
                     // This controller dropped its ui_tx (detach / quit) → reap it; the
                     // loop and any other controllers live on.
@@ -614,11 +700,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity::human(name);
+        let profile = default_profile(&who);
         ctl_tx
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                who: ClientIdentity::human(name),
+                who,
+                profile,
                 ack: ack_tx,
             })
             .unwrap();
@@ -643,16 +732,51 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (ui_tx, ui_rx) = mpsc::channel(16);
         let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity {
+            kind: ClientKind::Agent,
+            name: "peer".into(),
+            session_id: None,
+            task: None,
+        };
+        let profile = default_profile(&who);
         ctl_tx
             .send(HostCommand::Attach {
                 ui_rx,
                 event_tx,
-                who: ClientIdentity {
-                    kind: ClientKind::Agent,
-                    name: "peer".into(),
-                    session_id: None,
-                    task: None,
-                },
+                who,
+                profile,
+                ack: ack_tx,
+            })
+            .unwrap();
+        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        (event_rx, ui_tx)
+    }
+
+    // Attach an agent-kind controller with an explicit profile — for the permission
+    // gate tests, which need a bare peer vs. a supervisor edge (same kind, different
+    // rights, exactly the distinction ClientKind can't make).
+    async fn try_attach_with(
+        ctl_tx: &mpsc::UnboundedSender<HostCommand>,
+        profile: ClientProfile,
+    ) -> (
+        mpsc::UnboundedReceiver<ControllerEvent>,
+        mpsc::Sender<UiEvent>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let who = ClientIdentity {
+            kind: ClientKind::Agent,
+            name: "peer".into(),
+            session_id: None,
+            task: None,
+        };
+        ctl_tx
+            .send(HostCommand::Attach {
+                ui_rx,
+                event_tx,
+                who,
+                profile,
                 ack: ack_tx,
             })
             .unwrap();
@@ -724,6 +848,196 @@ mod tests {
         match loop_ui_rx.recv().await {
             Some((_, UiEvent::Quit)) => {}
             other => panic!("loop expected human Quit, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A bare peer agent (agent_peer profile, may_answer_permissions=false) cannot answer
+    // a permission prompt: its PermissionResponse doesn't fulfil the loop's oneshot and
+    // it gets a refusal Notice; a human's subsequent answer still wins. Closes the
+    // first-responder-wins hole where a child could rubber-stamp its parent's gate.
+    #[tokio::test]
+    async fn agent_peer_cannot_answer_permissions_but_human_can() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut agent, a_ui) = try_attach_with(&ctl_tx, ClientProfile::agent_peer()).await;
+        let (mut human, h_ui) = try_attach(&ctl_tx).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
+        loop_agent_tx
+            .send(AgentEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                respond: resp_tx,
+            })
+            .await
+            .unwrap();
+        // The human sees the prompt; the agent does not answer-gate on seeing it.
+        match human.recv().await {
+            Some(ControllerEvent::PermissionRequest { tool_use_id, .. }) => {
+                assert_eq!(tool_use_id, "t1")
+            }
+            other => panic!("human expected PermissionRequest, got {other:?}"),
+        }
+        let _ = agent.recv().await; // drain the agent's copy of the prompt
+
+        // The agent tries to approve: refused with a Notice, oneshot NOT fulfilled.
+        a_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        match agent.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("agent expected refusal Notice, got {other:?}"),
+        }
+
+        // The human's answer wins: the oneshot resolves and a resolution is fanned out.
+        h_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            resp_rx.await.unwrap(),
+            "human's answer must fulfil the oneshot"
+        );
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // The supervisor edge (agent kind, but may_answer_permissions=true) IS honored — this
+    // is the parent steering its child's gated calls (steering.rs drives the verdict down
+    // this edge), which must keep working alongside the gate above.
+    #[tokio::test]
+    async fn supervisor_can_answer_permissions() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut supervisor, s_ui) = try_attach_with(&ctl_tx, ClientProfile::supervisor()).await;
+
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
+        loop_agent_tx
+            .send(AgentEvent::PermissionRequest {
+                tool_use_id: "t1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                respond: resp_tx,
+            })
+            .await
+            .unwrap();
+        match supervisor.recv().await {
+            Some(ControllerEvent::PermissionRequest { .. }) => {}
+            other => panic!("supervisor expected PermissionRequest, got {other:?}"),
+        }
+
+        s_ui.send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+        assert!(
+            resp_rx.await.unwrap(),
+            "supervisor's answer must fulfil the oneshot"
+        );
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // The Capabilities command list is filtered per profile: a client with no command
+    // rights (a peer agent) sees empty `commands` while a human sees the full list;
+    // render info (models/mcp) is kept for both. Proven on replay from the seed buffer.
+    #[tokio::test]
+    async fn capabilities_command_list_is_filtered_by_profile() {
+        use crate::core::events::{CommandInfo, ModelInfo};
+
+        let seed = vec![ControllerEvent::Capabilities {
+            commands: vec![CommandInfo {
+                name: "/model".into(),
+                usage: "u".into(),
+            }],
+            models: vec![ModelInfo {
+                id: "id1".into(),
+                label: "L1".into(),
+            }],
+            mcp: Vec::new(),
+        }];
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, seed));
+
+        let (mut human, _h_ui) = try_attach(&ctl_tx).await;
+        let (mut agent, _a_ui) = try_attach_agent(&ctl_tx).await;
+
+        match human.recv().await {
+            Some(ControllerEvent::Capabilities {
+                commands, models, ..
+            }) => {
+                assert_eq!(commands.len(), 1, "human keeps the full command list");
+                assert_eq!(models.len(), 1);
+            }
+            other => panic!("human expected Capabilities, got {other:?}"),
+        }
+        match agent.recv().await {
+            Some(ControllerEvent::Capabilities {
+                commands, models, ..
+            }) => {
+                assert!(commands.is_empty(), "agent's command list is emptied");
+                assert_eq!(models.len(), 1, "render info (models) is kept");
+            }
+            other => panic!("agent expected Capabilities, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A slash-command from a client without command rights (a peer agent) is refused
+    // with a Notice and never reaches the loop; a human's command is forwarded.
+    #[tokio::test]
+    async fn commands_are_gated_by_profile() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+
+        let (mut agent, a_ui) = try_attach_agent(&ctl_tx).await;
+        let (_human, h_ui) = try_attach(&ctl_tx).await;
+
+        // Agent's command is refused with a Notice; the loop sees nothing.
+        a_ui.send(UiEvent::Command {
+            line: "/model x".into(),
+        })
+        .await
+        .unwrap();
+        match agent.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("agent expected refusal Notice, got {other:?}"),
+        }
+
+        // Human's command is forwarded to the loop.
+        h_ui.send(UiEvent::Command {
+            line: "/mcp".into(),
+        })
+        .await
+        .unwrap();
+        match loop_ui_rx.recv().await {
+            Some((_, UiEvent::Command { line })) => assert_eq!(line, "/mcp"),
+            other => panic!("loop expected human Command, got {other:?}"),
         }
 
         ctl_tx.send(HostCommand::Quit).unwrap();
