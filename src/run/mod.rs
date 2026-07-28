@@ -49,6 +49,8 @@ pub async fn host(cli: Cli) -> Result<()> {
         // Filled in the local branch when --relay arms remote pairing.
         pairing_qr: None,
         pairing_code: None,
+        pairing_qr_watch: None,
+        pairing_code_watch: None,
         // This process hosts the agent loop: it's the owner TUI (cosmetic badge only).
         is_owner: true,
         user_name: who.name.clone(),

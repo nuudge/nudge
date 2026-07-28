@@ -21,6 +21,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         // A --connect client never hosts a relay, so it shows no pairing QR.
         pairing_qr: None,
         pairing_code: None,
+        pairing_qr_watch: None,
+        pairing_code_watch: None,
         // A --connect client is a guest: it attaches to a daemon it doesn't host
         // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,

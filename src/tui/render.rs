@@ -173,14 +173,31 @@ impl App {
     // dark-on-light, so a light-on-dark terminal would otherwise invert it.
     fn pair_panel_body(&self, inner_width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
+        // Which of the two pairings is on screen: a full-access code confers full
+        // control, a watch-only code lets a teammate observe but not drive.
+        let (label, scan_hint) = if self.show_watch {
+            (
+                "watch-only — observe, cannot drive",
+                "Scan to watch from another phone",
+            )
+        } else {
+            (
+                "full-access — full control",
+                "Scan to control from your phone",
+            )
+        };
+        out.push(Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(Color::Cyan),
+        )));
         let qr_style = Style::default().fg(Color::Black).bg(Color::White);
-        if let Some(qr) = &self.pairing_qr {
+        if let Some(qr) = self.visible_pairing_qr() {
             for line in qr.lines() {
                 out.push(Line::from(Span::styled(line.to_string(), qr_style)));
             }
         }
         out.push(Line::from(""));
-        if let Some(code) = &self.pairing_code {
+        if let Some(code) = self.visible_pairing_code() {
             // Hand-wrap so the Paragraph needs no `Wrap` (which would mangle the QR rows).
             let w = inner_width.max(1);
             let chars: Vec<char> = code.chars().collect();
@@ -193,8 +210,19 @@ impl App {
             }
         }
         out.push(Line::from(""));
+        // Only offer the toggle when a watch-only code exists to flip to.
+        let footer = if self.has_watch_pairing() {
+            let other = if self.show_watch {
+                "full-access"
+            } else {
+                "watch-only"
+            };
+            format!("{scan_hint} · w = {other} · Enter = foreground · Ctrl-C = quit")
+        } else {
+            format!("{scan_hint} · Enter = foreground · Ctrl-C = quit")
+        };
         out.push(Line::from(Span::styled(
-            "Scan to control from your phone · Enter = foreground · Ctrl-C = quit",
+            footer,
             Style::default().fg(Color::Yellow),
         )));
         out
@@ -253,22 +281,20 @@ impl App {
         // Once the relay connects, /background swaps the input box for the QR panel; the
         // log shrinks (Min(0)) rather than being taken over. Else a short banner.
         let show_qr = self.mode == Mode::Background
-            && self.pairing_qr.is_some()
+            && self.visible_pairing_qr().is_some()
             && matches!(self.handoff_status, Some(HandoffStatus::Connected));
         let (log_constraint, bottom_height) = if show_qr {
             let qr_rows = self
-                .pairing_qr
-                .as_ref()
+                .visible_pairing_qr()
                 .map(|q| q.lines().count())
                 .unwrap_or(0);
             let code_rows = self
-                .pairing_code
-                .as_ref()
+                .visible_pairing_code()
                 .map(|c| c.chars().count().div_ceil(input_inner_width))
                 .unwrap_or(0);
-            // borders(2) + qr + blank(1) + code + blank(1) + hint(1); QR on top so it
-            // survives clipping on a short terminal.
-            (Constraint::Min(0), (qr_rows + code_rows + 5) as u16)
+            // borders(2) + label(1) + qr + blank(1) + code + blank(1) + hint(1); QR near
+            // the top so it survives clipping on a short terminal.
+            (Constraint::Min(0), (qr_rows + code_rows + 6) as u16)
         } else if self.mode == Mode::Background {
             (Constraint::Min(3), 4)
         } else {

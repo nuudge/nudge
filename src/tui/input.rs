@@ -12,6 +12,11 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
+            // Toggle between the full-access and watch-only pairing QR (both legs are
+            // already dialed); a no-op when there's no watch pairing to show.
+            KeyCode::Char('w') if self.has_watch_pairing() => {
+                self.show_watch = !self.show_watch;
+            }
             _ => {}
         }
     }
@@ -444,6 +449,8 @@ mod tests {
             thinking_display: "".into(),
             pairing_qr: None,
             pairing_code: None,
+            pairing_qr_watch: None,
+            pairing_code_watch: None,
             is_owner: true,
             user_name: "u".into(),
             models: Vec::new(),
@@ -452,6 +459,53 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // `w` on the background screen toggles between the full-access and watch-only QR,
+    // and each toggle flips which pairing `visible_pairing_*` returns.
+    #[tokio::test]
+    async fn background_w_toggles_the_visible_pairing() {
+        let mut app = test_app();
+        app.pairing_qr = Some("FULL_QR".into());
+        app.pairing_code = Some("full-code".into());
+        app.pairing_qr_watch = Some("WATCH_QR".into());
+        app.pairing_code_watch = Some("watch-code".into());
+        app.mode = Mode::Background;
+
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("FULL_QR")
+        );
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert!(app.show_watch);
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("WATCH_QR")
+        );
+        assert_eq!(
+            app.visible_pairing_code().map(String::as_str),
+            Some("watch-code")
+        );
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert!(!app.show_watch);
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("FULL_QR")
+        );
+    }
+
+    // With no watch-only pairing (a guest, or no relay), `w` does nothing.
+    #[tokio::test]
+    async fn background_w_is_a_noop_without_a_watch_pairing() {
+        let mut app = test_app();
+        app.pairing_qr = Some("FULL_QR".into());
+        app.mode = Mode::Background;
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert!(!app.show_watch);
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("FULL_QR")
+        );
     }
 
     #[tokio::test]
