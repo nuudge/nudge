@@ -127,22 +127,17 @@ pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Resu
 // arm phone pairing. It shares the process with the local TUI, so it never writes
 // stderr — instead it reports progress over `status`, which the TUI renders on the
 // background pair screen. The session is never ended by this loop, only by the local
-// owner quitting (which tears the process down). The co-located handoff is always a
-// full-rights pairing (your own phone), so it attaches with `ClientProfile::human()`.
+// owner quitting (which tears the process down). `profile` is the rights this leg grants
+// — the co-located session arms two legs (a full-access `human()` one and a watch-only
+// one), each a separate room, so the rights follow the room exactly as `--daemon --watch`.
 pub async fn serve_relay_handoff(
     relay_url: String,
     cipher: Cipher,
     broker: BrokerHandle,
     status: mpsc::Sender<HandoffStatus>,
+    profile: ClientProfile,
 ) {
-    relay_dial_loop(
-        relay_url,
-        cipher,
-        broker,
-        Some(status),
-        ClientProfile::human(),
-    )
-    .await;
+    relay_dial_loop(relay_url, cipher, broker, Some(status), profile).await;
 }
 
 // Keep one spare host connection parked on the relay at all times. Each iteration

@@ -209,6 +209,12 @@ impl Session {
         file.write_all(line.as_bytes())
             .await
             .context("failed to write to session log")?;
+        // tokio::fs::File buffers internally: write_all returning only means the bytes
+        // were accepted, and drop flushes them in the BACKGROUND — so without an
+        // explicit flush a caller can observe the file before the line lands (the
+        // commit→TurnComplete ordering, and any test reading the log back). flush()
+        // waits for the OS write; durability (fsync) is deliberately not needed here.
+        file.flush().await.context("failed to flush session log")?;
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
 use crate::core::{self, ClientIdentity, SessionHandle, SessionHost};
-use crate::transport;
+use crate::transport::{self, PairingScope};
 use crate::tui;
 
 // Buffer for relay-dial status updates flowing from the handoff task to the TUI.
@@ -24,14 +24,22 @@ pub(super) async fn run(
     relay: Option<String>,
 ) -> Result<()> {
     let handoff_rx = if let Some(base) = relay {
-        // Regenerate the pairing each launch (no persistence): the device
-        // re-scans after a restart. The QR/code go to the TUI, which surfaces
-        // them on /background; the dial-out only opens once backgrounded.
-        let pairing = transport::Pairing::generate(base);
-        ui_cfg.pairing_qr = Some(pairing.render_qr()?);
-        ui_cfg.pairing_code = Some(pairing.encode());
-        let dial_url = pairing.host_dial_url();
-        let cipher = pairing.cipher;
+        // Regenerate the pairings each launch (no persistence): the device re-scans
+        // after a restart. Two scoped codes are minted — a full-access one (your own
+        // phone) and a watch-only one (a teammate who may observe but not drive) — each
+        // its own room + key so rights follow the room (same model as `--daemon --watch`).
+        // Both QRs/codes go to the TUI, which shows one at a time (toggle with `w`); both
+        // legs dial only once backgrounded.
+        let full = transport::Pairing::generate(base.clone());
+        let watch = transport::Pairing::generate_scoped(base, PairingScope::WatchOnly);
+        ui_cfg.pairing_qr = Some(full.render_qr()?);
+        ui_cfg.pairing_code = Some(full.encode());
+        ui_cfg.pairing_qr_watch = Some(watch.render_qr()?);
+        ui_cfg.pairing_code_watch = Some(watch.encode());
+        let full_url = full.host_dial_url();
+        let full_cipher = full.cipher;
+        let watch_url = watch.host_dial_url();
+        let watch_cipher = watch.cipher;
         let broker = host.broker_handle();
         let (status_tx, status_rx) = mpsc::channel::<core::HandoffStatus>(HANDOFF_STATUS_CAP);
         // Dedupe re-dials: while one dial is live this is a no-op, so re-entering
@@ -43,12 +51,33 @@ pub(super) async fn run(
                 return;
             }
             let dialing = dialing.clone();
-            let dial_url = dial_url.clone();
-            let cipher = cipher.clone();
+            let full_url = full_url.clone();
+            let full_cipher = full_cipher.clone();
+            let watch_url = watch_url.clone();
+            let watch_cipher = watch_cipher.clone();
             let broker = broker.clone();
             let status_tx = status_tx.clone();
             tokio::spawn(async move {
-                transport::serve_relay_handoff(dial_url, cipher, broker, status_tx).await;
+                // Both legs dial the same relay, so they share one status channel:
+                // status is relay reachability, not per-leg. Last-writer-wins is fine —
+                // a watch leg failing after the full leg connected would be a real
+                // divergence (same relay) worth surfacing.
+                tokio::join!(
+                    transport::serve_relay_handoff(
+                        full_url,
+                        full_cipher,
+                        broker.clone(),
+                        status_tx.clone(),
+                        core::ClientProfile::human(),
+                    ),
+                    transport::serve_relay_handoff(
+                        watch_url,
+                        watch_cipher,
+                        broker,
+                        status_tx,
+                        core::ClientProfile::watch_only(),
+                    ),
+                );
                 dialing.store(false, Ordering::SeqCst);
             });
         });

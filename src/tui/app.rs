@@ -81,8 +81,13 @@ pub(super) struct App {
     // Set by handlers, applied by the run loop (which holds the host handle).
     pub(super) pending_transition: Option<Mode>,
     // Present only on the owner TUI with NUDGE_RELAY set; drives the /background QR.
+    // `_watch` is the second, watch-only pairing (a teammate who may observe but not
+    // drive); `show_watch` toggles which of the two the background screen renders.
     pub(super) pairing_qr: Option<String>,
     pub(super) pairing_code: Option<String>,
+    pub(super) pairing_qr_watch: Option<String>,
+    pub(super) pairing_code_watch: Option<String>,
+    pub(super) show_watch: bool,
     // Relay-dial progress; None until the first update.
     pub(super) handoff_status: Option<HandoffStatus>,
     // Cosmetic only: owner = this process hosts the loop (and may show a pairing QR);
@@ -103,6 +108,8 @@ pub struct UiConfig {
     pub thinking_display: String,
     pub pairing_qr: Option<String>,
     pub pairing_code: Option<String>,
+    pub pairing_qr_watch: Option<String>,
+    pub pairing_code_watch: Option<String>,
     pub is_owner: bool,
     pub user_name: String,
     pub models: Vec<(String, String)>,
@@ -134,6 +141,9 @@ impl App {
             pending_transition: None,
             pairing_qr: cfg.pairing_qr,
             pairing_code: cfg.pairing_code,
+            pairing_qr_watch: cfg.pairing_qr_watch,
+            pairing_code_watch: cfg.pairing_code_watch,
+            show_watch: false,
             handoff_status: None,
             is_owner: cfg.is_owner,
             self_name: cfg.user_name,
@@ -159,5 +169,28 @@ impl App {
     // Doesn't touch auto_scroll — an event shouldn't yank a reading user to the bottom.
     pub(super) fn push(&mut self, entry: LogEntry) {
         self.log.push(entry);
+    }
+
+    // Whether a watch-only pairing exists to toggle to (owner TUI with a relay).
+    pub(super) fn has_watch_pairing(&self) -> bool {
+        self.pairing_qr_watch.is_some()
+    }
+
+    // The QR/code the background screen currently shows: the watch-only pair when
+    // toggled on and present, else the full-access pair.
+    pub(super) fn visible_pairing_qr(&self) -> Option<&String> {
+        if self.show_watch {
+            self.pairing_qr_watch.as_ref()
+        } else {
+            self.pairing_qr.as_ref()
+        }
+    }
+
+    pub(super) fn visible_pairing_code(&self) -> Option<&String> {
+        if self.show_watch {
+            self.pairing_code_watch.as_ref()
+        } else {
+            self.pairing_code.as_ref()
+        }
     }
 }
