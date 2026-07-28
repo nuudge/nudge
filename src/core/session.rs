@@ -21,6 +21,12 @@ pub struct Session {
     // The per-project name index, `<dir>/index.json` (id → entry). Path policy is
     // the caller's (it owns `dir`); the read/write mechanism lives here.
     index_path: PathBuf,
+    // Log entries produced by the in-flight turn but not yet on disk. They mirror the
+    // messages the loop pushed past its `last_good_snapshot`: `commit` flushes them when
+    // the turn lands on a valid boundary, `rollback` drops them when a provider error
+    // (or steering failure) rolls memory back — so the JSONL always holds exactly the
+    // committed prefix of the transcript, never an entry the live model didn't keep.
+    staged: Vec<(Message, Option<ClientIdentity>)>,
 }
 
 // One row of the per-project session index: the human name plus light context
@@ -72,6 +78,7 @@ impl Session {
             log_path,
             name: None,
             index_path,
+            staged: Vec::new(),
         })
     }
 
@@ -139,6 +146,7 @@ impl Session {
                 log_path,
                 name,
                 index_path,
+                staged: Vec::new(),
             },
             entries,
             dropped,
@@ -179,10 +187,6 @@ impl Session {
         tilde_path(&self.cwd)
     }
 
-    pub async fn log(&self, message: &Message) -> Result<()> {
-        self.log_from(message, None).await
-    }
-
     // Log a message with the identity of whoever sent it (a typed user turn).
     // The message's text must be the clean, unattributed form — see `LoggedMessage`.
     pub async fn log_from(&self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
@@ -206,6 +210,28 @@ impl Session {
             .await
             .context("failed to write to session log")?;
         Ok(())
+    }
+
+    // Buffer a log entry for the in-flight turn. The message's text must be the clean,
+    // unattributed form (see `LoggedMessage`); it reaches disk only when `commit` runs.
+    pub fn stage(&mut self, message: &Message, sender: Option<&ClientIdentity>) {
+        self.staged.push((message.clone(), sender.cloned()));
+    }
+
+    // The turn landed on a valid boundary: flush every staged entry to the transcript
+    // and clear the buffer. A write error surfaces as the turn's error exactly as an
+    // eager `log` would today — no entry is silently dropped on a failed flush.
+    pub async fn commit(&mut self) -> Result<()> {
+        for (message, sender) in std::mem::take(&mut self.staged) {
+            self.log_from(&message, sender.as_ref()).await?;
+        }
+        Ok(())
+    }
+
+    // The turn rolled back (provider error, steering failure): drop its staged entries
+    // so they never reach disk.
+    pub fn rollback(&mut self) {
+        self.staged.clear();
     }
 }
 
@@ -338,10 +364,13 @@ mod tests {
         )
         .await
         .unwrap();
-        s.log(&Message {
-            role: "assistant".into(),
-            content: vec![ContentBlock::Text { text: "ok".into() }],
-        })
+        s.log_from(
+            &Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -453,10 +482,13 @@ mod tests {
             let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
             id = s.id.clone();
             // A clean assistant turn so open()'s truncation keeps the transcript.
-            s.log(&Message {
-                role: "assistant".into(),
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-            })
+            s.log_from(
+                &Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text { text: "hi".into() }],
+                },
+                None,
+            )
             .await
             .unwrap();
             s.set_name("my-label".into(), None).unwrap();

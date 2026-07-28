@@ -114,9 +114,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
             role: "user".into(),
             content: vec![ContentBlock::Text { text: user_text }],
         });
-        session
-            .log_from(messages.last().unwrap(), who.as_ref())
-            .await?;
+        session.stage(messages.last().unwrap(), who.as_ref());
         attribute_message(who.as_ref(), messages.last_mut().unwrap());
 
         // INNER loop: model + tool turns until non-tool-use stop.
@@ -145,6 +143,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         })
                         .await;
                     messages.truncate(last_good_snapshot);
+                    session.rollback();
                     break;
                 }
             };
@@ -162,7 +161,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 role: "assistant".into(),
                 content: resp.content,
             };
-            session.log(&assistant_msg).await?;
+            session.stage(&assistant_msg, None);
 
             for block in &assistant_msg.content {
                 match block {
@@ -185,6 +184,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
             if resp.stop_reason != "tool_use" {
                 messages.push(assistant_msg);
                 last_good_snapshot = messages.len();
+                session.commit().await?;
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
                 emit_session_info_if_changed(
                     &agent_tx,
@@ -241,6 +241,10 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             )
                             .await;
                         }
+                        // Quit here drops any entries staged this turn (the tool_use
+                        // assistant + earlier iterations). That's intentional, not a
+                        // leak: the turn never committed, so on resume strict truncation
+                        // would have discarded those trailing entries anyway.
                         Some((_, UiEvent::Quit)) | None => return Ok(()),
                         Some((_, UiEvent::PermissionResponse { .. })) => {}
                     }
@@ -251,9 +255,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 role: "user".into(),
                 content: tool_results,
             };
-            session
-                .log_from(&user_msg, guidance_sender.as_ref())
-                .await?;
+            session.stage(&user_msg, guidance_sender.as_ref());
             attribute_message(guidance_sender.as_ref(), &mut user_msg);
             messages.push(user_msg);
 
@@ -271,12 +273,13 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         text: notice.clone(),
                     }],
                 };
-                session.log(&synthetic).await?;
+                session.stage(&synthetic, None);
                 let _ = agent_tx
                     .send(AgentEvent::AssistantText { text: notice })
                     .await;
                 messages.push(synthetic);
                 last_good_snapshot = messages.len();
+                session.commit().await?;
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
                 emit_session_info_if_changed(
                     &agent_tx,

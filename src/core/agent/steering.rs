@@ -55,7 +55,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         role: "user".into(),
         content: vec![ContentBlock::Text { text }],
     });
-    session.log(messages.last().unwrap()).await?;
+    session.stage(messages.last().unwrap(), None);
 
     let (mut tools, tool_cache_boundary) = backend.tool_schemas();
     tools.extend(peer_tools::schemas(peers, factory));
@@ -74,6 +74,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         Ok(r) => r,
         Err(e) => {
             return safe_deny(
+                session,
                 messages,
                 *last_good_snapshot,
                 peers,
@@ -111,6 +112,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     });
     let Some((verdict, message)) = verdict else {
         return safe_deny(
+            session,
             messages,
             *last_good_snapshot,
             peers,
@@ -202,8 +204,9 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             text: closing.clone(),
         }],
     });
-    session.log(messages.last().unwrap()).await?;
+    session.stage(messages.last().unwrap(), None);
     *last_good_snapshot = messages.len();
+    session.commit().await?;
 
     let _ = agent_tx.send(AgentEvent::Notice { text: closing }).await;
     Ok(())
@@ -212,7 +215,9 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
 // Steering could not produce a verdict: never leave the peer hanging or the
 // transcript dangling — deny (the peer pauses and can be redirected later) and roll
 // the check-in turn back so the next real turn lands on a valid boundary.
+#[allow(clippy::too_many_arguments)] // internal seam; mirrors run_steering_turn's state
 async fn safe_deny(
+    session: &mut Session,
     messages: &mut Vec<Message>,
     last_good_snapshot: usize,
     peers: &mut PeerSet,
@@ -222,6 +227,7 @@ async fn safe_deny(
     reason: &str,
 ) -> Result<()> {
     messages.truncate(last_good_snapshot);
+    session.rollback();
     peers
         .drive(
             checkin.pid,
