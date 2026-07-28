@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use super::events::{AgentEvent, UiEvent};
-use crate::core::session::Session;
+use crate::core::identity::ClientIdentity;
+use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
 mod command;
@@ -22,7 +23,7 @@ use command::Command;
 use dispatch::dispatch_tools;
 use naming::{fallback_name, short_id, title_from_response, title_prompt};
 use session_info::{emit_session_info_if_changed, finalize_rename};
-use supervision::{attribute, recv_registration, supervise_peer_event};
+use supervision::{attribute_message, recv_registration, supervise_peer_event};
 
 pub async fn run_agent<P: Provider, B: Backend>(
     mut cfg: AgentConfig,
@@ -56,10 +57,10 @@ pub async fn run_agent<P: Provider, B: Backend>(
 
     // OUTER loop: one iteration per user turn.
     loop {
-        let user_text = loop {
+        let (who, user_text) = loop {
             tokio::select! {
                 ui = ui_rx.recv() => match ui {
-                Some((who, UiEvent::UserMessage { text })) => break attribute(who.as_ref(), text),
+                Some((who, UiEvent::UserMessage { text })) => break (who, text),
                 Some((_, UiEvent::Command { line })) => {
                     dispatch_command(
                         &line,
@@ -107,11 +108,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
             }
         };
 
+        // The log stores the clean text + sender; the model-facing transcript gets
+        // the attributed form, derived here at build time (and again on resume).
         messages.push(Message {
             role: "user".into(),
             content: vec![ContentBlock::Text { text: user_text }],
         });
-        session.log(messages.last().unwrap()).await?;
+        session.stage(messages.last().unwrap(), who.as_ref());
+        attribute_message(who.as_ref(), messages.last_mut().unwrap());
 
         // INNER loop: model + tool turns until non-tool-use stop.
         for iteration in 0..cfg.max_iterations {
@@ -139,6 +143,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         })
                         .await;
                     messages.truncate(last_good_snapshot);
+                    session.rollback();
                     break;
                 }
             };
@@ -156,7 +161,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 role: "assistant".into(),
                 content: resp.content,
             };
-            session.log(&assistant_msg).await?;
+            session.stage(&assistant_msg, None);
 
             for block in &assistant_msg.content {
                 match block {
@@ -179,6 +184,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
             if resp.stop_reason != "tool_use" {
                 messages.push(assistant_msg);
                 last_good_snapshot = messages.len();
+                session.commit().await?;
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
                 emit_session_info_if_changed(
                     &agent_tx,
@@ -204,6 +210,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
 
             // After a denial, pause for fresh user guidance that rides along in the
             // same tool_results turn, so the model sees "denied — try this" in one step.
+            let mut guidance_sender: Option<ClientIdentity> = None;
             if denied {
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
                 emit_session_info_if_changed(
@@ -217,9 +224,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 loop {
                     match ui_rx.recv().await {
                         Some((who, UiEvent::UserMessage { text })) => {
-                            tool_results.push(ContentBlock::Text {
-                                text: attribute(who.as_ref(), text),
-                            });
+                            guidance_sender = who;
+                            tool_results.push(ContentBlock::Text { text });
                             break;
                         }
                         Some((_, UiEvent::Command { line })) => {
@@ -235,17 +241,22 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             )
                             .await;
                         }
+                        // Quit here drops any entries staged this turn (the tool_use
+                        // assistant + earlier iterations). That's intentional, not a
+                        // leak: the turn never committed, so on resume strict truncation
+                        // would have discarded those trailing entries anyway.
                         Some((_, UiEvent::Quit)) | None => return Ok(()),
                         Some((_, UiEvent::PermissionResponse { .. })) => {}
                     }
                 }
             }
 
-            let user_msg = Message {
+            let mut user_msg = Message {
                 role: "user".into(),
                 content: tool_results,
             };
-            session.log(&user_msg).await?;
+            session.stage(&user_msg, guidance_sender.as_ref());
+            attribute_message(guidance_sender.as_ref(), &mut user_msg);
             messages.push(user_msg);
 
             if iteration == cfg.max_iterations - 1 {
@@ -262,12 +273,13 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         text: notice.clone(),
                     }],
                 };
-                session.log(&synthetic).await?;
+                session.stage(&synthetic, None);
                 let _ = agent_tx
                     .send(AgentEvent::AssistantText { text: notice })
                     .await;
                 messages.push(synthetic);
                 last_good_snapshot = messages.len();
+                session.commit().await?;
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
                 emit_session_info_if_changed(
                     &agent_tx,
@@ -383,4 +395,19 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 .await;
         }
     }
+}
+
+// Rebuild the model-facing transcript from logged entries: the log stores clean
+// text + sender, and attribution is derived here exactly as the live path derives
+// it at arrival. Pre-sender logs have `sender: None` (their text may carry an
+// already-baked prefix), which `attribute` leaves untouched.
+pub fn resume_messages(entries: &[LoggedMessage]) -> Vec<Message> {
+    entries
+        .iter()
+        .map(|e| {
+            let mut msg = e.message.clone();
+            attribute_message(e.sender.as_ref(), &mut msg);
+            msg
+        })
+        .collect()
 }

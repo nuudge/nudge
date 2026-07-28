@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
+use crate::core::identity::ClientIdentity;
 use crate::llm::{ContentBlock, Message};
 
 pub struct Session {
@@ -20,6 +21,12 @@ pub struct Session {
     // The per-project name index, `<dir>/index.json` (id → entry). Path policy is
     // the caller's (it owns `dir`); the read/write mechanism lives here.
     index_path: PathBuf,
+    // Log entries produced by the in-flight turn but not yet on disk. They mirror the
+    // messages the loop pushed past its `last_good_snapshot`: `commit` flushes them when
+    // the turn lands on a valid boundary, `rollback` drops them when a provider error
+    // (or steering failure) rolls memory back — so the JSONL always holds exactly the
+    // committed prefix of the transcript, never an entry the live model didn't keep.
+    staged: Vec<(Message, Option<ClientIdentity>)>,
 }
 
 // One row of the per-project session index: the human name plus light context
@@ -34,9 +41,20 @@ pub struct IndexEntry {
 
 type Index = BTreeMap<String, IndexEntry>;
 
+// One logged transcript entry: the model-facing message plus, for a typed user
+// turn, the identity of whoever sent it. The stored text is CLEAN — attribution
+// (the `[message from peer …]` prefix the model sees, the `name > ` stamp a UI
+// shows) is derived from `sender` at build time, never baked into the log. Old
+// logs predate the field and deserialize with `sender: None`; their user text
+// may carry an already-baked prefix, which the absent sender leaves untouched.
+pub struct LoggedMessage {
+    pub message: Message,
+    pub sender: Option<ClientIdentity>,
+}
+
 pub struct Resumed {
     pub session: Session,
-    pub messages: Vec<Message>,
+    pub entries: Vec<LoggedMessage>,
     // Count of trailing entries discarded by strict truncation (orphaned
     // tool_use, mid-flight tool_results, or a user prompt with no reply).
     // Surfaced to the TUI so the user knows their log was partially dropped.
@@ -60,6 +78,7 @@ impl Session {
             log_path,
             name: None,
             index_path,
+            staged: Vec::new(),
         })
     }
 
@@ -84,7 +103,7 @@ impl Session {
             }
         };
 
-        let mut messages: Vec<Message> = Vec::new();
+        let mut entries: Vec<LoggedMessage> = Vec::new();
         for (i, line) in raw.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -106,12 +125,19 @@ impl Session {
                     log_path.display()
                 )
             })?;
-            messages.push(msg);
+            // Absent on pre-sender logs (and lenient on malformed): None = unattributed.
+            let sender = envelope
+                .get("sender")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            entries.push(LoggedMessage {
+                message: msg,
+                sender,
+            });
         }
 
-        let original_len = messages.len();
-        truncate_to_clean_boundary(&mut messages);
-        let dropped = original_len - messages.len();
+        let original_len = entries.len();
+        truncate_to_clean_boundary(&mut entries);
+        let dropped = original_len - entries.len();
 
         Ok(Resumed {
             session: Self {
@@ -120,8 +146,9 @@ impl Session {
                 log_path,
                 name,
                 index_path,
+                staged: Vec::new(),
             },
-            messages,
+            entries,
             dropped,
         })
     }
@@ -160,13 +187,18 @@ impl Session {
         tilde_path(&self.cwd)
     }
 
-    pub async fn log(&self, message: &Message) -> Result<()> {
-        let event = json!({
+    // Log a message with the identity of whoever sent it (a typed user turn).
+    // The message's text must be the clean, unattributed form — see `LoggedMessage`.
+    pub async fn log_from(&self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
+        let mut event = json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "sessionId": self.id,
             "cwd": self.cwd.display().to_string(),
             "message": message,
         });
+        if let Some(who) = sender {
+            event["sender"] = serde_json::to_value(who).context("serializing sender")?;
+        }
         let line = format!("{event}\n");
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -178,6 +210,28 @@ impl Session {
             .await
             .context("failed to write to session log")?;
         Ok(())
+    }
+
+    // Buffer a log entry for the in-flight turn. The message's text must be the clean,
+    // unattributed form (see `LoggedMessage`); it reaches disk only when `commit` runs.
+    pub fn stage(&mut self, message: &Message, sender: Option<&ClientIdentity>) {
+        self.staged.push((message.clone(), sender.cloned()));
+    }
+
+    // The turn landed on a valid boundary: flush every staged entry to the transcript
+    // and clear the buffer. A write error surfaces as the turn's error exactly as an
+    // eager `log` would today — no entry is silently dropped on a failed flush.
+    pub async fn commit(&mut self) -> Result<()> {
+        for (message, sender) in std::mem::take(&mut self.staged) {
+            self.log_from(&message, sender.as_ref()).await?;
+        }
+        Ok(())
+    }
+
+    // The turn rolled back (provider error, steering failure): drop its staged entries
+    // so they never reach disk.
+    pub fn rollback(&mut self) {
+        self.staged.clear();
     }
 }
 
@@ -254,9 +308,10 @@ pub fn tilde_path(path: &Path) -> String {
 // a tool_result — i.e., a valid place to hand back to the outer loop and wait
 // for the next user message. Anything beyond (orphaned tool_use after a crash,
 // stray tool_results, a user prompt that never got a reply) is discarded.
-fn truncate_to_clean_boundary(messages: &mut Vec<Message>) {
+fn truncate_to_clean_boundary(entries: &mut Vec<LoggedMessage>) {
     let mut cutoff: Option<usize> = None;
-    for (i, msg) in messages.iter().enumerate().rev() {
+    for (i, entry) in entries.iter().enumerate().rev() {
+        let msg = &entry.message;
         let is_clean_assistant = msg.role == "assistant"
             && !msg
                 .content
@@ -268,20 +323,97 @@ fn truncate_to_clean_boundary(messages: &mut Vec<Message>) {
         }
     }
     match cutoff {
-        Some(n) => messages.truncate(n),
-        None => messages.clear(),
+        Some(n) => entries.truncate(n),
+        None => entries.clear(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::identity::ClientKind;
 
     // Unique temp directory per test, mirroring the transport tests' temp-path style.
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nudge-session-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // log_from persists the sender next to the (clean) message; open restores it.
+    // Messages logged without a sender (assistant turns) round-trip as None.
+    #[tokio::test]
+    async fn log_from_persists_sender_and_open_restores_it() {
+        let dir = temp_dir();
+        let s = Session::create(dir.clone(), dir.clone()).unwrap();
+        let id = s.id.clone();
+        let who = ClientIdentity {
+            kind: ClientKind::Agent,
+            name: "child-abc".into(),
+            session_id: None,
+            task: None,
+        };
+        s.log_from(
+            &Message {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "clean text".into(),
+                }],
+            },
+            Some(&who),
+        )
+        .await
+        .unwrap();
+        s.log_from(
+            &Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+        assert_eq!(resumed.entries.len(), 2);
+        match &resumed.entries[0].message.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "clean text"),
+            other => panic!("expected clean text block, got {other:?}"),
+        }
+        let sender = resumed.entries[0]
+            .sender
+            .as_ref()
+            .expect("sender persisted");
+        assert_eq!(sender.name, "child-abc");
+        assert_eq!(sender.kind, ClientKind::Agent);
+        assert!(resumed.entries[1].sender.is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // A pre-sender log line (no `sender` field in the envelope) deserializes as
+    // unattributed — the backward-compatibility contract for existing transcripts.
+    #[test]
+    fn open_reads_pre_sender_log_as_unattributed() {
+        let dir = temp_dir();
+        let log = concat!(
+            r#"{"timestamp":"t","sessionId":"old","cwd":"/","message":{"role":"user","content":[{"type":"text","text":"[message from peer x]\nlegacy"}]}}"#,
+            "\n",
+            r#"{"timestamp":"t","sessionId":"old","cwd":"/","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
+            "\n",
+        );
+        std::fs::write(dir.join("old.jsonl"), log).unwrap();
+
+        let resumed = Session::open("old", dir.clone(), dir.clone()).unwrap();
+        assert_eq!(resumed.entries.len(), 2);
+        assert!(resumed.entries[0].sender.is_none());
+        match &resumed.entries[0].message.content[0] {
+            // The baked prefix stays in the text — absent sender leaves it alone.
+            ContentBlock::Text { text } => assert_eq!(text, "[message from peer x]\nlegacy"),
+            other => panic!("expected text block, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // set_name writes the index row and updates the in-memory name; a fresh
@@ -350,10 +482,13 @@ mod tests {
             let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
             id = s.id.clone();
             // A clean assistant turn so open()'s truncation keeps the transcript.
-            s.log(&Message {
-                role: "assistant".into(),
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-            })
+            s.log_from(
+                &Message {
+                    role: "assistant".into(),
+                    content: vec![ContentBlock::Text { text: "hi".into() }],
+                },
+                None,
+            )
             .await
             .unwrap();
             s.set_name("my-label".into(), None).unwrap();
@@ -379,7 +514,7 @@ mod tests {
         assert_eq!(resolve_reference(&dir, "early-name"), id);
         let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
         assert_eq!(resumed.session.name.as_deref(), Some("early-name"));
-        assert!(resumed.messages.is_empty());
+        assert!(resumed.entries.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -397,7 +532,7 @@ mod tests {
         std::fs::remove_file(dir.join(format!("{id}.jsonl"))).unwrap();
 
         let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
-        assert!(resumed.messages.is_empty());
+        assert!(resumed.entries.is_empty());
         assert_eq!(resumed.session.name.as_deref(), Some("kept"));
 
         // Unknown id, no transcript, not in index → still errors.

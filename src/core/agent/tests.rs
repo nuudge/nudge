@@ -91,6 +91,26 @@ fn end_turn_response(text: &str) -> Response {
     }
 }
 
+// Closes each turn with an end_turn reply, except the `fail_on`-th call (1-indexed),
+// which errors — how tests drive a provider failure mid-turn to exercise rollback.
+struct FailOnNthProvider {
+    calls: std::sync::Mutex<usize>,
+    fail_on: usize,
+}
+impl Provider for FailOnNthProvider {
+    async fn complete(&self, _req: &Request<'_>) -> Result<Response> {
+        let mut n = self.calls.lock().unwrap();
+        *n += 1;
+        if *n == self.fail_on {
+            anyhow::bail!("simulated provider failure");
+        }
+        Ok(end_turn_response("ok"))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
 // A no-tool backend: the loop needs a Backend, but these tests exercise input
 // routing (peers, drive edges), not tool dispatch.
 struct FakeBackend;
@@ -876,6 +896,24 @@ async fn peer_message_is_attributed_in_the_transcript() {
         other => panic!("expected the attributed user turn, got {other:?}"),
     }
 
+    // The log stores the other half of the invariant: clean text + the sender,
+    // so resume can re-derive exactly the attributed form the provider saw.
+    let jsonl = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .expect("session log written");
+    let first = std::fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    let envelope: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(envelope["message"]["content"][0]["text"], "task done");
+    assert_eq!(envelope["sender"]["name"], "child-1");
+
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
@@ -1252,5 +1290,265 @@ async fn spawn_denial_does_not_run_the_factory() {
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// resume_messages derives attribution at build time from each entry's persisted
+// sender: an agent sender gets the `[message from peer …]` prefix, a human stays
+// bare, and a pre-sender entry (None — its text may carry an already-baked prefix)
+// passes through untouched.
+#[test]
+fn resume_messages_applies_attribution_from_persisted_sender() {
+    use crate::core::session::LoggedMessage;
+
+    let user = |text: &str| Message {
+        role: "user".into(),
+        content: vec![ContentBlock::Text { text: text.into() }],
+    };
+    let entries = vec![
+        LoggedMessage {
+            message: user("do it"),
+            sender: Some(ClientIdentity {
+                kind: ClientKind::Agent,
+                name: "child-x".into(),
+                session_id: None,
+                task: None,
+            }),
+        },
+        LoggedMessage {
+            message: user("hello"),
+            sender: Some(ClientIdentity::human("alice")),
+        },
+        LoggedMessage {
+            message: user("[message from peer old]\nlegacy"),
+            sender: None,
+        },
+    ];
+
+    let msgs = super::resume_messages(&entries);
+    let texts: Vec<&str> = msgs
+        .iter()
+        .map(|m| match &m.content[0] {
+            ContentBlock::Text { text } => text.as_str(),
+            other => panic!("expected text block, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts[0], "[message from peer child-x]\ndo it");
+    assert_eq!(texts[1], "hello");
+    assert_eq!(texts[2], "[message from peer old]\nlegacy");
+}
+
+// Locate the session's JSONL and return each entry's message role, in order. An
+// absent file (nothing ever committed) reads as empty.
+fn logged_roles(dir: &std::path::Path) -> Vec<String> {
+    logged_lines(dir)
+        .iter()
+        .map(|line| {
+            let env: Value = serde_json::from_str(line).unwrap();
+            env["message"]["role"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+// The raw non-empty JSONL lines for the session, or empty if the file is absent.
+fn logged_lines(dir: &std::path::Path) -> Vec<String> {
+    let path = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
+    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(raw) => raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+async fn drain_until(rx: &mut mpsc::Receiver<AgentEvent>, pred: impl Fn(&AgentEvent) -> bool) {
+    while let Some(ev) = rx.recv().await {
+        if pred(&ev) {
+            return;
+        }
+    }
+    panic!("event stream ended before the awaited event");
+}
+
+// A provider error mid-turn rolls the in-memory transcript back AND leaves nothing on
+// disk for that turn: the failed turn's user entry is never committed, so the JSONL
+// holds only the committed turns and a resume sees no phantom / no consecutive user
+// roles. The turn after the failure lands cleanly right behind the last good close.
+#[tokio::test]
+async fn provider_error_midturn_leaves_no_phantom_log_entry() {
+    let (session, dir) = mk_session();
+    let id = session.id.clone();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FailOnNthProvider {
+            calls: std::sync::Mutex::new(0),
+            fail_on: 2,
+        },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    // Turn 1 commits (call 1 succeeds).
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "hi".into() }))
+        .await
+        .unwrap();
+    drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::TurnComplete)).await;
+
+    // Turn 2's provider call fails; its user entry must be rolled back, not logged.
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "again".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::Error { .. })).await;
+
+    // Turn 3 commits (call 3 succeeds) — it must follow turn 1's close directly.
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "retry".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::TurnComplete)).await;
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    // On disk: only the two committed turns, no "again" phantom, no consecutive users.
+    let lines = logged_lines(&dir);
+    assert!(
+        !lines.iter().any(|l| l.contains("again")),
+        "rolled-back turn must not be logged: {lines:?}"
+    );
+    assert_eq!(
+        logged_roles(&dir),
+        vec!["user", "assistant", "user", "assistant"],
+        "log holds exactly the committed turns"
+    );
+
+    // A resume rebuilds the same clean, alternating transcript.
+    let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+    let msgs = super::resume_messages(&resumed.entries);
+    let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+    assert!(
+        roles.windows(2).all(|w| w != ["user", "user"]),
+        "resume must not surface consecutive user roles: {roles:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A steering inference that fails (provider error) safe-denies the peer AND rolls the
+// staged check-in back: nothing about the check-in reaches the JSONL.
+#[tokio::test]
+async fn steering_failure_leaves_no_checkin_in_the_log() {
+    let (session, dir) = mk_session();
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, _agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FailOnNthProvider {
+            calls: std::sync::Mutex::new(0),
+            fail_on: 1,
+        },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+        })
+        .unwrap();
+
+    // The steering inference errors → the peer is safe-denied.
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(!allow),
+        other => panic!("expected the safe deny, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    // The staged check-in was rolled back — it never reached disk.
+    let lines = logged_lines(&dir);
+    assert!(
+        !lines.iter().any(|l| l.contains("check-in from peer")),
+        "rolled-back check-in must not be logged: {lines:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A successful multi-iteration turn (tool_use then end_turn) commits the exact same
+// entries eager logging produced: user, assistant(tool_use), user(tool_results),
+// assistant — proving deferral is a no-op on the committed path.
+#[tokio::test]
+async fn successful_multi_iteration_turn_persists_all_entries() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("Bash", serde_json::json!({})),
+            end_turn_response("done"),
+        ]),
+        seen_messages,
+        seen_tools,
+    };
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::TurnComplete)).await;
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    assert_eq!(
+        logged_roles(&dir),
+        vec!["user", "assistant", "user", "assistant"],
+        "every mid-turn entry is committed when the turn completes"
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }

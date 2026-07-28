@@ -24,8 +24,10 @@ impl App {
                 LogEntry::Blank => out.push(Line::from("")),
                 LogEntry::User { text, sender } => {
                     // Own turns render as "> "; another party's turns are prefixed
-                    // with their name so a shared session stays legible.
-                    let prefix = if *sender == self.self_name {
+                    // with their name so a shared session stays legible. An empty
+                    // sender (a pre-sender log entry replayed unattributed) renders
+                    // as a plain own-style turn rather than a stray " > ".
+                    let prefix = if sender.is_empty() || *sender == self.self_name {
                         "> ".to_string()
                     } else {
                         format!("{sender} > ")

@@ -31,11 +31,11 @@ pub async fn host(cli: Cli) -> Result<()> {
     // build its own provider with the same key.
     let api_key = config.anthropic_api_key.clone();
 
-    let (session, initial_messages, dropped) = match &cli.resume {
+    let (session, entries, dropped) = match &cli.resume {
         None => (coding::open_new()?, Vec::new(), 0),
         Some(id) => {
             let r = coding::open_resume(id)?;
-            (r.session, r.messages, r.dropped)
+            (r.session, r.entries, r.dropped)
         }
     };
 
@@ -109,8 +109,10 @@ pub async fn host(cli: Cli) -> Result<()> {
     // Pre-translate the resumed transcript to controller events and seed the
     // host's replay buffer with it, so the TUI (and later a remote client)
     // rebuilds history purely from the event stream — no front-end-side JSONL
-    // replay. `initial_messages` still seeds the model's conversation in the loop.
-    let mut seed = coding::replay_events(&initial_messages, dropped, &who.name);
+    // replay. The model's conversation is rebuilt separately from the same
+    // entries, with sender attribution applied at build time.
+    let initial_messages = core::agent::resume_messages(&entries);
+    let mut seed = coding::replay_events(&entries, dropped);
     // Prepend the initial session context so every controller has a header on its very
     // first attach, before any turn completes. The loop re-emits SessionInfo on each
     // turn boundary (and on /model) to keep it live; clients only ever render it.

@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::core::ControllerEvent;
-use crate::core::session::{Resumed, Session};
-use crate::llm::{ContentBlock, Message};
+use crate::core::session::{LoggedMessage, Resumed, Session};
+use crate::llm::ContentBlock;
 
 pub mod backend;
 pub mod context;
@@ -23,10 +23,10 @@ pub use backend::{CodingBackend, print_preamble};
 // merge reassembles them by id, exactly as for live events, so one render path
 // serves both live and replay. Usage / permission outcomes aren't in the JSONL
 // (they're runtime-only), so they're absent here, matching the old seed_replay.
-// `owner` attributes the historical user turns: the transcript records no per-message
-// identity, so replayed user messages are stamped with the resuming user's name (they
-// render as "you" for that user, and as a named party for anyone else who attaches).
-pub fn replay_events(messages: &[Message], dropped: usize, owner: &str) -> Vec<ControllerEvent> {
+// User turns are attributed from each entry's persisted sender; entries from
+// pre-sender logs carry none and replay unattributed (empty sender), which
+// renderers show as a plain own-style turn.
+pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<ControllerEvent> {
     let mut out = Vec::new();
     if dropped > 0 {
         out.push(ControllerEvent::Warn {
@@ -36,7 +36,8 @@ pub fn replay_events(messages: &[Message], dropped: usize, owner: &str) -> Vec<C
             ),
         });
     }
-    for msg in messages {
+    for entry in entries {
+        let msg = &entry.message;
         match msg.role.as_str() {
             "user" => {
                 for block in &msg.content {
@@ -44,7 +45,11 @@ pub fn replay_events(messages: &[Message], dropped: usize, owner: &str) -> Vec<C
                         ContentBlock::Text { text } => {
                             out.push(ControllerEvent::UserMessage {
                                 text: text.clone(),
-                                sender: owner.to_string(),
+                                sender: entry
+                                    .sender
+                                    .as_ref()
+                                    .map(|w| w.name.clone())
+                                    .unwrap_or_default(),
                             });
                         }
                         ContentBlock::ToolResult {
@@ -197,4 +202,48 @@ fn flatten_cwd(cwd: &Path) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::ClientIdentity;
+    use crate::llm::Message;
+
+    // Replayed user turns are attributed from each entry's persisted sender; a
+    // pre-sender entry replays with an empty sender (rendered unattributed).
+    #[test]
+    fn replay_seeds_sender_from_entry_metadata() {
+        let user = |text: &str| Message {
+            role: "user".into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        };
+        let entries = vec![
+            LoggedMessage {
+                message: user("hi"),
+                sender: Some(ClientIdentity::human("alice")),
+            },
+            LoggedMessage {
+                message: user("legacy"),
+                sender: None,
+            },
+        ];
+
+        let events = replay_events(&entries, 0);
+        match &events[0] {
+            ControllerEvent::UserMessage { text, sender } => {
+                assert_eq!(text, "hi");
+                assert_eq!(sender, "alice");
+            }
+            other => panic!("expected attributed UserMessage, got {other:?}"),
+        }
+        match &events[1] {
+            ControllerEvent::UserMessage { text, sender } => {
+                assert_eq!(text, "legacy");
+                assert_eq!(sender, "");
+            }
+            other => panic!("expected unattributed UserMessage, got {other:?}"),
+        }
+        assert!(matches!(events.last(), Some(ControllerEvent::TurnComplete)));
+    }
 }
