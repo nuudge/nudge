@@ -130,13 +130,15 @@ pub async fn host(cli: Cli) -> Result<()> {
     );
     // Seed the capability surface next to SessionInfo so every attach renders menus
     // (model picker, MCP catalog) from the daemon's data on its very first frame. The
-    // loop re-emits it when the MCP catalog changes.
+    // loop re-emits it when the surface changes (MCP load/unload, peer change). A
+    // fresh session holds no peers yet.
     seed.insert(
         1,
         core::ControllerEvent::Capabilities {
             commands: core::agent::command_catalog(),
             models: cfg.models.clone(),
             mcp: backend.mcp_catalog(),
+            peers: Vec::new(),
         },
     );
     // The executor behind the model-facing Spawn tool: this session may create

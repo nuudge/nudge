@@ -143,11 +143,11 @@ class FramesTest {
     @Test
     fun capabilitiesDecodesAndRoundTrips() {
         // Exact bytes serde emits for ControllerEvent::Capabilities — the field order
-        // (commands, models, mcp) and the struct shapes are byte-pinned so a phone
-        // menu built from this can't silently drift from the daemon.
+        // (commands, models, mcp, peers) and the struct shapes are byte-pinned so a
+        // phone menu built from this can't silently drift from the daemon.
         val decoded = WireJson.decodeFromString(
             ServerFrame.serializer(),
-            """{"Event":{"seq":1,"event":{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}]}}}}""",
+            """{"Event":{"seq":1,"event":{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}],"peers":[{"name":"child-ab12cd34","kind":"Agent","supervised":true,"session_id":"s1","task":null}]}}}}""",
         )
         assertEquals(
             ServerFrame.Event(
@@ -156,6 +156,7 @@ class FramesTest {
                     listOf(CommandInfo("/model", "u")),
                     listOf(ModelInfo("id1", "L1")),
                     listOf(McpServerInfo("gitlab", "d", false)),
+                    listOf(PeerInfo("child-ab12cd34", ClientKind.Agent, true, "s1", null)),
                 ),
             ),
             decoded,
@@ -166,8 +167,16 @@ class FramesTest {
             listOf(CommandInfo("/mcp", "usage")),
             listOf(ModelInfo("m", "Model")),
             listOf(McpServerInfo("everything", null, true)),
+            emptyList(),
         )
         assertEquals(cap, WireJson.decodeFromString(ControllerEvent.serializer(), enc(ControllerEvent.serializer(), cap)))
+
+        // A pre-peers daemon omits the field entirely → decodes as an empty roster.
+        val old = WireJson.decodeFromString(
+            ControllerEvent.serializer(),
+            """{"Capabilities":{"commands":[],"models":[],"mcp":[]}}""",
+        )
+        assertEquals(ControllerEvent.Capabilities(emptyList(), emptyList(), emptyList(), emptyList()), old)
     }
 
     @Test

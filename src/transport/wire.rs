@@ -328,8 +328,8 @@ mod tests {
     // wrapper and the event share the name "Command", which is fine (distinct enums).
     #[test]
     fn command_and_capabilities_wire_bytes() {
-        use crate::core::events::CommandInfo;
-        use crate::core::{ControllerEvent, McpServerInfo, ModelInfo};
+        use crate::core::events::{CommandInfo, PeerInfo};
+        use crate::core::{ClientKind, ControllerEvent, McpServerInfo, ModelInfo};
 
         let cmd = ClientFrame::Command(UiEvent::Command {
             line: "/model x".into(),
@@ -353,10 +353,17 @@ mod tests {
                 description: Some("d".into()),
                 loaded: false,
             }],
+            peers: vec![PeerInfo {
+                name: "child-ab12cd34".into(),
+                kind: ClientKind::Agent,
+                supervised: true,
+                session_id: Some("s1".into()),
+                task: None,
+            }],
         };
         assert_eq!(
             serde_json::to_string(&cap).unwrap(),
-            r#"{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}]}}"#
+            r#"{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}],"peers":[{"name":"child-ab12cd34","kind":"Agent","supervised":true,"session_id":"s1","task":null}]}}"#
         );
     }
 }

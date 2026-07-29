@@ -215,6 +215,24 @@ impl PeerSet {
         names
     }
 
+    // The full roster for /peers and the Capabilities event. Sorted by name so the
+    // listing (and change detection against a prior snapshot) is deterministic.
+    pub fn infos(&self) -> Vec<super::events::PeerInfo> {
+        let mut out: Vec<super::events::PeerInfo> = self
+            .peers
+            .values()
+            .map(|p| super::events::PeerInfo {
+                name: p.who.name.clone(),
+                kind: p.who.kind.clone(),
+                supervised: p.supervised,
+                session_id: p.who.session_id.clone(),
+                task: p.who.task.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     // Display name for a peer, for attributing its activity in Notices. Falls back to
     // the routing id if the peer is already gone.
     pub fn display_name(&self, id: PeerId) -> String {

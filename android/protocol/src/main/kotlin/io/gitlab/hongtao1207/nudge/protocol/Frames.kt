@@ -70,6 +70,17 @@ data class CommandInfo(val name: String, val usage: String)
 @Serializable
 data class McpServerInfo(val name: String, val description: String?, val loaded: Boolean)
 
+// One held peer edge (name, kind, direction of creation, provenance). Mirrors the
+// Rust PeerInfo field order exactly.
+@Serializable
+data class PeerInfo(
+    val name: String,
+    val kind: ClientKind,
+    val supervised: Boolean,
+    @SerialName("session_id") val sessionId: String?,
+    val task: String?,
+)
+
 @Serializable(with = ControllerEventSerializer::class)
 sealed class ControllerEvent {
     @Serializable
@@ -84,13 +95,15 @@ sealed class ControllerEvent {
         @SerialName("session_name") val sessionName: String? = null,
     ) : ControllerEvent()
 
-    // The daemon's capabilities: command grammar, model catalog, MCP catalog. Seeded
-    // next to SessionInfo and re-emitted on catalog change; menus render from it.
+    // The daemon's capabilities: command grammar, model catalog, MCP catalog, peer
+    // roster. Seeded next to SessionInfo and re-emitted on surface change; menus
+    // render from it. `peers` is defaulted so a daemon that predates it still decodes.
     @Serializable
     data class Capabilities(
         val commands: List<CommandInfo>,
         val models: List<ModelInfo>,
         val mcp: List<McpServerInfo>,
+        val peers: List<PeerInfo> = emptyList(),
     ) : ControllerEvent()
 
     @Serializable

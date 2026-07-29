@@ -362,10 +362,12 @@ fn translate(
             commands,
             models,
             mcp,
+            peers,
         } => ControllerEvent::Capabilities {
             commands,
             models,
             mcp,
+            peers,
         },
         AgentEvent::Usage {
             in_tokens,
@@ -423,15 +425,14 @@ fn translate(
 fn project(profile: &ClientProfile, ev: &ControllerEvent) -> Option<ControllerEvent> {
     match ev {
         ControllerEvent::Notice { .. } if !profile.receives_supervision => None,
-        ControllerEvent::Capabilities { models, mcp, .. }
-            if profile.commands == CommandScope::None =>
-        {
-            Some(ControllerEvent::Capabilities {
-                commands: Vec::new(),
-                models: models.clone(),
-                mcp: mcp.clone(),
-            })
-        }
+        ControllerEvent::Capabilities {
+            models, mcp, peers, ..
+        } if profile.commands == CommandScope::None => Some(ControllerEvent::Capabilities {
+            commands: Vec::new(),
+            models: models.clone(),
+            mcp: mcp.clone(),
+            peers: peers.clone(),
+        }),
         _ => Some(ev.clone()),
     }
 }
@@ -989,6 +990,7 @@ mod tests {
                 label: "L1".into(),
             }],
             mcp: Vec::new(),
+            peers: Vec::new(),
         }];
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);

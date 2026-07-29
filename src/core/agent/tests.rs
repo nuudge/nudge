@@ -1552,3 +1552,137 @@ async fn successful_multi_iteration_turn_persists_all_entries() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// /peers reports the held roster (name, kind, supervision) as a Notice; with no
+// peers it says so rather than replying with an empty listing.
+#[tokio::test]
+async fn peers_command_reports_the_roster() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    ui_tx
+        .send((
+            None,
+            UiEvent::Command {
+                line: "/peers".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    match agent_rx.recv().await {
+        Some(AgentEvent::Notice { text }) => {
+            assert!(text.contains("child-1"), "roster names the peer: {text}");
+            assert!(text.contains("agent"), "roster shows the kind: {text}");
+            assert!(
+                text.contains("supervised"),
+                "roster shows supervision: {text}"
+            );
+        }
+        other => panic!("expected roster Notice, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn peers_command_with_no_peers_says_so() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    ui_tx
+        .send((
+            None,
+            UiEvent::Command {
+                line: "/peers".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    match agent_rx.recv().await {
+        Some(AgentEvent::Notice { text }) => assert_eq!(text, "no peers held"),
+        other => panic!("expected empty-roster Notice, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// The roster rides Capabilities and is re-advertised on peer change: a runtime
+// registration emits it with the new peer, and the peer's disconnect (reap) emits
+// it again, empty.
+#[tokio::test]
+async fn peer_change_reemits_capabilities_roster() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+    ));
+
+    let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+    reg_tx
+        .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
+        .unwrap();
+    match agent_rx.recv().await {
+        Some(AgentEvent::Capabilities { peers, .. }) => {
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].name, "child-1");
+            assert!(!peers[0].supervised);
+        }
+        other => panic!("expected Capabilities after registration, got {other:?}"),
+    }
+
+    // The peer disconnects: the loop reaps it (a Notice narrates that) and
+    // re-advertises the now-empty roster.
+    drop(peer_ev);
+    let mut saw_empty_roster = false;
+    for _ in 0..4 {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Capabilities { peers, .. }) => {
+                assert!(peers.is_empty(), "roster empties after the reap");
+                saw_empty_roster = true;
+                break;
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    assert!(
+        saw_empty_roster,
+        "expected a Capabilities re-emit after reap"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
