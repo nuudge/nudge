@@ -23,6 +23,17 @@ pub struct McpServerInfo {
     pub loaded: bool,
 }
 
+// One held peer edge, as advertised in Capabilities and reported by /peers.
+// `supervised` is the direction-of-creation bit (true = this session spawned it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub name: String,
+    pub kind: super::identity::ClientKind,
+    pub supervised: bool,
+    pub session_id: Option<String>,
+    pub task: Option<String>,
+}
+
 // IDs are carried on every tool-related event so the UI can correlate updates:
 // the TUI resolves a pending ToolCall entry in place when its ToolResult
 // arrives. PermissionRequest's tool_use_id is still unused (the pending prompt
@@ -43,13 +54,15 @@ pub enum AgentEvent {
         // still nameless. Controllers prefer it over `session_id` in the header.
         session_name: Option<String>,
     },
-    // The daemon's capability surface (commands, models, MCP catalog). Seeded into
-    // the replay buffer next to SessionInfo and re-emitted when the catalog changes
-    // (an MCP load/unload), so every client renders menus from live daemon data.
+    // The daemon's capability surface (commands, models, MCP catalog, peer roster).
+    // Seeded into the replay buffer next to SessionInfo and re-emitted when the
+    // surface changes (an MCP load/unload, a peer spawned/dismissed/disconnected),
+    // so every client renders menus from live daemon data.
     Capabilities {
         commands: Vec<CommandInfo>,
         models: Vec<ModelInfo>,
         mcp: Vec<McpServerInfo>,
+        peers: Vec<PeerInfo>,
     },
     Usage {
         in_tokens: u64,
@@ -125,11 +138,12 @@ pub enum ControllerEvent {
         session_name: Option<String>,
     },
     // The daemon's capability surface — see AgentEvent::Capabilities. Seeded into
-    // the replay buffer next to SessionInfo and re-emitted on catalog change.
+    // the replay buffer next to SessionInfo and re-emitted on surface change.
     Capabilities {
         commands: Vec<CommandInfo>,
         models: Vec<ModelInfo>,
         mcp: Vec<McpServerInfo>,
+        peers: Vec<PeerInfo>,
     },
     Usage {
         in_tokens: u64,

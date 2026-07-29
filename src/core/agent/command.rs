@@ -10,6 +10,8 @@ pub(super) enum Command {
     // Rename the session: Some = verbatim, None = let the loop derive one.
     Rename(Option<String>),
     Mcp(McpCommand),
+    // List the session's held peer edges (read-only).
+    Peers,
     // `/model` with no argument: not an error, but the pickerless path needs a hint.
     ModelUsage,
     // Anything unrecognized, echoed back so the client sees why nothing happened.
@@ -42,6 +44,7 @@ pub(super) fn parse(line: &str) -> Command {
             (Some("unload"), Some(name)) => McpCommand::Unload(name.to_string()),
             _ => McpCommand::Usage,
         }),
+        Some("/peers") => Command::Peers,
         _ => Command::Unknown(line.to_string()),
     }
 }
@@ -61,6 +64,10 @@ pub fn command_catalog() -> Vec<CommandInfo> {
         CommandInfo {
             name: "/mcp".into(),
             usage: "/mcp | /mcp load <name> | /mcp unload <name>".into(),
+        },
+        CommandInfo {
+            name: "/peers".into(),
+            usage: "/peers — list held peer agents".into(),
         },
     ]
 }

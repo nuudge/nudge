@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use super::events::{AgentEvent, UiEvent};
 use crate::core::identity::ClientIdentity;
+use crate::core::peer::PeerSet;
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
@@ -69,6 +70,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         &mut backend,
                         &mut session,
                         &messages,
+                        &peers,
                         &agent_tx,
                         &mut last_session_ctx,
                     )
@@ -81,10 +83,14 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 reg = recv_registration(&mut peer_register_rx) => match reg {
                     Some(reg) => {
                         peers.register(reg);
+                        let _ = agent_tx
+                            .send(capabilities_event(&cfg, &backend, &peers))
+                            .await;
                     }
                     None => peer_register_rx = None,
                 },
                 (pid, ev) = peers.recv() => {
+                    let roster_before = peers.roster();
                     // A supervised peer's check-in comes back here and is decided by
                     // one steering inference over this agent's own transcript.
                     if let supervision::Observed::CheckIn(checkin) =
@@ -103,6 +109,12 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             checkin,
                         )
                         .await?;
+                    }
+                    // A disconnected peer was reaped above — re-advertise the roster.
+                    if peers.roster() != roster_before {
+                        let _ = agent_tx
+                            .send(capabilities_event(&cfg, &backend, &peers))
+                            .await;
                     }
                 }
             }
@@ -197,6 +209,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 break;
             }
 
+            let roster_before = peers.roster();
             let (mut tool_results, denied) = dispatch_tools(
                 &assistant_msg,
                 &agent_tx,
@@ -206,6 +219,12 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 &self_handle,
             )
             .await;
+            // A Spawn/DismissPeer in the batch changed the roster — re-advertise it.
+            if peers.roster() != roster_before {
+                let _ = agent_tx
+                    .send(capabilities_event(&cfg, &backend, &peers))
+                    .await;
+            }
             messages.push(assistant_msg);
 
             // After a denial, pause for fresh user guidance that rides along in the
@@ -236,6 +255,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                                 &mut backend,
                                 &mut session,
                                 &messages,
+                                &peers,
                                 &agent_tx,
                                 &mut last_session_ctx,
                             )
@@ -295,13 +315,15 @@ pub async fn run_agent<P: Provider, B: Backend>(
 }
 
 // The Capabilities event, assembled from the static command grammar, the resolved
-// model catalog, and the backend's live MCP catalog. Re-emitted when the MCP
-// catalog changes so clients re-render menus.
-fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B) -> AgentEvent {
+// model catalog, the backend's live MCP catalog, and the held peer roster.
+// Re-emitted when the surface changes (MCP load/unload, peer change) so clients
+// re-render menus.
+fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B, peers: &PeerSet) -> AgentEvent {
     AgentEvent::Capabilities {
         commands: command_catalog(),
         models: cfg.models.clone(),
         mcp: backend.mcp_catalog(),
+        peers: peers.infos(),
     }
 }
 
@@ -316,6 +338,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
     backend: &mut B,
     session: &mut Session,
     messages: &[Message],
+    peers: &PeerSet,
     agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
     last_session_ctx: &mut (String, Option<String>, Option<String>),
 ) {
@@ -377,8 +400,39 @@ async fn dispatch_command<P: Provider, B: Backend>(
             // A load/unload mutates the tool surface — re-advertise the catalog. A
             // bare list doesn't change anything, so it doesn't.
             if matches!(mcp, McpCommand::Load(_) | McpCommand::Unload(_)) {
-                let _ = agent_tx.send(capabilities_event(cfg, backend)).await;
+                let _ = agent_tx.send(capabilities_event(cfg, backend, peers)).await;
             }
+        }
+        Command::Peers => {
+            let infos = peers.infos();
+            let text = if infos.is_empty() {
+                "no peers held".to_string()
+            } else {
+                let mut lines = vec!["peers:".to_string()];
+                for p in infos {
+                    let kind = match p.kind {
+                        crate::core::identity::ClientKind::Agent => "agent",
+                        crate::core::identity::ClientKind::Human => "human",
+                    };
+                    let role = if p.supervised {
+                        "supervised"
+                    } else {
+                        "unsupervised"
+                    };
+                    let mut line = format!("- {} ({kind}, {role})", p.name);
+                    if let Some(id) = &p.session_id {
+                        line.push_str(&format!(" — session {id}"));
+                    }
+                    if let Some(task) = &p.task {
+                        let t: String = task.chars().take(80).collect();
+                        let ellipsis = if t.len() < task.len() { "…" } else { "" };
+                        line.push_str(&format!(" — task: {t}{ellipsis}"));
+                    }
+                    lines.push(line);
+                }
+                lines.join("\n")
+            };
+            let _ = agent_tx.send(AgentEvent::Notice { text }).await;
         }
         Command::ModelUsage => {
             let _ = agent_tx
