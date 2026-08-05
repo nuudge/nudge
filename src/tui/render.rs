@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::coding::tools;
 use crate::core::HandoffStatus;
 
-use super::app::{App, LogEntry, Mode};
+use super::app::{App, LogEntry, Mode, PairScope};
 use super::input::wrap_input;
 use super::markdown;
 use super::text::{
@@ -173,18 +173,22 @@ impl App {
     // dark-on-light, so a light-on-dark terminal would otherwise invert it.
     fn pair_panel_body(&self, inner_width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        // Which of the two pairings is on screen: a full-access code confers full
-        // control, a watch-only code lets a teammate observe but not drive.
-        let (label, scan_hint) = if self.show_watch {
-            (
-                "watch-only — observe, cannot drive",
-                "Scan to watch from another phone",
-            )
-        } else {
-            (
+        // Which pairing is on screen: full-access confers full control, watch-only lets
+        // a teammate observe but not drive, agent-peer lets a remote nudge session
+        // /connect-peer into a mutual, unsupervised edge.
+        let (label, scan_hint) = match self.pair_scope {
+            PairScope::Full => (
                 "full-access — full control",
                 "Scan to control from your phone",
-            )
+            ),
+            PairScope::Watch => (
+                "watch-only — observe, cannot drive",
+                "Scan to watch from another phone",
+            ),
+            PairScope::Agent => (
+                "agent-peer — connect a peer agent",
+                "Give this code to a peer's human for /connect-peer",
+            ),
         };
         out.push(Line::from(Span::styled(
             label.to_string(),
@@ -210,14 +214,12 @@ impl App {
             }
         }
         out.push(Line::from(""));
-        // Only offer the toggle when a watch-only code exists to flip to.
-        let footer = if self.has_watch_pairing() {
-            let other = if self.show_watch {
-                "full-access"
-            } else {
-                "watch-only"
-            };
-            format!("{scan_hint} · w = {other} · Enter = foreground · Ctrl-C = quit")
+        // Offer the `w` cycle only when another dialed leg exists to flip to.
+        let footer = if let Some(next) = self.next_pairing_scope() {
+            format!(
+                "{scan_hint} · w = {} · Enter = foreground · Ctrl-C = quit",
+                next.label()
+            )
         } else {
             format!("{scan_hint} · Enter = foreground · Ctrl-C = quit")
         };

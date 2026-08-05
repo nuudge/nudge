@@ -12,11 +12,10 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
-            // Toggle between the full-access and watch-only pairing QR (both legs are
-            // already dialed); a no-op when there's no watch pairing to show.
-            KeyCode::Char('w') if self.has_watch_pairing() => {
-                self.show_watch = !self.show_watch;
-            }
+            // Cycle the visible pairing QR across the dialed legs (full-access →
+            // watch-only → agent-peer, skipping absent scopes); a no-op when only one
+            // pairing exists.
+            KeyCode::Char('w') => self.cycle_pairing(),
             _ => {}
         }
     }
@@ -438,7 +437,7 @@ fn char_index_at(input: &str, row: usize, col: usize, width: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::app::UiConfig;
+    use super::super::app::{PairScope, UiConfig};
     use super::*;
 
     fn test_app() -> App {
@@ -451,6 +450,8 @@ mod tests {
             pairing_code: None,
             pairing_qr_watch: None,
             pairing_code_watch: None,
+            pairing_qr_agent: None,
+            pairing_code_agent: None,
             is_owner: true,
             user_name: "u".into(),
             models: Vec::new(),
@@ -461,23 +462,27 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    // `w` on the background screen toggles between the full-access and watch-only QR,
-    // and each toggle flips which pairing `visible_pairing_*` returns.
+    // `w` cycles the visible pairing across all present legs: full → watch → agent →
+    // full, each flip changing which pairing `visible_pairing_*` returns.
     #[tokio::test]
-    async fn background_w_toggles_the_visible_pairing() {
+    async fn background_w_cycles_the_visible_pairing() {
         let mut app = test_app();
         app.pairing_qr = Some("FULL_QR".into());
         app.pairing_code = Some("full-code".into());
         app.pairing_qr_watch = Some("WATCH_QR".into());
         app.pairing_code_watch = Some("watch-code".into());
+        app.pairing_qr_agent = Some("AGENT_QR".into());
+        app.pairing_code_agent = Some("agent-code".into());
         app.mode = Mode::Background;
 
+        assert_eq!(app.pair_scope, PairScope::Full);
         assert_eq!(
             app.visible_pairing_qr().map(String::as_str),
             Some("FULL_QR")
         );
+
         app.handle_background_key(press(KeyCode::Char('w')));
-        assert!(app.show_watch);
+        assert_eq!(app.pair_scope, PairScope::Watch);
         assert_eq!(
             app.visible_pairing_qr().map(String::as_str),
             Some("WATCH_QR")
@@ -486,22 +491,61 @@ mod tests {
             app.visible_pairing_code().map(String::as_str),
             Some("watch-code")
         );
+
         app.handle_background_key(press(KeyCode::Char('w')));
-        assert!(!app.show_watch);
+        assert_eq!(app.pair_scope, PairScope::Agent);
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("AGENT_QR")
+        );
+        assert_eq!(
+            app.visible_pairing_code().map(String::as_str),
+            Some("agent-code")
+        );
+
+        // Wraps back to full-access.
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert_eq!(app.pair_scope, PairScope::Full);
         assert_eq!(
             app.visible_pairing_qr().map(String::as_str),
             Some("FULL_QR")
         );
     }
 
-    // With no watch-only pairing (a guest, or no relay), `w` does nothing.
+    // `w` skips an absent scope: with full + agent present but no watch, it cycles
+    // full → agent → full (the wrap logic most likely to regress).
     #[tokio::test]
-    async fn background_w_is_a_noop_without_a_watch_pairing() {
+    async fn background_w_skips_a_missing_scope() {
+        let mut app = test_app();
+        app.pairing_qr = Some("FULL_QR".into());
+        app.pairing_code = Some("full-code".into());
+        app.pairing_qr_agent = Some("AGENT_QR".into());
+        app.pairing_code_agent = Some("agent-code".into());
+        app.mode = Mode::Background;
+
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert_eq!(app.pair_scope, PairScope::Agent, "watch is skipped");
+        assert_eq!(
+            app.visible_pairing_qr().map(String::as_str),
+            Some("AGENT_QR")
+        );
+
+        app.handle_background_key(press(KeyCode::Char('w')));
+        assert_eq!(
+            app.pair_scope,
+            PairScope::Full,
+            "wraps past the absent watch"
+        );
+    }
+
+    // With only the full-access pairing (a guest, or no other legs), `w` does nothing.
+    #[tokio::test]
+    async fn background_w_is_a_noop_with_only_full() {
         let mut app = test_app();
         app.pairing_qr = Some("FULL_QR".into());
         app.mode = Mode::Background;
         app.handle_background_key(press(KeyCode::Char('w')));
-        assert!(!app.show_watch);
+        assert_eq!(app.pair_scope, PairScope::Full);
         assert_eq!(
             app.visible_pairing_qr().map(String::as_str),
             Some("FULL_QR")

@@ -160,9 +160,19 @@ pub async fn serve_relay_handoff(
     broker: BrokerHandle,
     status: mpsc::Sender<HandoffStatus>,
     profile: ClientProfile,
+    peer_accept: Option<PeerAccept>,
 ) {
-    // Co-located handoff is human/watch pairing only — no reverse-edge acceptance yet.
-    relay_dial_loop(relay_url, cipher, broker, Some(status), profile, None).await;
+    // Full/watch legs pass `None`; the agent-peer leg passes `Some`, so an inbound
+    // dialer's reverse-edge offer is accepted and the return edge registered (#61).
+    relay_dial_loop(
+        relay_url,
+        cipher,
+        broker,
+        Some(status),
+        profile,
+        peer_accept,
+    )
+    .await;
 }
 
 // Keep one spare host connection parked on the relay at all times. Each iteration

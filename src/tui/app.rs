@@ -81,13 +81,16 @@ pub(super) struct App {
     // Set by handlers, applied by the run loop (which holds the host handle).
     pub(super) pending_transition: Option<Mode>,
     // Present only on the owner TUI with NUDGE_RELAY set; drives the /background QR.
-    // `_watch` is the second, watch-only pairing (a teammate who may observe but not
-    // drive); `show_watch` toggles which of the two the background screen renders.
+    // `_watch` is a watch-only pairing (observe, cannot drive); `_agent` is an
+    // agent-peer pairing (a remote nudge dials it with /connect-peer). `pair_scope`
+    // selects which of the (up to three) codes the background screen renders.
     pub(super) pairing_qr: Option<String>,
     pub(super) pairing_code: Option<String>,
     pub(super) pairing_qr_watch: Option<String>,
     pub(super) pairing_code_watch: Option<String>,
-    pub(super) show_watch: bool,
+    pub(super) pairing_qr_agent: Option<String>,
+    pub(super) pairing_code_agent: Option<String>,
+    pub(super) pair_scope: PairScope,
     // Relay-dial progress; None until the first update.
     pub(super) handoff_status: Option<HandoffStatus>,
     // Cosmetic only: owner = this process hosts the loop (and may show a pairing QR);
@@ -110,9 +113,33 @@ pub struct UiConfig {
     pub pairing_code: Option<String>,
     pub pairing_qr_watch: Option<String>,
     pub pairing_code_watch: Option<String>,
+    pub pairing_qr_agent: Option<String>,
+    pub pairing_code_agent: Option<String>,
     pub is_owner: bool,
     pub user_name: String,
     pub models: Vec<(String, String)>,
+}
+
+// Which pairing the /background screen currently shows. Full is always present when
+// any pairing is (the owner always mints it); watch/agent may be absent (a guest or a
+// --connect client has none). The `w` key cycles Full → Watch → Agent, skipping absent
+// scopes (see `next_pairing_scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PairScope {
+    Full,
+    Watch,
+    Agent,
+}
+
+impl PairScope {
+    // Short label for the footer toggle hint.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            PairScope::Full => "full-access",
+            PairScope::Watch => "watch-only",
+            PairScope::Agent => "agent-peer",
+        }
+    }
 }
 
 impl App {
@@ -143,7 +170,9 @@ impl App {
             pairing_code: cfg.pairing_code,
             pairing_qr_watch: cfg.pairing_qr_watch,
             pairing_code_watch: cfg.pairing_code_watch,
-            show_watch: false,
+            pairing_qr_agent: cfg.pairing_qr_agent,
+            pairing_code_agent: cfg.pairing_code_agent,
+            pair_scope: PairScope::Full,
             handoff_status: None,
             is_owner: cfg.is_owner,
             self_name: cfg.user_name,
@@ -171,26 +200,44 @@ impl App {
         self.log.push(entry);
     }
 
-    // Whether a watch-only pairing exists to toggle to (owner TUI with a relay).
-    pub(super) fn has_watch_pairing(&self) -> bool {
-        self.pairing_qr_watch.is_some()
-    }
-
-    // The QR/code the background screen currently shows: the watch-only pair when
-    // toggled on and present, else the full-access pair.
-    pub(super) fn visible_pairing_qr(&self) -> Option<&String> {
-        if self.show_watch {
-            self.pairing_qr_watch.as_ref()
-        } else {
-            self.pairing_qr.as_ref()
+    // The QR for a given scope, if that pairing exists.
+    fn scope_qr(&self, scope: PairScope) -> Option<&String> {
+        match scope {
+            PairScope::Full => self.pairing_qr.as_ref(),
+            PairScope::Watch => self.pairing_qr_watch.as_ref(),
+            PairScope::Agent => self.pairing_qr_agent.as_ref(),
         }
     }
 
+    // The next present pairing scope after the current one, cycling Full → Watch →
+    // Agent → (wrap), skipping absent scopes and the current scope itself. `None` when
+    // no other scope has a code (only one pairing, or none) — then `w` is a no-op.
+    pub(super) fn next_pairing_scope(&self) -> Option<PairScope> {
+        const ORDER: [PairScope; 3] = [PairScope::Full, PairScope::Watch, PairScope::Agent];
+        let cur = ORDER.iter().position(|s| *s == self.pair_scope).unwrap();
+        (1..ORDER.len())
+            .map(|step| ORDER[(cur + step) % ORDER.len()])
+            .find(|s| self.scope_qr(*s).is_some())
+    }
+
+    // Advance the background screen to the next present pairing scope; a no-op when
+    // there is no other scope to show.
+    pub(super) fn cycle_pairing(&mut self) {
+        if let Some(next) = self.next_pairing_scope() {
+            self.pair_scope = next;
+        }
+    }
+
+    // The QR/code the background screen currently shows, per `pair_scope`.
+    pub(super) fn visible_pairing_qr(&self) -> Option<&String> {
+        self.scope_qr(self.pair_scope)
+    }
+
     pub(super) fn visible_pairing_code(&self) -> Option<&String> {
-        if self.show_watch {
-            self.pairing_code_watch.as_ref()
-        } else {
-            self.pairing_code.as_ref()
+        match self.pair_scope {
+            PairScope::Full => self.pairing_code.as_ref(),
+            PairScope::Watch => self.pairing_code_watch.as_ref(),
+            PairScope::Agent => self.pairing_code_agent.as_ref(),
         }
     }
 }

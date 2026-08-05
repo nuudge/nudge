@@ -52,6 +52,8 @@ pub async fn host(cli: Cli) -> Result<()> {
         pairing_code: None,
         pairing_qr_watch: None,
         pairing_code_watch: None,
+        pairing_qr_agent: None,
+        pairing_code_agent: None,
         // This process hosts the agent loop: it's the owner TUI (cosmetic badge only).
         is_owner: true,
         user_name: who.name.clone(),
@@ -200,14 +202,16 @@ pub async fn host(cli: Cli) -> Result<()> {
 
     if cli.daemon {
         // --daemon --peer parks an agent-scope leg that accepts a remote dialer's
-        // reverse-edge offer, registering the return edge into this loop (#53). The
-        // co-located (interactive) path can dial out but does not park a leg yet.
+        // reverse-edge offer, registering the return edge into this loop (#53).
         let peer_accept = cli.peer.then(|| transport::PeerAccept {
             identity: peer_identity,
             registrar: peer_reg_tx,
         });
         daemon::run(host, cli.socket, relay, cli.watch, peer_accept).await
     } else {
-        local::run(host, ui_cfg, who, relay).await
+        // The co-located handoff arms an agent-peer leg too (#61): once /background
+        // dials, this interactive session is simultaneously human-driven and dialable
+        // via /connect-peer, so it needs the same identity + registrar the dialer got.
+        local::run(host, ui_cfg, who, relay, peer_identity, peer_reg_tx).await
     }
 }
