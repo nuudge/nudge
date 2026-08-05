@@ -154,6 +154,7 @@ pub async fn host(cli: Cli) -> Result<()> {
         core::PeerWiring {
             factory: Some(factory),
             initial_peers: Default::default(),
+            register_rx: None,
         },
     );
 

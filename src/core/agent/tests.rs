@@ -261,7 +261,63 @@ async fn peer_activity_surfaces_as_a_notice() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A supervised peer registration, as the Spawn path produces (steered + dismissable).
+// #52: a peer handed to a LIVE loop through the composition-root wiring —
+// `PeerWiring.register_rx` → `AgentIo.peer_register_rx` — lands in the loop. Built on
+// the real `SessionHost::spawn` path (not `mk_io`), so it proves the seam the runtime
+// producer will drive: sending a registration through the channel makes the peer show
+// up in the re-emitted Capabilities roster.
+#[tokio::test]
+async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
+    use crate::core::PeerWiring;
+
+    let (session, dir) = mk_session();
+    let (peer_reg_tx, peer_reg_rx) = mpsc::unbounded_channel();
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring {
+            factory: None,
+            initial_peers: PeerSet::default(),
+            register_rx: Some(peer_reg_rx),
+        },
+    );
+
+    let mut ctrl = host
+        .attach(ClientIdentity::human("watcher"))
+        .await
+        .expect("initial attach");
+
+    // Drive the registrar the way the runtime producer will: a completed edge arrives
+    // through the channel. The loop registers it and re-advertises the roster.
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peer_reg_tx
+        .send(PeerRegistration::new(peer_ctrl, agent_who("remote-1")))
+        .unwrap();
+
+    let saw_peer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ctrl.events.recv().await {
+                Some(ControllerEvent::Capabilities { peers, .. })
+                    if peers.iter().any(|p| p.name == "remote-1") =>
+                {
+                    break true;
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the peer to appear in Capabilities");
+    assert!(saw_peer, "the registered peer must appear in the roster");
+
+    host.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
 fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistration {
     PeerRegistration {
         controller,

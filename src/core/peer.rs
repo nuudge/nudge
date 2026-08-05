@@ -72,13 +72,15 @@ pub struct PeerRegistration {
 }
 
 // The peer capabilities an agent is born with: whether it may spawn subagents (the
-// factory) and which peers it already holds — e.g. a spawned child starts with its
+// factory), which peers it already holds — e.g. a spawned child starts with its
 // return edge to the spawner seeded here, so MessagePeer is available from its very
-// first turn. Default = a plain session with neither.
+// first turn — and the runtime registrar the composition root drives to hand the
+// live loop new peers (a `/connect-peer` edge). Default = a plain session with none.
 #[derive(Default)]
 pub struct PeerWiring {
     pub factory: Option<PeerFactory>,
     pub initial_peers: PeerSet,
+    pub register_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>>,
 }
 
 impl PeerRegistration {
