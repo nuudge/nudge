@@ -170,6 +170,7 @@ impl SessionHost {
                 // loop's registration select arm inert.
                 peer_register_rx: peers.register_rx,
                 peer_factory: peers.factory,
+                peer_dialer: peers.dialer,
                 self_handle,
             },
         ));

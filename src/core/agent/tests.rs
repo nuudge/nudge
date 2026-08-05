@@ -189,6 +189,7 @@ fn mk_io(
         peers,
         peer_register_rx,
         peer_factory: None,
+        peer_dialer: None,
         self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
     }
 }
@@ -283,6 +284,7 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
             factory: None,
             initial_peers: PeerSet::default(),
             register_rx: Some(peer_reg_rx),
+            dialer: None,
         },
     );
 
@@ -318,6 +320,100 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
     host.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// #53: the /connect-peer command hands the pasted code to the injected dialer (off the
+// loop, non-blocking) and the completed forward edge lands via the registrar. A stub
+// dialer stands in for the network — it records the code it was handed and registers a
+// peer, whose far ends a keeper task holds alive so the edge isn't immediately reaped.
+#[tokio::test]
+async fn connect_peer_command_invokes_dialer_and_registers_edge() {
+    use crate::core::{BrokerHandle, PeerDialer, PeerWiring};
+
+    let (session, dir) = mk_session();
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+    let (code_tx, mut code_rx) = mpsc::unbounded_channel::<String>();
+
+    let dialer: PeerDialer = Box::new(move |code: String, _self: BrokerHandle| {
+        let reg_tx = reg_tx.clone();
+        let code_tx = code_tx.clone();
+        Box::pin(async move {
+            let _ = code_tx.send(code);
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+            let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(16);
+            // Hold the far ends so the registered peer isn't reaped before we observe it.
+            tokio::spawn(async move {
+                let _keep = (ev_tx, ui_rx);
+                std::future::pending::<()>().await;
+            });
+            reg_tx
+                .send(PeerRegistration::new(
+                    Controller {
+                        events: ev_rx,
+                        ui_tx,
+                    },
+                    agent_who("remote-peer"),
+                ))
+                .map_err(|_| anyhow::anyhow!("loop gone"))?;
+            Ok(())
+        })
+    });
+
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring {
+            factory: None,
+            initial_peers: PeerSet::default(),
+            register_rx: Some(reg_rx),
+            dialer: Some(dialer),
+        },
+    );
+    let mut ctrl = host
+        .attach(ClientIdentity::human("watcher"))
+        .await
+        .expect("attach");
+
+    ctrl.ui_tx
+        .send(UiEvent::Command {
+            line: "/connect-peer nudge:pastedcode".into(),
+        })
+        .await
+        .unwrap();
+
+    // The dialer was invoked with exactly the pasted code (parse + dispatch + hand-off).
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), code_rx.recv())
+        .await
+        .expect("dialer was not invoked")
+        .expect("code");
+    assert_eq!(got, "nudge:pastedcode");
+
+    // The forward edge lands through the registrar: the peer shows up in the roster.
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ctrl.events.recv().await {
+                Some(ControllerEvent::Capabilities { peers, .. })
+                    if peers.iter().any(|p| p.name == "remote-peer") =>
+                {
+                    break true;
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the peer in Capabilities");
+    assert!(landed, "the dialed peer must appear in the roster");
+
+    host.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A supervised peer registration, as the Spawn path produces (steered + dismissable).
 fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistration {
     PeerRegistration {
         controller,
@@ -1200,6 +1296,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
             peers: PeerSet::default(),
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot)),
+            peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
         },
     ));
@@ -1295,6 +1392,7 @@ async fn spawn_denial_does_not_run_the_factory() {
             peers: PeerSet::default(),
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot.clone())),
+            peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
         },
     ));

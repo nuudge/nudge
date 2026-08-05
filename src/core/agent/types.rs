@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::core::events::{AgentEvent, McpServerInfo, ModelInfo, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet};
+use crate::core::peer::{PeerDialer, PeerFactory, PeerRegistration, PeerSet};
 use crate::llm::SystemBlock;
 
 use super::command::McpCommand;
@@ -79,5 +79,10 @@ pub struct AgentIo {
     // `self_handle` reaches this agent's OWN broker, handed to the factory so a
     // spawned child can attach back — the return edge.
     pub peer_factory: Option<PeerFactory>,
+    // Executor behind the human-only `/connect-peer` command (None = this session may
+    // not dial peers, e.g. a spawned child). `dispatch_command` hands it the pasted
+    // code + `self_handle` and spawns it, so the loop is never blocked on the dial; the
+    // finished forward edge returns via `peer_register_rx`.
+    pub peer_dialer: Option<PeerDialer>,
     pub self_handle: BrokerHandle,
 }

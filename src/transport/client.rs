@@ -25,7 +25,6 @@ const CHANNEL_CAPACITY: usize = 64;
 // A real `--daemon --peer` sends it as the first post-Attached frame; a non-peer
 // target never does, so this bound turns "no return edge" into a clean failure
 // instead of a hang.
-#[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
 const REVERSE_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The remote counterpart of `SessionHost`: it owns no loop, only the path to a
@@ -177,7 +176,6 @@ impl RelayClient {
     // registers the forward peer, attaches the reverse controller, spawns the duplex
     // pump, and returns — the caller's loop is never held on network I/O. `Err` = the
     // far side is gone or offered no return edge (not a `--daemon --peer`).
-    #[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
@@ -306,7 +304,6 @@ async fn pump_writes<W: FrameWriter<ClientFrame> + 'static>(
 // `ReverseCommand`s drive it. When the socket drops (or either side tears its half
 // down) the loop ends: dropping `fwd_ev_tx` closes the forward peer's stream (the
 // dialer's PeerSet reaps it), and dropping `ac` detaches the reverse controller.
-#[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
 async fn dial_pump<R, W>(
     mut reader: R,
     mut writer: W,

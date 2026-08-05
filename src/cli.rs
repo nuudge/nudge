@@ -75,4 +75,9 @@ pub struct Cli {
     /// observes the session but cannot drive it, run commands, answer prompts, or quit.
     #[arg(long, requires = "daemon", conflicts_with = "socket")]
     pub watch: bool,
+
+    /// (--daemon, relay) Also mint an agent-peer pairing code: a remote nudge session
+    /// dials it with `/connect-peer` to form a mutual, unsupervised peer edge.
+    #[arg(long, requires = "daemon", conflicts_with = "socket")]
+    pub peer: bool,
 }

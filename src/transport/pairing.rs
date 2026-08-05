@@ -41,12 +41,14 @@ const RENDEZVOUS_ID_BYTES: usize = 16;
 
 // The rights a pairing grants, minted into the code by the daemon and resolved back to a
 // ClientProfile on the accept path. `Full` = a full human front-end (your own phone);
-// `WatchOnly` = a restricted spectator (a teammate's code). The authority is the room the
-// pairing dials, not this tag — see the module comment.
+// `WatchOnly` = a restricted spectator (a teammate's code); `Agent` = a remote peer agent
+// reached via `/connect-peer` (an unsupervised conversation edge). The authority is the
+// room the pairing dials, not this tag — see the module comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingScope {
     Full,
     WatchOnly,
+    Agent,
 }
 
 impl PairingScope {
@@ -54,6 +56,7 @@ impl PairingScope {
         match self {
             PairingScope::Full => 0,
             PairingScope::WatchOnly => 1,
+            PairingScope::Agent => 2,
         }
     }
 
@@ -61,6 +64,7 @@ impl PairingScope {
         match b {
             0 => Ok(PairingScope::Full),
             1 => Ok(PairingScope::WatchOnly),
+            2 => Ok(PairingScope::Agent),
             other => anyhow::bail!("unknown pairing scope byte: {other}"),
         }
     }
@@ -72,6 +76,7 @@ impl PairingScope {
         match self {
             PairingScope::Full => ClientProfile::human(),
             PairingScope::WatchOnly => ClientProfile::watch_only(),
+            PairingScope::Agent => ClientProfile::agent(),
         }
     }
 }
@@ -198,7 +203,11 @@ mod tests {
     // survives, since matching keys on both ends is the whole point.
     #[test]
     fn encode_decode_round_trip() {
-        for scope in [PairingScope::Full, PairingScope::WatchOnly] {
+        for scope in [
+            PairingScope::Full,
+            PairingScope::WatchOnly,
+            PairingScope::Agent,
+        ] {
             let p = Pairing::generate_scoped("wss://relay.example.com".into(), scope);
             let restored = Pairing::decode(&p.encode()).unwrap();
             assert_eq!(restored.relay_base, p.relay_base);
@@ -253,6 +262,7 @@ mod tests {
             PairingScope::WatchOnly.profile(),
             ClientProfile::watch_only()
         );
+        assert_eq!(PairingScope::Agent.profile(), ClientProfile::agent());
     }
 
     #[test]

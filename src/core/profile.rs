@@ -69,7 +69,6 @@ impl ClientProfile {
     // session. Assigned by provenance (an agent-scope pairing / the dialer's own
     // reverse-edge grant), never claimed. Differs from `agent_peer` only in `commands`:
     // a peer edge carries the full slash-command surface, a spawned-child edge none.
-    #[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
     pub fn agent() -> Self {
         Self {
             commands: CommandScope::All,

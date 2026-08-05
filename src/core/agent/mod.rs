@@ -1,8 +1,9 @@
 use anyhow::Result;
 
 use super::events::{AgentEvent, UiEvent};
+use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::PeerSet;
+use crate::core::peer::{PeerDialer, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
@@ -40,6 +41,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
         mut peers,
         mut peer_register_rx,
         peer_factory,
+        peer_dialer,
         self_handle,
     } = io;
     let mut messages: Vec<Message> = initial_messages;
@@ -73,6 +75,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         &peers,
                         &agent_tx,
                         &mut last_session_ctx,
+                        &self_handle,
+                        &peer_dialer,
                     )
                     .await;
                 }
@@ -258,6 +262,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
                                 &peers,
                                 &agent_tx,
                                 &mut last_session_ctx,
+                                &self_handle,
+                                &peer_dialer,
                             )
                             .await;
                         }
@@ -341,6 +347,8 @@ async fn dispatch_command<P: Provider, B: Backend>(
     peers: &PeerSet,
     agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
     last_session_ctx: &mut (String, Option<String>, Option<String>),
+    self_handle: &BrokerHandle,
+    peer_dialer: &Option<PeerDialer>,
 ) {
     match command::parse(line) {
         Command::SetModel(model) => {
@@ -440,6 +448,43 @@ async fn dispatch_command<P: Provider, B: Backend>(
                     text: "usage: /model <id>".into(),
                 })
                 .await;
+        }
+        // Dial a remote peer over the relay. Human-only (no model tool) and never
+        // blocks the loop: hand the code to the injected dialer and spawn it — the
+        // finished forward edge arrives via `peer_register_rx`, and the reverse edge
+        // (the far side driving us) attaches to our own broker. A failure comes back
+        // as a Notice from the spawned task.
+        Command::ConnectPeer(code) => {
+            if code.trim().is_empty() {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: "usage: /connect-peer <pairing-code>".into(),
+                    })
+                    .await;
+            } else if let Some(dialer) = peer_dialer {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: "connecting to peer over the relay…".into(),
+                    })
+                    .await;
+                let fut = dialer(code, self_handle.clone());
+                let agent_tx = agent_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = fut.await {
+                        let _ = agent_tx
+                            .send(AgentEvent::Notice {
+                                text: format!("could not connect to peer: {e:#}"),
+                            })
+                            .await;
+                    }
+                });
+            } else {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: "peer connections are not available in this session".into(),
+                    })
+                    .await;
+            }
         }
         Command::Unknown(cmd) => {
             let _ = agent_tx

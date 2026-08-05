@@ -11,6 +11,7 @@ pub(super) async fn run(
     socket: Option<PathBuf>,
     relay: Option<String>,
     watch: bool,
+    peer_accept: Option<transport::PeerAccept>,
 ) -> Result<()> {
     let broker = host.broker_handle();
     // The long-running daemon. A controller quitting/leaving never ends it, so
@@ -26,7 +27,9 @@ pub(super) async fn run(
             // Relay daemon: mint a fresh room + key, print a QR to pair a device,
             // and dial OUT to the relay (the only direction that crosses NAT). With
             // --watch, mint a SECOND watch-only pairing (its own room + key) and park a
-            // spare on it too, so a restricted spectator can pair alongside.
+            // spare on it too, so a restricted spectator can pair alongside. With --peer,
+            // mint a THIRD agent-scope pairing whose leg accepts a remote dialer's
+            // reverse-edge offer (#53).
             let base = relay.context(
                 "set NUDGE_RELAY to host over a relay, or pass --socket <path> for a local debug daemon",
             )?;
@@ -40,13 +43,23 @@ pub(super) async fn run(
             }];
             if watch {
                 let watch_pairing =
-                    transport::Pairing::generate_scoped(base, PairingScope::WatchOnly);
+                    transport::Pairing::generate_scoped(base.clone(), PairingScope::WatchOnly);
                 print_pairing(&watch_pairing, "watch-only")?;
                 legs.push(transport::RelayLeg {
                     dial_url: watch_pairing.host_dial_url(),
                     cipher: watch_pairing.cipher.clone(),
                     profile: watch_pairing.scope.profile(),
                     peer_accept: None,
+                });
+            }
+            if let Some(peer_accept) = peer_accept {
+                let agent_pairing = transport::Pairing::generate_scoped(base, PairingScope::Agent);
+                print_pairing(&agent_pairing, "agent-peer")?;
+                legs.push(transport::RelayLeg {
+                    dial_url: agent_pairing.host_dial_url(),
+                    cipher: agent_pairing.cipher.clone(),
+                    profile: agent_pairing.scope.profile(),
+                    peer_accept: Some(peer_accept),
                 });
             }
             transport::run_relay_daemon(legs, broker).await

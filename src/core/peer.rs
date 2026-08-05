@@ -33,6 +33,22 @@ pub type PeerFactory = Box<
         + Sync,
 >;
 
+// Dials a remote peer on demand — the executor behind the human-only `/connect-peer`
+// command. Like `PeerFactory`, the composition root supplies it (dialing needs a
+// transport, which `core` must not name), and the loop hands it the pasted pairing
+// code plus a handle to its OWN broker (so the far side's reverse edge attaches back).
+// It captures the runtime registrar, so the completed forward edge returns through
+// `peer_register_rx` rather than blocking the loop on network I/O. Absent for a session
+// that cannot dial (a spawned child).
+pub type PeerDialer = Box<
+    dyn Fn(
+            String,
+            BrokerHandle,
+        ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // A peer this agent holds a client connection to.
 struct Peer {
     who: ClientIdentity,
@@ -81,6 +97,7 @@ pub struct PeerWiring {
     pub factory: Option<PeerFactory>,
     pub initial_peers: PeerSet,
     pub register_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>>,
+    pub dialer: Option<PeerDialer>,
 }
 
 impl PeerRegistration {
