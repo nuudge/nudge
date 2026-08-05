@@ -35,10 +35,13 @@ Everything below is downstream of these, in priority order.
    half-channels (**observe** and **drive**) over uniform connections. When a new capability
    comes up, the question is "which composition of the existing primitives is this?" — not
    "what new channel do we add?"
-4. **Bidirectional by construction, not by feature.** A single connection is a one-way
-   relationship: A drives and observes B. Two-way collaboration is *two connections*, not a
-   special "duplex" mode. Symmetry between two agents means each is a client of the other —
-   nothing more.
+4. **Bidirectional by construction, not by feature.** A single *relationship* is one-way:
+   A drives and observes B. Two-way collaboration is *two directed edges*, not a merged
+   channel with blended semantics. Symmetry between two agents means each holds an edge to
+   the other — nothing more. The two edges of a mutual pair *may share one transport
+   connection* (a duplex socket carrying direction-tagged frames — the duplex peer
+   transport): that is bundling, not a third kind of relationship. Each direction keeps its
+   own drive/observe halves, its own profile, and its own replay cursor.
 5. **The symmetry test.** If you cannot tell whether a human or an agent is on the other end
    of a connection, and it does not change how you behave, the design is right.
 
