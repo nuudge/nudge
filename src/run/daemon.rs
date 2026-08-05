@@ -36,6 +36,7 @@ pub(super) async fn run(
                 dial_url: full.host_dial_url(),
                 cipher: full.cipher.clone(),
                 profile: full.scope.profile(),
+                peer_accept: None,
             }];
             if watch {
                 let watch_pairing =
@@ -45,6 +46,7 @@ pub(super) async fn run(
                     dial_url: watch_pairing.host_dial_url(),
                     cipher: watch_pairing.cipher.clone(),
                     profile: watch_pairing.scope.profile(),
+                    peer_accept: None,
                 });
             }
             transport::run_relay_daemon(legs, broker).await

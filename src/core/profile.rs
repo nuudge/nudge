@@ -62,6 +62,21 @@ impl ClientProfile {
         }
     }
 
+    // A remote peer agent reached over a `/connect-peer` edge: an unsupervised
+    // conversation edge (model 2). It drives and observes and may run commands ("it's
+    // just another message"), but does not end the session, receive supervision
+    // chatter, or answer permission prompts — each side's own human gates its own
+    // session. Assigned by provenance (an agent-scope pairing / the dialer's own
+    // reverse-edge grant), never claimed. Differs from `agent_peer` only in `commands`:
+    // a peer edge carries the full slash-command surface, a spawned-child edge none.
+    #[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
+    pub fn agent() -> Self {
+        Self {
+            commands: CommandScope::All,
+            ..Self::agent_peer()
+        }
+    }
+
     // The edge from a spawner to the child it supervises: an agent peer that additionally
     // may answer the child's permission check-ins (that IS supervision — the parent
     // steers its child's gated calls). Assigned by direction at spawn time, which the

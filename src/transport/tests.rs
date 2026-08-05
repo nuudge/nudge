@@ -11,12 +11,15 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+use super::daemon::PeerAccept;
 use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
 use super::{RelayClient, RelayLeg, SocketClient, bind_listener, run_daemon, run_relay_daemon};
 use crate::core::host::spawn_bare_broker;
+use crate::core::peer::{PeerRegistration, PeerSet};
 use crate::core::{
-    AgentEvent, ClientIdentity, ClientProfile, Controller, ControllerEvent, SessionHandle, UiEvent,
+    AgentEvent, ClientIdentity, ClientKind, ClientProfile, Controller, ControllerEvent,
+    SessionHandle, UiEvent,
 };
 
 // A collision-free socket path under the system temp dir. The name is kept short
@@ -177,6 +180,7 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
             dial_url: url.clone(),
             cipher: cipher.clone(),
             profile: ClientProfile::human(),
+            peer_accept: None,
         }],
         bb.handle.clone(),
     ));
@@ -283,6 +287,7 @@ async fn relay_sees_only_ciphertext() {
             dial_url: url.clone(),
             cipher: cipher.clone(),
             profile: ClientProfile::human(),
+            peer_accept: None,
         }],
         bb.handle.clone(),
     ));
@@ -452,6 +457,7 @@ async fn relay_two_clients_attach_concurrently() {
             dial_url: host_url,
             cipher: cipher.clone(),
             profile: ClientProfile::human(),
+            peer_accept: None,
         }],
         bb.handle.clone(),
     ));
@@ -486,4 +492,213 @@ async fn relay_two_clients_attach_concurrently() {
 
     daemon.abort();
     bb.task.abort();
+}
+
+// An agent-kind identity for a peer session (what a session announces over the edge).
+fn agent_id(name: &str) -> ClientIdentity {
+    ClientIdentity {
+        kind: ClientKind::Agent,
+        name: name.into(),
+        session_id: None,
+        task: None,
+    }
+}
+
+// #60: both directed edges of a mutual peer pair ride ONE socket. Two bare brokers
+// (A's and B's), one relay, one socket. B parks an agent-scope leg that answers the
+// reverse-edge offer; A dials it. The forward peer (B) lands in A's PeerSet and the
+// return peer (A) lands in B's PeerSet — both through the #52 registrar, each named by
+// what the OTHER side announced — and all four half-channels work over the single
+// socket, before any command exists.
+#[tokio::test]
+async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
+    let port = spawn_test_relay().await;
+    let url = format!("ws://127.0.0.1:{port}/peerroom");
+    let cipher = Cipher::generate();
+
+    let mut bb_a = spawn_bare_broker(Vec::new());
+    let mut bb_b = spawn_bare_broker(Vec::new());
+    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
+    let (reg_b_tx, mut reg_b_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
+
+    let who_a = agent_id("peer-a");
+    let who_b = agent_id("peer-b");
+
+    // B is the acceptor: an agent leg that accepts the reverse-edge offer.
+    let daemon = tokio::spawn(run_relay_daemon(
+        vec![RelayLeg {
+            dial_url: url.clone(),
+            cipher: cipher.clone(),
+            profile: ClientProfile::agent(),
+            peer_accept: Some(PeerAccept {
+                identity: who_b.clone(),
+                registrar: reg_b_tx,
+            }),
+        }],
+        bb_b.handle.clone(),
+    ));
+
+    // A dials B with the reverse-edge offer.
+    let client = RelayClient::new(url.clone(), cipher.clone());
+    timeout(
+        Duration::from_secs(5),
+        client.dial_peer(bb_a.handle.clone(), reg_a_tx, who_a.clone()),
+    )
+    .await
+    .expect("dial_peer timed out")
+    .expect("dial_peer failed");
+
+    // Both return edges arrive through the registrars, each named by the OTHER side's
+    // announced identity (never derived locally).
+    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
+        .await
+        .expect("A registrar timeout")
+        .expect("A received peer B");
+    let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
+        .await
+        .expect("B registrar timeout")
+        .expect("B received peer A");
+    assert_eq!(
+        peer_b.who.name, "peer-b",
+        "A holds B under B's announced name"
+    );
+    assert_eq!(
+        peer_a.who.name, "peer-a",
+        "B holds A under A's announced name"
+    );
+    assert!(
+        !peer_b.supervised && !peer_a.supervised,
+        "both edges unsupervised"
+    );
+
+    let mut peers_a = PeerSet::default();
+    let mut peers_b = PeerSet::default();
+    let id_b = peers_a.register(peer_b);
+    let id_a = peers_b.register(peer_a);
+
+    // A observes B: an event injected into B's broker reaches A's held peer.
+    bb_b.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "from-b".into(),
+        })
+        .await
+        .unwrap();
+    match timeout(Duration::from_secs(5), peers_a.recv())
+        .await
+        .expect("A observe timeout")
+    {
+        (id, Some(ControllerEvent::AssistantText { text })) => {
+            assert_eq!(id, id_b);
+            assert_eq!(text, "from-b");
+        }
+        other => panic!("A expected to observe B's text, got {other:?}"),
+    }
+
+    // A drives B: a message driven to A's held peer reaches B's broker, stamped as A.
+    peers_a
+        .drive(
+            id_b,
+            UiEvent::UserMessage {
+                text: "a-drives".into(),
+            },
+        )
+        .await;
+    match timeout(Duration::from_secs(5), bb_b.loop_ui_rx.recv())
+        .await
+        .expect("B loop timeout")
+    {
+        Some((who, UiEvent::UserMessage { text })) => {
+            assert_eq!(text, "a-drives");
+            assert_eq!(who.expect("stamped sender").name, "peer-a");
+        }
+        other => panic!("B's loop expected A's drive, got {other:?}"),
+    }
+
+    // B observes A: an event injected into A's broker reaches B's held peer.
+    bb_a.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "from-a".into(),
+        })
+        .await
+        .unwrap();
+    match timeout(Duration::from_secs(5), peers_b.recv())
+        .await
+        .expect("B observe timeout")
+    {
+        (id, Some(ControllerEvent::AssistantText { text })) => {
+            assert_eq!(id, id_a);
+            assert_eq!(text, "from-a");
+        }
+        other => panic!("B expected to observe A's text, got {other:?}"),
+    }
+
+    // B drives A: a message driven to B's held peer reaches A's broker, stamped as B.
+    peers_b
+        .drive(
+            id_a,
+            UiEvent::UserMessage {
+                text: "b-drives".into(),
+            },
+        )
+        .await;
+    match timeout(Duration::from_secs(5), bb_a.loop_ui_rx.recv())
+        .await
+        .expect("A loop timeout")
+    {
+        Some((who, UiEvent::UserMessage { text })) => {
+            assert_eq!(text, "b-drives");
+            assert_eq!(who.expect("stamped sender").name, "peer-b");
+        }
+        other => panic!("A's loop expected B's drive, got {other:?}"),
+    }
+
+    daemon.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+}
+
+// #60 negative case: dialing a leg WITHOUT `peer_accept` (a plain full-scope leg, or an
+// old daemon that ignores the offer) must fail closed within the ReverseAttach timeout,
+// not hang — and register no forward peer. Proves the bounded-wait fallback.
+#[tokio::test]
+async fn dial_peer_without_return_edge_fails_closed() {
+    let port = spawn_test_relay().await;
+    let url = format!("ws://127.0.0.1:{port}/plainroom");
+    let cipher = Cipher::generate();
+
+    let bb = spawn_bare_broker(Vec::new());
+    // A plain full-scope leg: it admits the attach but offers no return edge.
+    let daemon = tokio::spawn(run_relay_daemon(
+        vec![RelayLeg {
+            dial_url: url.clone(),
+            cipher: cipher.clone(),
+            profile: ClientProfile::human(),
+            peer_accept: None,
+        }],
+        bb.handle.clone(),
+    ));
+
+    let (reg_tx, mut reg_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
+    let bb_dialer = spawn_bare_broker(Vec::new());
+    let client = RelayClient::new(url, cipher);
+    // The outer timeout is generous vs. the internal ReverseAttach timeout: dial_peer
+    // must RETURN (with an error), never hang.
+    let result = timeout(
+        Duration::from_secs(20),
+        client.dial_peer(bb_dialer.handle.clone(), reg_tx, agent_id("peer-a")),
+    )
+    .await
+    .expect("dial_peer must fail closed, not hang");
+    assert!(
+        result.is_err(),
+        "dialing a leg without a return edge must fail, got {result:?}"
+    );
+    assert!(
+        reg_rx.try_recv().is_err(),
+        "no forward peer may be registered on a failed dial"
+    );
+
+    daemon.abort();
+    bb.task.abort();
+    bb_dialer.task.abort();
 }

@@ -1,20 +1,32 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
 };
-use crate::core::{ClientIdentity, Controller, ControllerEvent, SessionHandle, UiEvent};
+use crate::core::{
+    BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, PeerRegistration,
+    SessionHandle, UiEvent,
+};
 
 // Channel depth between the bridge tasks and the TUI. Matches the in-process
 // host's CHANNEL_CAPACITY so backpressure behaves the same across transports.
 const CHANNEL_CAPACITY: usize = 64;
+
+// How long a peer dial waits, after `Attached`, for the acceptor's `ReverseAttach`.
+// A real `--daemon --peer` sends it as the first post-Attached frame; a non-peer
+// target never does, so this bound turns "no return edge" into a clean failure
+// instead of a hang.
+#[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
+const REVERSE_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The remote counterpart of `SessionHost`: it owns no loop, only the path to a
 // daemon's Unix socket. Each `attach` opens a fresh connection, performs the
@@ -47,7 +59,13 @@ impl SocketClient {
         let mut reader = LineReader(BufReader::new(read_half));
         let mut writer = LineWriter(write_half);
 
-        writer.send(&ClientFrame::Attach { after_seq, who }).await?;
+        writer
+            .send(&ClientFrame::Attach {
+                after_seq,
+                who,
+                reverse_offer: false,
+            })
+            .await?;
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
             Some(ServerFrame::Attached) => {}
@@ -126,7 +144,13 @@ impl RelayClient {
         let mut writer = WsWriter::new(sink, self.cipher.clone());
         let mut reader = WsReader::new(stream, self.cipher.clone());
 
-        writer.send(&ClientFrame::Attach { after_seq, who }).await?;
+        writer
+            .send(&ClientFrame::Attach {
+                after_seq,
+                who,
+                reverse_offer: false,
+            })
+            .await?;
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
             Some(ServerFrame::Attached) => {}
@@ -143,6 +167,81 @@ impl RelayClient {
             events: event_rx,
             ui_tx,
         }))
+    }
+
+    // Dial a peer session over the relay and establish the DUPLEX edge (#60): both
+    // directed edges of the mutual pair ride this one socket. `self_broker` is the
+    // dialer's OWN broker (so the far side can drive/observe it — the reverse edge),
+    // `registrar` hands the forward peer to the dialer's live loop (#52), and `who` is
+    // the dialer's announced identity. Non-blocking: it performs the handshake,
+    // registers the forward peer, attaches the reverse controller, spawns the duplex
+    // pump, and returns — the caller's loop is never held on network I/O. `Err` = the
+    // far side is gone or offered no return edge (not a `--daemon --peer`).
+    #[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
+    pub async fn dial_peer(
+        &self,
+        self_broker: BrokerHandle,
+        registrar: mpsc::UnboundedSender<PeerRegistration>,
+        who: ClientIdentity,
+    ) -> Result<()> {
+        let (ws, _resp) = connect_async(self.relay_url.as_str())
+            .await
+            .with_context(|| format!("dialing peer relay at {}", self.relay_url))?;
+        let (sink, stream) = ws.split();
+        let mut writer = WsWriter::new(sink, self.cipher.clone());
+        let mut reader = WsReader::new(stream, self.cipher.clone());
+
+        writer
+            .send(&ClientFrame::Attach {
+                after_seq: None,
+                who,
+                reverse_offer: true,
+            })
+            .await?;
+        match reader.recv().await? {
+            Some(ServerFrame::Attached) => {}
+            Some(ServerFrame::Busy) => anyhow::bail!("the peer session has ended"),
+            other => anyhow::bail!("unexpected handshake response: {other:?}"),
+        }
+        // The acceptor announces itself in ReverseAttach as the first frame after
+        // Attached. A non-peer target (a phone daemon) ignores the offer and streams
+        // forward Events instead; bound the wait so we don't hang, then fail cleanly.
+        let peer_who = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
+            Ok(Ok(Some(ServerFrame::ReverseAttach { who }))) => who,
+            _ => anyhow::bail!(
+                "the far side offered no return edge — the target must be a `--daemon --peer` session"
+            ),
+        };
+
+        // Forward edge: the dialer holds the acceptor as a peer (drives/observes it).
+        // The pump feeds inbound Events into `fwd_ev_tx` and drains outbound drives from
+        // `fwd_ui_rx`; the Controller with the matching ends goes to the loop's PeerSet.
+        let (fwd_ev_tx, fwd_ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+        let (fwd_ui_tx, fwd_ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
+        let forward = Controller {
+            events: fwd_ev_rx,
+            ui_tx: fwd_ui_tx,
+        };
+        if registrar
+            .send(PeerRegistration::new(forward, peer_who.clone()))
+            .is_err()
+        {
+            anyhow::bail!("the dialer's loop is gone");
+        }
+
+        // Reverse edge: attach a controller to the dialer's OWN broker as the acceptor
+        // (provenance: the reverse grant is implied by running /connect-peer). Its
+        // events go out as ReverseEvent; inbound ReverseCommands drive it.
+        let ac = match self_broker
+            .attach_as(peer_who, ClientProfile::agent())
+            .await
+        {
+            Some(c) => c,
+            None => anyhow::bail!("the dialer's broker is gone"),
+        };
+
+        tokio::spawn(dial_pump(reader, writer, fwd_ev_tx, fwd_ui_rx, ac));
+        Ok(())
     }
 }
 
@@ -197,4 +296,56 @@ async fn pump_writes<W: FrameWriter<ClientFrame> + 'static>(
         }
     }
     let _ = writer.send(&ClientFrame::Detach).await;
+}
+
+// The dialer's half of the duplex peer edge (#60): both directed edges over one
+// socket. Forward — the dialer holds the acceptor as a peer: inbound `Event`s feed the
+// forward peer's stream (observe), outbound drives from `fwd_ui_rx` go out as `Command`
+// (drive). Reverse — the acceptor drives/observes the dialer: `ac` (attached to the
+// dialer's own broker) streams its events out as `ReverseEvent`, and inbound
+// `ReverseCommand`s drive it. When the socket drops (or either side tears its half
+// down) the loop ends: dropping `fwd_ev_tx` closes the forward peer's stream (the
+// dialer's PeerSet reaps it), and dropping `ac` detaches the reverse controller.
+#[allow(dead_code)] // production caller lands with /connect-peer (#53); exercised by the duplex transport test
+async fn dial_pump<R, W>(
+    mut reader: R,
+    mut writer: W,
+    fwd_ev_tx: mpsc::UnboundedSender<ControllerEvent>,
+    mut fwd_ui_rx: mpsc::Receiver<UiEvent>,
+    mut ac: Controller,
+) where
+    R: FrameReader<ServerFrame> + 'static,
+    W: FrameWriter<ClientFrame> + 'static,
+{
+    let mut rev_seq: u64 = 0;
+    loop {
+        tokio::select! {
+            ui = fwd_ui_rx.recv() => match ui {
+                // Drive the acceptor (forward).
+                Some(ui) => if writer.send(&ClientFrame::Command(ui)).await.is_err() { break },
+                // The loop reaped the forward peer → tear the edge down.
+                None => break,
+            },
+            ev = ac.events.recv() => match ev {
+                // The dialer's own broker events → the acceptor observes them (reverse).
+                Some(event) => {
+                    let seq = rev_seq;
+                    rev_seq += 1;
+                    if writer.send(&ClientFrame::ReverseEvent { seq, event }).await.is_err() { break }
+                }
+                // The dialer's broker went away.
+                None => break,
+            },
+            frame = reader.recv() => match frame {
+                // The acceptor's events → the forward peer's observe stream.
+                Ok(Some(ServerFrame::Event { event, .. })) => { let _ = fwd_ev_tx.send(event); }
+                // The acceptor drives the dialer (reverse) → the dialer's own broker.
+                Ok(Some(ServerFrame::ReverseCommand(ui))) => { let _ = ac.ui_tx.send(ui).await; }
+                // ReverseAttach was consumed at the handshake; Attached/Busy are noise here.
+                Ok(Some(_)) => {}
+                // Socket closed or a fault → the edge is dropped.
+                Ok(None) | Err(_) => break,
+            },
+        }
+    }
 }
