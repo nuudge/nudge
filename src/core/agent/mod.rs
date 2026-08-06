@@ -59,12 +59,73 @@ pub async fn run_agent<P: Provider, B: Backend>(
     );
 
     // OUTER loop: one iteration per user turn.
+    // A coalesce over-read stashes one input here; the next turn consumes it first.
+    let mut pending_input: Option<LoopInput> = None;
     loop {
-        let (who, user_text) = loop {
-            tokio::select! {
-                ui = ui_rx.recv() => match ui {
-                Some((who, UiEvent::UserMessage { text })) => break (who, text),
-                Some((_, UiEvent::Command { line })) => {
+        let (who, mut user_text) = loop {
+            let input = match pending_input.take() {
+                Some(p) => p,
+                None => tokio::select! {
+                    ui = ui_rx.recv() => match ui {
+                        Some(input) => input,
+                        None => return Ok(()),
+                    },
+                    reg = recv_registration(&mut peer_register_rx) => {
+                        match reg {
+                            Some(reg) => {
+                                // Fired only for runtime edges (a /connect-peer forward
+                                // edge, or an inbound remote dialer's reverse edge) — so
+                                // this Notice resolves the "connecting…" line on both
+                                // sides and names the peer.
+                                let name = reg.who.name.clone();
+                                peers.register(reg);
+                                let _ = agent_tx
+                                    .send(AgentEvent::Notice {
+                                        text: format!("connected to peer {name}"),
+                                    })
+                                    .await;
+                                let _ = agent_tx
+                                    .send(capabilities_event(&cfg, &backend, &peers))
+                                    .await;
+                            }
+                            None => peer_register_rx = None,
+                        }
+                        continue;
+                    }
+                    (pid, ev) = peers.recv() => {
+                        let roster_before = peers.roster();
+                        // A supervised peer's check-in comes back here and is decided by
+                        // one steering inference over this agent's own transcript.
+                        if let supervision::Observed::CheckIn(checkin) =
+                            supervise_peer_event(&mut peers, &agent_tx, pid, ev).await
+                        {
+                            steering::run_steering_turn(
+                                &cfg,
+                                &provider,
+                                &backend,
+                                &mut session,
+                                &mut messages,
+                                &mut last_good_snapshot,
+                                &mut peers,
+                                &agent_tx,
+                                &peer_factory,
+                                checkin,
+                            )
+                            .await?;
+                        }
+                        // A disconnected peer was reaped above — re-advertise the roster.
+                        if peers.roster() != roster_before {
+                            let _ = agent_tx
+                                .send(capabilities_event(&cfg, &backend, &peers))
+                                .await;
+                        }
+                        continue;
+                    }
+                },
+            };
+            match input {
+                (who, UiEvent::UserMessage { text }) => break (who, text),
+                (_, UiEvent::Command { line }) => {
                     dispatch_command(
                         &line,
                         &mut cfg,
@@ -80,58 +141,29 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     )
                     .await;
                 }
-                Some((_, UiEvent::Quit)) | None => return Ok(()),
+                (_, UiEvent::Quit) => return Ok(()),
                 // Terminated at the broker; never forwarded to the loop.
-                Some((_, UiEvent::PermissionResponse { .. })) => {}
-                },
-                reg = recv_registration(&mut peer_register_rx) => match reg {
-                    Some(reg) => {
-                        // Fired only for runtime edges (a /connect-peer forward edge, or
-                        // an inbound remote dialer's reverse edge) — so this Notice
-                        // resolves the "connecting…" line on both sides and names the peer.
-                        let name = reg.who.name.clone();
-                        peers.register(reg);
-                        let _ = agent_tx
-                            .send(AgentEvent::Notice {
-                                text: format!("connected to peer {name}"),
-                            })
-                            .await;
-                        let _ = agent_tx
-                            .send(capabilities_event(&cfg, &backend, &peers))
-                            .await;
-                    }
-                    None => peer_register_rx = None,
-                },
-                (pid, ev) = peers.recv() => {
-                    let roster_before = peers.roster();
-                    // A supervised peer's check-in comes back here and is decided by
-                    // one steering inference over this agent's own transcript.
-                    if let supervision::Observed::CheckIn(checkin) =
-                        supervise_peer_event(&mut peers, &agent_tx, pid, ev).await
-                    {
-                        steering::run_steering_turn(
-                            &cfg,
-                            &provider,
-                            &backend,
-                            &mut session,
-                            &mut messages,
-                            &mut last_good_snapshot,
-                            &mut peers,
-                            &agent_tx,
-                            &peer_factory,
-                            checkin,
-                        )
-                        .await?;
-                    }
-                    // A disconnected peer was reaped above — re-advertise the roster.
-                    if peers.roster() != roster_before {
-                        let _ = agent_tx
-                            .send(capabilities_event(&cfg, &backend, &peers))
-                            .await;
-                    }
-                }
+                (_, UiEvent::PermissionResponse { .. }) => {}
             }
         };
+
+        // Coalesce consecutive same-sender user messages already queued: a peer that
+        // fires several messages in a row is digested in one turn, not N (same info to
+        // the model, fewer tokens). Only what's already waiting is drained; the first
+        // non-mergeable input is stashed for the next turn.
+        loop {
+            match ui_rx.try_recv() {
+                Ok((w, UiEvent::UserMessage { text })) if same_sender(&w, &who) => {
+                    user_text.push_str("\n\n");
+                    user_text.push_str(&text);
+                }
+                Ok(other) => {
+                    pending_input = Some(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
 
         // The log stores the clean text + sender; the model-facing transcript gets
         // the attributed form, derived here at build time (and again on resume).
@@ -261,13 +293,20 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 )
                 .await;
                 loop {
-                    match ui_rx.recv().await {
-                        Some((who, UiEvent::UserMessage { text })) => {
+                    let input = match pending_input.take() {
+                        Some(p) => p,
+                        None => match ui_rx.recv().await {
+                            Some(input) => input,
+                            None => return Ok(()),
+                        },
+                    };
+                    match input {
+                        (who, UiEvent::UserMessage { text }) => {
                             guidance_sender = who;
                             tool_results.push(ContentBlock::Text { text });
                             break;
                         }
-                        Some((_, UiEvent::Command { line })) => {
+                        (_, UiEvent::Command { line }) => {
                             dispatch_command(
                                 &line,
                                 &mut cfg,
@@ -287,8 +326,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         // assistant + earlier iterations). That's intentional, not a
                         // leak: the turn never committed, so on resume strict truncation
                         // would have discarded those trailing entries anyway.
-                        Some((_, UiEvent::Quit)) | None => return Ok(()),
-                        Some((_, UiEvent::PermissionResponse { .. })) => {}
+                        (_, UiEvent::Quit) => return Ok(()),
+                        (_, UiEvent::PermissionResponse { .. }) => {}
                     }
                 }
             }
@@ -333,6 +372,16 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 .await;
             }
         }
+    }
+}
+
+// Whether two message senders are the same driver — the coalesce key. Two
+// unstamped (None) senders are treated as one; otherwise names must match.
+fn same_sender(a: &Option<ClientIdentity>, b: &Option<ClientIdentity>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x.name == y.name,
+        (None, None) => true,
+        _ => false,
     }
 }
 

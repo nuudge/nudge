@@ -106,7 +106,9 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
             "description": "Send a message to a peer agent you hold a connection to (a \
                 subagent you spawned, or the agent that spawned you). The message arrives \
                 as that agent's next instruction and triggers a turn on its side; use it to \
-                assign follow-up work, ask a question, or report a result. Message a peer \
+                assign follow-up work, ask a question, or report a result. Put everything \
+                you have for one peer in a single message — consecutive messages to the same \
+                peer are merged into one turn, so extra calls only cost tokens. Message a peer \
                 only when it advances the task — never to acknowledge an acknowledgment or \
                 exchange pleasantries: needless replies ping-pong between agents \
                 indefinitely. Peer names appear in your transcript (e.g. in '[message from \

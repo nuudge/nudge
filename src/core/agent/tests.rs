@@ -1890,3 +1890,141 @@ fn roster_system_text_lists_held_peers() {
         "unsupervised peer labelled: {text}"
     );
 }
+
+// Consecutive messages from the same sender, already queued when the turn starts, are
+// coalesced into ONE user turn (same info to the model, fewer round-trips), attributed
+// once. Pre-buffering both before spawning the loop makes the drain deterministic.
+#[tokio::test]
+async fn consecutive_same_sender_messages_coalesce_into_one_turn() {
+    let (session, dir) = mk_session();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    let who = agent_who("child-1");
+    ui_tx
+        .send((
+            Some(who.clone()),
+            UiEvent::UserMessage { text: "one".into() },
+        ))
+        .await
+        .unwrap();
+    ui_tx
+        .send((Some(who), UiEvent::UserMessage { text: "two".into() }))
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        RecordingProvider { seen: seen.clone() },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+
+    let transcript = seen.lock().unwrap().clone();
+    assert_eq!(
+        transcript.len(),
+        1,
+        "coalesced into one turn (a single user message), not two: {transcript:?}"
+    );
+    match &transcript[0].content[0] {
+        ContentBlock::Text { text } => {
+            assert!(
+                text.contains("one") && text.contains("two"),
+                "both messages reach the model in one turn: {text}"
+            );
+            assert!(
+                text.starts_with("[message from peer child-1]"),
+                "attributed once, to the shared sender: {text}"
+            );
+        }
+        other => panic!("expected a coalesced user turn, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Different senders are NOT coalesced: a second sender's message is stashed and becomes
+// its own turn, so cross-driver messages stay attributable.
+#[tokio::test]
+async fn different_sender_messages_are_not_coalesced() {
+    let (session, dir) = mk_session();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    ui_tx
+        .send((
+            Some(agent_who("alice")),
+            UiEvent::UserMessage {
+                text: "from-a".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    ui_tx
+        .send((
+            Some(agent_who("bob")),
+            UiEvent::UserMessage {
+                text: "from-b".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        RecordingProvider { seen: seen.clone() },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    // Two distinct turns complete (one per sender).
+    let mut completed = 0;
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            completed += 1;
+            if completed == 2 {
+                break;
+            }
+        }
+    }
+
+    // The last recorded request holds both turns as separate user messages.
+    let transcript = seen.lock().unwrap().clone();
+    let user_texts: Vec<&str> = transcript
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| match &m.content[0] {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("from-a"))
+            && user_texts.iter().any(|t| t.contains("from-b")),
+        "each sender is its own turn: {user_texts:?}"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|t| !(t.contains("from-a") && t.contains("from-b"))),
+        "the two senders' messages are never merged into one turn: {user_texts:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
