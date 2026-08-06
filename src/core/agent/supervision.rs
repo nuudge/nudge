@@ -113,7 +113,16 @@ pub(super) async fn supervise_peer_event(
             if let Some(line) = activity_line(&other) {
                 peers.record_activity(pid, &line);
             }
-            if let Some(text) = peer_notice(&name, &other) {
+            // Activity narration only for supervised children — it's the parent's live
+            // view of unattended work (no watch-mode for a child exists yet). An
+            // unsupervised peer's activity belongs to its own session and human;
+            // narrating it here floods this session's clients with another session's
+            // work (10 chatty peers = 10 transcripts' worth). Its conversation still
+            // arrives as MessagePeer turns, and errors are always surfaced (rare,
+            // significant).
+            let narrate =
+                peers.is_supervised(pid) || matches!(other, ControllerEvent::Error { .. });
+            if narrate && let Some(text) = peer_notice(&name, &other) {
                 let _ = agent_tx.send(AgentEvent::Notice { text }).await;
             }
             Observed::Handled
@@ -153,10 +162,18 @@ fn activity_line(ev: &ControllerEvent) -> Option<String> {
 
 // Map a peer's observed event to a one-line Notice for this agent's front-end, or None
 // for the noisy/internal events (usage, session info, turn markers) that add no watch
-// value.
+// value. Assistant text is clipped — the notice is a watch-glance, not the record (a
+// child's report arrives in full via MessagePeer).
 pub(super) fn peer_notice(name: &str, ev: &ControllerEvent) -> Option<String> {
+    const NOTICE_CHARS_CAP: usize = 160;
     match ev {
-        ControllerEvent::AssistantText { text } => Some(format!("[peer {name}] {text}")),
+        ControllerEvent::AssistantText { text } => {
+            let mut t: String = text.chars().take(NOTICE_CHARS_CAP).collect();
+            if t.chars().count() < text.chars().count() {
+                t.push('…');
+            }
+            Some(format!("[peer {name}] {t}"))
+        }
         ControllerEvent::ToolUseStart {
             name: tool,
             summary,

@@ -213,8 +213,8 @@ fn fake_peer() -> (
     )
 }
 
-// A peer attached at runtime drives the loop with no user message: its activity
-// surfaces to this agent's own front-end as a Notice (the watch substrate).
+// A SUPERVISED peer's activity surfaces to this agent's own front-end as a Notice
+// (the parent's watch substrate). Registered at runtime via the registrar.
 #[tokio::test]
 async fn peer_activity_surfaces_as_a_notice() {
     let (session, dir) = mk_session();
@@ -232,7 +232,7 @@ async fn peer_activity_surfaces_as_a_notice() {
 
     let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
     reg_tx
-        .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
+        .send(supervised_reg(peer_ctrl, agent_who("child-1")))
         .unwrap();
     peer_ev
         .send(ControllerEvent::AssistantText {
@@ -2022,6 +2022,66 @@ async fn different_sender_messages_are_not_coalesced() {
             .iter()
             .all(|t| !(t.contains("from-a") && t.contains("from-b"))),
         "the two senders' messages are never merged into one turn: {user_texts:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// An UNSUPERVISED peer's activity is NOT narrated — its work belongs to its own
+// session; only its MessagePeer turns, errors, and lifecycle reach this one. The
+// peer's Error (always narrated) is the sentinel: events are processed in order, so
+// if the AssistantText had narrated, it would arrive before the error notice.
+#[tokio::test]
+async fn unsupervised_peer_activity_is_not_narrated() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+    ));
+
+    let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+    reg_tx
+        .send(PeerRegistration::new(peer_ctrl, agent_who("mate")))
+        .unwrap();
+    peer_ev
+        .send(ControllerEvent::AssistantText {
+            text: "chatty peer output".into(),
+        })
+        .unwrap();
+    peer_ev
+        .send(ControllerEvent::Error {
+            message: "sentinel".into(),
+        })
+        .unwrap();
+
+    let mut first_activity_notice = None;
+    while let Some(ev) = agent_rx.recv().await {
+        if let AgentEvent::Notice { text } = ev {
+            if text.contains("connected to peer") {
+                continue;
+            }
+            first_activity_notice = Some(text);
+            break;
+        }
+    }
+    let text = first_activity_notice.expect("expected the sentinel error Notice");
+    assert!(
+        text.contains("sentinel"),
+        "the first narrated notice must be the error sentinel, not the suppressed \
+         activity: {text}"
+    );
+    assert!(
+        !text.contains("chatty peer output"),
+        "unsupervised activity must not narrate: {text}"
     );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
