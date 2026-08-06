@@ -19,6 +19,31 @@ pub(super) fn is_peer_tool(name: &str) -> bool {
     name == MESSAGE_PEER || name == SPAWN || name == RESPOND_TO_PEER || name == DISMISS_PEER
 }
 
+// A model-facing listing of the peers currently held, so the agent knows which names
+// it can address with MessagePeer without having to guess (and learn the roster from a
+// failed call). `None` when peerless. The loop appends this as a TRAILING, uncached
+// system block — after the volatile env breakpoint — so a peer connecting or leaving
+// only reprocesses this small tail, never the cached stable prefix.
+pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
+    let infos = peers.infos();
+    if infos.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "You are connected to these peer agents. Address one by its exact \
+             name with the MessagePeer tool:",
+    );
+    for p in infos {
+        let role = if p.supervised {
+            "subagent you spawned"
+        } else {
+            "peer"
+        };
+        out.push_str(&format!("\n- {} ({role})", p.name));
+    }
+    Some(out)
+}
+
 // Spawning is autonomous token-spending and dismissal destroys a child's in-memory
 // context (in-flight work stops) — the human gates both lifecycle actions. Messaging
 // is conversation (the addressee's own gates apply to whatever it causes), and a

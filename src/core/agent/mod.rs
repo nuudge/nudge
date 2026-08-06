@@ -86,7 +86,16 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 },
                 reg = recv_registration(&mut peer_register_rx) => match reg {
                     Some(reg) => {
+                        // Fired only for runtime edges (a /connect-peer forward edge, or
+                        // an inbound remote dialer's reverse edge) — so this Notice
+                        // resolves the "connecting…" line on both sides and names the peer.
+                        let name = reg.who.name.clone();
                         peers.register(reg);
+                        let _ = agent_tx
+                            .send(AgentEvent::Notice {
+                                text: format!("connected to peer {name}"),
+                            })
+                            .await;
                         let _ = agent_tx
                             .send(capabilities_event(&cfg, &backend, &peers))
                             .await;
@@ -139,11 +148,18 @@ pub async fn run_agent<P: Provider, B: Backend>(
             // Loop-level peer tools ride after the backend's array (never inside the
             // cached stable prefix); offered per capability (factory / held peers).
             tools.extend(peer_tools::schemas(&peers, &peer_factory));
+            // The peer roster rides as a trailing, uncached system block after the
+            // backend's volatile env breakpoint, so the model knows whom it can address
+            // and a peer joining/leaving never busts the cached stable prefix.
+            let mut system = backend.system_blocks();
+            if let Some(text) = peer_tools::roster_system_text(&peers) {
+                system.push(crate::llm::SystemBlock { text, cache: false });
+            }
             let req = Request {
                 model: &cfg.model,
                 max_tokens: cfg.max_tokens,
                 thinking_display: &cfg.thinking_display,
-                system: backend.system_blocks(),
+                system,
                 tools,
                 tool_cache_boundary,
                 tool_choice: None,

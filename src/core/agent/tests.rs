@@ -240,14 +240,19 @@ async fn peer_activity_surfaces_as_a_notice() {
         })
         .unwrap();
 
+    // The registration now emits a "connected to peer" Notice first; the activity
+    // Notice (what this test is about) follows it.
     let mut saw = None;
     while let Some(ev) = agent_rx.recv().await {
         if let AgentEvent::Notice { text } = ev {
+            if text.contains("connected to peer") {
+                continue;
+            }
             saw = Some(text);
             break;
         }
     }
-    let text = saw.expect("expected a peer Notice");
+    let text = saw.expect("expected a peer activity Notice");
     assert!(
         text.contains("child-1"),
         "notice should name the peer: {text}"
@@ -301,12 +306,19 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
         .unwrap();
 
     let saw_peer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut saw_notice = false;
         loop {
             match ctrl.events.recv().await {
+                // A runtime edge announces itself, so the "connecting…" line resolves.
+                Some(ControllerEvent::Notice { text })
+                    if text.contains("connected to peer remote-1") =>
+                {
+                    saw_notice = true;
+                }
                 Some(ControllerEvent::Capabilities { peers, .. })
                     if peers.iter().any(|p| p.name == "remote-1") =>
                 {
-                    break true;
+                    break saw_notice;
                 }
                 Some(_) => continue,
                 None => break false,
@@ -315,7 +327,10 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
     })
     .await
     .expect("timed out waiting for the peer to appear in Capabilities");
-    assert!(saw_peer, "the registered peer must appear in the roster");
+    assert!(
+        saw_peer,
+        "the registered peer must appear in the roster and announce a connect Notice"
+    );
 
     host.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
@@ -1807,14 +1822,22 @@ async fn peer_change_reemits_capabilities_roster() {
     reg_tx
         .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
         .unwrap();
-    match agent_rx.recv().await {
-        Some(AgentEvent::Capabilities { peers, .. }) => {
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "child-1");
-            assert!(!peers[0].supervised);
+    // Registration emits a connect Notice, then the Capabilities roster re-advertise.
+    let mut saw_roster = false;
+    for _ in 0..4 {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Capabilities { peers, .. }) => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].name, "child-1");
+                assert!(!peers[0].supervised);
+                saw_roster = true;
+                break;
+            }
+            Some(_) => continue,
+            None => break,
         }
-        other => panic!("expected Capabilities after registration, got {other:?}"),
     }
+    assert!(saw_roster, "expected Capabilities after registration");
 
     // The peer disconnects: the loop reaps it (a Notice narrates that) and
     // re-advertises the now-empty roster.
@@ -1839,4 +1862,31 @@ async fn peer_change_reemits_capabilities_roster() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// The model-facing roster block: None when peerless, else names each held peer and
+// distinguishes a spawned subagent from a connected peer, so the agent can address
+// one without guessing.
+#[test]
+fn roster_system_text_lists_held_peers() {
+    use super::peer_tools::roster_system_text;
+
+    let mut peers = PeerSet::default();
+    assert!(roster_system_text(&peers).is_none(), "peerless → no block");
+
+    let (a_ctrl, _a_ev, _a_ui) = fake_peer();
+    peers.register(supervised_reg(a_ctrl, agent_who("child-1")));
+    let (b_ctrl, _b_ev, _b_ui) = fake_peer();
+    peers.register(PeerRegistration::new(b_ctrl, agent_who("mate")));
+
+    let text = roster_system_text(&peers).expect("held peers → a block");
+    assert!(text.contains("MessagePeer"), "names the tool: {text}");
+    assert!(
+        text.contains("child-1 (subagent you spawned)"),
+        "supervised peer labelled: {text}"
+    );
+    assert!(
+        text.contains("mate (peer)"),
+        "unsupervised peer labelled: {text}"
+    );
 }
