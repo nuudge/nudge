@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -153,6 +155,9 @@ impl SessionHost {
         let self_handle = BrokerHandle {
             ctl_tx: ctl_tx.clone(),
         };
+        // Flipped (once, stickily) by the broker when a second distinct driving sender
+        // connects; read by the loop at payload-build time to name human senders.
+        let multi_driver = Arc::new(AtomicBool::new(false));
 
         let agent_task = tokio::spawn(run_agent(
             cfg,
@@ -172,6 +177,7 @@ impl SessionHost {
                 peer_factory: peers.factory,
                 peer_dialer: peers.dialer,
                 self_handle,
+                multi_driver: multi_driver.clone(),
             },
         ));
 
@@ -179,7 +185,13 @@ impl SessionHost {
         // (empty for a fresh session). It primes the broker's replay buffer so
         // every controller — including a remote one that can't read the JSONL —
         // reconstructs the full history from the event stream alone.
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, seed));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            seed,
+            multi_driver,
+        ));
 
         Self {
             agent_task,
@@ -507,9 +519,26 @@ async fn broker(
     mut loop_agent_rx: mpsc::Receiver<AgentEvent>,
     mut ctl_rx: mpsc::UnboundedReceiver<HostCommand>,
     seed: Vec<ControllerEvent>,
+    multi_driver: Arc<AtomicBool>,
 ) {
     let mut attached: HashMap<ControllerId, ControllerChannels> = HashMap::new();
     let mut next_id: ControllerId = 0;
+    // Distinct driving senders this session has ever had: seeded from the resumed
+    // transcript's message senders (a historically multi-party session stays
+    // attributed), grown by each driving attach. At two, `multi_driver` flips —
+    // stickily, so attribution never flaps when a driver leaves.
+    let mut driver_names: std::collections::HashSet<String> = seed
+        .iter()
+        .filter_map(|ev| match ev {
+            ControllerEvent::UserMessage { sender, .. } if !sender.is_empty() => {
+                Some(sender.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    if driver_names.len() >= 2 {
+        multi_driver.store(true, Ordering::Relaxed);
+    }
     // Pre-seeded with the resumed transcript (if any), so the first attach
     // replays history + live as one stream. Live events append after the seed.
     let mut buffer: Vec<ControllerEvent> = seed;
@@ -520,6 +549,12 @@ async fn broker(
             cmd = ctl_rx.recv() => {
                 match cmd {
                     Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
+                        if profile.may_drive && !who.name.is_empty() {
+                            driver_names.insert(who.name.clone());
+                            if driver_names.len() >= 2 {
+                                multi_driver.store(true, Ordering::Relaxed);
+                            }
+                        }
                         // Replay the full history to this controller before any live
                         // event, projected through its profile just like live fan-out
                         // (so its replay drops supervision Notices and empties the
@@ -682,7 +717,13 @@ pub(crate) fn spawn_bare_broker(seed: Vec<ControllerEvent>) -> BareBroker {
     let (loop_ui_tx, loop_ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (agent_tx, loop_agent_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, seed));
+    let task = tokio::spawn(broker(
+        loop_ui_tx,
+        loop_agent_rx,
+        ctl_rx,
+        seed,
+        Arc::new(AtomicBool::new(false)),
+    ));
     BareBroker {
         handle: BrokerHandle { ctl_tx },
         agent_tx,
@@ -811,7 +852,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut human, _h_ui) = try_attach(&ctl_tx).await;
         let (mut agent, _a_ui) = try_attach_agent(&ctl_tx).await;
@@ -849,7 +896,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut agent, a_ui) = try_attach_agent(&ctl_tx).await;
         let (_human, h_ui) = try_attach(&ctl_tx).await;
@@ -881,7 +934,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut agent, a_ui) = try_attach_with(&ctl_tx, ClientProfile::agent_peer()).await;
         let (mut human, h_ui) = try_attach(&ctl_tx).await;
@@ -941,7 +1000,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut supervisor, s_ui) = try_attach_with(&ctl_tx, ClientProfile::supervisor()).await;
 
@@ -997,7 +1062,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, seed));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            seed,
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut human, _h_ui) = try_attach(&ctl_tx).await;
         let (mut agent, _a_ui) = try_attach_agent(&ctl_tx).await;
@@ -1032,7 +1103,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut agent, a_ui) = try_attach_agent(&ctl_tx).await;
         let (_human, h_ui) = try_attach(&ctl_tx).await;
@@ -1071,7 +1148,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut watcher, w_ui) = try_attach_with(&ctl_tx, ClientProfile::watch_only()).await;
         let (_driver, d_ui) = try_attach(&ctl_tx).await;
@@ -1114,7 +1197,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a_events, a_ui_tx) = try_attach(&ctl_tx).await;
 
@@ -1183,7 +1272,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a, _a_ui) = try_attach(&ctl_tx).await;
         let (mut b, _b_ui) = try_attach(&ctl_tx).await;
@@ -1206,7 +1301,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a, a_ui) = try_attach(&ctl_tx).await;
         let (mut b, _b_ui) = try_attach(&ctl_tx).await;
@@ -1237,7 +1338,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a, a_ui) = try_attach_as(&ctl_tx, "alice").await;
         let (mut b, _b_ui) = try_attach_as(&ctl_tx, "bob").await;
@@ -1278,7 +1385,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a, a_ui) = try_attach(&ctl_tx).await;
         let (mut b, b_ui) = try_attach(&ctl_tx).await;
@@ -1344,7 +1457,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (a, a_ui) = try_attach(&ctl_tx).await;
         let (mut b, _b_ui) = try_attach(&ctl_tx).await;
@@ -1374,7 +1493,13 @@ mod tests {
         let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         // A attaches but never drains (leading underscore = a live, undrained binding).
         let (_a_slow, _a_ui) = try_attach(&ctl_tx).await;
@@ -1414,7 +1539,13 @@ mod tests {
         let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
         let (loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
         let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
-        let broker_task = tokio::spawn(broker(loop_ui_tx, loop_agent_rx, ctl_rx, Vec::new()));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
 
         let (mut a, _a_ui) = try_attach(&ctl_tx).await;
         loop_agent_tx
@@ -1446,6 +1577,82 @@ mod tests {
                 other => panic!("{who} expected live Notice, got {other:?}"),
             }
         }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // The multi-driver flag flips (stickily) when a SECOND distinct driving sender
+    // connects. A watch-only attach never counts (it cannot drive), and a repeat
+    // attach of the same name doesn't either.
+    #[tokio::test]
+    async fn multi_driver_flips_on_second_distinct_driving_attach() {
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let multi = Arc::new(AtomicBool::new(false));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            multi.clone(),
+        ));
+
+        let (_a, _a_ui) = try_attach_as(&ctl_tx, "alice").await;
+        assert!(!multi.load(Ordering::Relaxed), "one driver → solo");
+
+        // A watcher (may_drive=false) and a re-attach of the same name don't count.
+        let (_w, _w_ui) = try_attach_with(&ctl_tx, ClientProfile::watch_only()).await;
+        let (_a2, _a2_ui) = try_attach_as(&ctl_tx, "alice").await;
+        assert!(
+            !multi.load(Ordering::Relaxed),
+            "watch-only and same-name attaches don't make a session multi-driver"
+        );
+
+        let (_b, _b_ui) = try_attach_as(&ctl_tx, "bob").await;
+        assert!(
+            multi.load(Ordering::Relaxed),
+            "a second distinct driving sender flips the flag"
+        );
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // A resumed multi-party transcript flips the flag from the seed alone, before
+    // anyone attaches — the persisted senders are the record of multi-party-ness.
+    #[tokio::test]
+    async fn multi_driver_seeds_from_replay_senders() {
+        let seed = vec![
+            ControllerEvent::UserMessage {
+                text: "hi".into(),
+                sender: "alice".into(),
+            },
+            ControllerEvent::UserMessage {
+                text: "yo".into(),
+                sender: "bob".into(),
+            },
+        ];
+        let (loop_ui_tx, _loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let multi = Arc::new(AtomicBool::new(false));
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            seed,
+            multi.clone(),
+        ));
+
+        // The store happens in the broker task before its select loop; one attach
+        // round-trip is enough to know it has run.
+        let (_a, _a_ui) = try_attach(&ctl_tx).await;
+        assert!(
+            multi.load(Ordering::Relaxed),
+            "two distinct persisted senders → multi from the start"
+        );
 
         ctl_tx.send(HostCommand::Quit).unwrap();
         broker_task.await.unwrap();

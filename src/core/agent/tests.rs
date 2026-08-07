@@ -191,6 +191,7 @@ fn mk_io(
         peer_factory: None,
         peer_dialer: None,
         self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+        multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 
@@ -1327,6 +1328,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
             peer_factory: Some(stub_factory(slot)),
             peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+            multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -1423,6 +1425,7 @@ async fn spawn_denial_does_not_run_the_factory() {
             peer_factory: Some(stub_factory(slot.clone())),
             peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+            multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -1477,9 +1480,10 @@ async fn spawn_denial_does_not_run_the_factory() {
 }
 
 // resume_messages derives attribution at build time from each entry's persisted
-// sender: an agent sender gets the `[message from peer …]` prefix, a human stays
-// bare, and a pre-sender entry (None — its text may carry an already-baked prefix)
-// passes through untouched.
+// sender: an agent sender always gets the `[message from peer …]` prefix; a human is
+// named too when the transcript is multi-party (two or more distinct senders) and
+// stays bare in a solo transcript; a pre-sender entry (None — its text may carry an
+// already-baked prefix) passes through untouched.
 #[test]
 fn resume_messages_applies_attribution_from_persisted_sender() {
     use crate::core::session::LoggedMessage;
@@ -1517,8 +1521,26 @@ fn resume_messages_applies_attribution_from_persisted_sender() {
         })
         .collect();
     assert_eq!(texts[0], "[message from peer child-x]\ndo it");
-    assert_eq!(texts[1], "hello");
+    // Two distinct senders → a multi-party transcript, so the human is named too.
+    assert_eq!(texts[1], "[message from alice]\nhello");
     assert_eq!(texts[2], "[message from peer old]\nlegacy");
+
+    // A solo transcript: the lone human stays bare.
+    let solo = vec![
+        LoggedMessage {
+            message: user("just me"),
+            sender: Some(ClientIdentity::human("alice")),
+        },
+        LoggedMessage {
+            message: user("still me"),
+            sender: Some(ClientIdentity::human("alice")),
+        },
+    ];
+    let msgs = super::resume_messages(&solo);
+    match &msgs[0].content[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "just me"),
+        other => panic!("expected text block, got {other:?}"),
+    }
 }
 
 // Locate the session's JSONL and return each entry's message role, in order. An
@@ -2100,5 +2122,62 @@ async fn unsupervised_peer_activity_is_not_narrated() {
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// End to end through a real SessionHost: once a second distinct human connects, a
+// human's message reaches the model NAMED — the multi-driver flag flips at the
+// broker and the loop derives the prefix at payload-build time.
+#[tokio::test]
+async fn second_connected_human_makes_messages_attributed() {
+    use crate::core::PeerWiring;
+
+    let (session, dir) = mk_session();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        RecordingProvider { seen: seen.clone() },
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring::default(),
+    );
+
+    let alice = host
+        .attach(ClientIdentity::human("alice"))
+        .await
+        .expect("alice attaches");
+    let mut bob = host
+        .attach(ClientIdentity::human("bob"))
+        .await
+        .expect("bob attaches");
+
+    bob.ui_tx
+        .send(UiEvent::UserMessage { text: "hi".into() })
+        .await
+        .unwrap();
+    // Wait for bob's turn to complete before reading the recorded request.
+    let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match bob.events.recv().await {
+                Some(ControllerEvent::TurnComplete) => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the turn");
+    assert!(done);
+
+    let transcript = seen.lock().unwrap().clone();
+    match &transcript[0].content[0] {
+        ContentBlock::Text { text } => assert_eq!(text, "[message from bob]\nhi"),
+        other => panic!("expected bob's attributed turn, got {other:?}"),
+    }
+
+    drop(alice);
+    host.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

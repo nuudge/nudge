@@ -15,16 +15,21 @@ pub(super) async fn recv_registration(
     }
 }
 
-// Fold the broker-stamped sender into the text that enters the transcript: an agent
-// peer's message is named, so the model knows which peer spoke; a human's message
-// stays bare, exactly as it always has. Keep the prefix format stable — the model
-// learns to reference it. Applied at payload-build time (live arrival and resume
-// rebuild); the session log stores the clean text plus the sender (see
-// `session::LoggedMessage`).
-pub(super) fn attribute(who: Option<&ClientIdentity>, text: String) -> String {
+// Fold the broker-stamped sender into the text that enters the transcript. An agent
+// peer's message is always named, so the model knows which peer spoke. A human's
+// message is named only in a multi-driver session (`multi`: two or more distinct
+// driving senders have connected) — a solo session stays bare, exactly as it always
+// has, while a shared session lets the model tell its drivers apart and address a
+// reply. Keep the prefix formats stable — the model learns to reference them.
+// Applied at payload-build time (live arrival and resume rebuild); the session log
+// stores the clean text plus the sender (see `session::LoggedMessage`).
+pub(super) fn attribute(who: Option<&ClientIdentity>, text: String, multi: bool) -> String {
     match who {
         Some(w) if w.kind == ClientKind::Agent => {
             format!("[message from peer {}]\n{text}", w.name)
+        }
+        Some(w) if multi && !w.name.is_empty() => {
+            format!("[message from {}]\n{text}", w.name)
         }
         _ => text,
     }
@@ -32,10 +37,14 @@ pub(super) fn attribute(who: Option<&ClientIdentity>, text: String) -> String {
 
 // Apply `attribute` to a logged user message's typed text blocks (tool_result
 // blocks are untouched) — the model-facing form of a clean logged entry.
-pub(super) fn attribute_message(who: Option<&ClientIdentity>, msg: &mut crate::llm::Message) {
+pub(super) fn attribute_message(
+    who: Option<&ClientIdentity>,
+    msg: &mut crate::llm::Message,
+    multi: bool,
+) {
     for block in &mut msg.content {
         if let crate::llm::ContentBlock::Text { text } = block {
-            *text = attribute(who, std::mem::take(text));
+            *text = attribute(who, std::mem::take(text), multi);
         }
     }
 }

@@ -43,6 +43,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
         peer_factory,
         peer_dialer,
         self_handle,
+        multi_driver,
     } = io;
     let mut messages: Vec<Message> = initial_messages;
     // Index of `messages` after the last completed turn. On API error mid-turn we roll
@@ -172,7 +173,11 @@ pub async fn run_agent<P: Provider, B: Backend>(
             content: vec![ContentBlock::Text { text: user_text }],
         });
         session.stage(messages.last().unwrap(), who.as_ref());
-        attribute_message(who.as_ref(), messages.last_mut().unwrap());
+        attribute_message(
+            who.as_ref(),
+            messages.last_mut().unwrap(),
+            multi_driver.load(std::sync::atomic::Ordering::Relaxed),
+        );
 
         // INNER loop: model + tool turns until non-tool-use stop.
         for iteration in 0..cfg.max_iterations {
@@ -337,7 +342,11 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 content: tool_results,
             };
             session.stage(&user_msg, guidance_sender.as_ref());
-            attribute_message(guidance_sender.as_ref(), &mut user_msg);
+            attribute_message(
+                guidance_sender.as_ref(),
+                &mut user_msg,
+                multi_driver.load(std::sync::atomic::Ordering::Relaxed),
+            );
             messages.push(user_msg);
 
             if iteration == cfg.max_iterations - 1 {
@@ -563,14 +572,22 @@ async fn dispatch_command<P: Provider, B: Backend>(
 
 // Rebuild the model-facing transcript from logged entries: the log stores clean
 // text + sender, and attribution is derived here exactly as the live path derives
-// it at arrival. Pre-sender logs have `sender: None` (their text may carry an
-// already-baked prefix), which `attribute` leaves untouched.
+// it at arrival — including the multi-driver rule, derived from the persisted
+// senders themselves (two or more distinct names → a shared session, so human
+// senders are named throughout). Pre-sender logs have `sender: None` (their text
+// may carry an already-baked prefix), which `attribute` leaves untouched.
 pub fn resume_messages(entries: &[LoggedMessage]) -> Vec<Message> {
+    let distinct: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter_map(|e| e.sender.as_ref().map(|w| w.name.as_str()))
+        .filter(|n| !n.is_empty())
+        .collect();
+    let multi = distinct.len() >= 2;
     entries
         .iter()
         .map(|e| {
             let mut msg = e.message.clone();
-            attribute_message(e.sender.as_ref(), &mut msg);
+            attribute_message(e.sender.as_ref(), &mut msg, multi);
             msg
         })
         .collect()
