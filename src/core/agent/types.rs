@@ -85,4 +85,7 @@ pub struct AgentIo {
     // finished forward edge returns via `peer_register_rx`.
     pub peer_dialer: Option<PeerDialer>,
     pub self_handle: BrokerHandle,
+    // Set (stickily) by the broker once two distinct driving senders have connected;
+    // read at payload-build time to name human senders in the transcript.
+    pub multi_driver: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
