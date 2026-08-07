@@ -723,7 +723,9 @@ async fn steering_failure_denies_safely_and_rolls_back() {
 
 // An UNSUPERVISED peer's permission request is never answered by this agent — its
 // own supervisor (or a human) holds that decision. This is what stops a child
-// rubber-stamping its parent's gated calls.
+// rubber-stamping its parent's gated calls. It is not narrated either (the peer's
+// prompts are its own session's business); the peer's Error event is the ordering
+// sentinel proving the prompt was processed before we assert.
 #[tokio::test]
 async fn unsupervised_check_in_is_not_answered() {
     let (session, dir) = mk_session();
@@ -750,13 +752,25 @@ async fn unsupervised_check_in_is_not_answered() {
             summary: "run ls".into(),
         })
         .unwrap();
+    peer_ev
+        .send(ControllerEvent::Error {
+            message: "sentinel".into(),
+        })
+        .unwrap();
 
-    // The observation surfaces (so a human can see it), explicitly unanswered here.
+    // Peer events are FIFO on one channel: the sentinel's notice proves the prompt
+    // was processed — silently (no "asks to use" narration precedes it).
     loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) if text.contains("not mine to answer") => break,
+            Some(AgentEvent::Notice { text }) if text.contains("sentinel") => break,
+            Some(AgentEvent::Notice { text }) => {
+                assert!(
+                    !text.contains("asks to use"),
+                    "unsupervised prompt must not narrate: {text}"
+                );
+            }
             Some(_) => {}
-            None => panic!("expected the not-mine Notice"),
+            None => panic!("expected the sentinel Notice"),
         }
     }
 

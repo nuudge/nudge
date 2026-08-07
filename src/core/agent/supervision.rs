@@ -99,13 +99,9 @@ pub(super) async fn supervise_peer_event(
                     summary,
                 })
             } else {
-                let _ = agent_tx
-                    .send(AgentEvent::Notice {
-                        text: format!(
-                            "[peer {name}] asks to use {tool_name}: {summary} (not mine to answer)"
-                        ),
-                    })
-                    .await;
+                // Not mine to answer (the peer's own human holds that decision), and not
+                // mine to narrate either — an unsupervised peer's prompts are its own
+                // session's business, same as the rest of its activity.
                 Observed::Handled
             }
         }
