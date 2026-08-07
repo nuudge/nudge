@@ -19,6 +19,31 @@ pub(super) fn is_peer_tool(name: &str) -> bool {
     name == MESSAGE_PEER || name == SPAWN || name == RESPOND_TO_PEER || name == DISMISS_PEER
 }
 
+// A model-facing listing of the peers currently held, so the agent knows which names
+// it can address with MessagePeer without having to guess (and learn the roster from a
+// failed call). `None` when peerless. The loop appends this as a TRAILING, uncached
+// system block — after the volatile env breakpoint — so a peer connecting or leaving
+// only reprocesses this small tail, never the cached stable prefix.
+pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
+    let infos = peers.infos();
+    if infos.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "You are connected to these peer agents. Address one by its exact \
+             name with the MessagePeer tool:",
+    );
+    for p in infos {
+        let role = if p.supervised {
+            "subagent you spawned"
+        } else {
+            "peer"
+        };
+        out.push_str(&format!("\n- {} ({role})", p.name));
+    }
+    Some(out)
+}
+
 // Spawning is autonomous token-spending and dismissal destroys a child's in-memory
 // context (in-flight work stops) — the human gates both lifecycle actions. Messaging
 // is conversation (the addressee's own gates apply to whatever it causes), and a
@@ -81,7 +106,9 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
             "description": "Send a message to a peer agent you hold a connection to (a \
                 subagent you spawned, or the agent that spawned you). The message arrives \
                 as that agent's next instruction and triggers a turn on its side; use it to \
-                assign follow-up work, ask a question, or report a result. Message a peer \
+                assign follow-up work, ask a question, or report a result. Put everything \
+                you have for one peer in a single message — consecutive messages to the same \
+                peer are merged into one turn, so extra calls only cost tokens. Message a peer \
                 only when it advances the task — never to acknowledge an acknowledgment or \
                 exchange pleasantries: needless replies ping-pong between agents \
                 indefinitely. Peer names appear in your transcript (e.g. in '[message from \

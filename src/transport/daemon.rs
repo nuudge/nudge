@@ -11,7 +11,10 @@ use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
 };
-use crate::core::{BrokerHandle, ClientProfile, HandoffStatus, SessionHandle, UiEvent};
+use crate::core::{
+    BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, HandoffStatus,
+    PeerRegistration, SessionHandle, UiEvent,
+};
 
 // How one client connection ended — decides what the accept loop does next.
 enum ConnOutcome {
@@ -93,11 +96,24 @@ pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHan
 
 // One relay leg the daemon parks: a room (dial URL) + its E2E key + the profile every
 // client arriving through it is attached with. Full and watch-only are separate rooms,
-// so the profile follows the room — the client can't move between them.
+// so the profile follows the room — the client can't move between them. `peer_accept`
+// is set only on an agent-scope leg: it makes this leg answer a dialer's reverse-edge
+// offer (#60), attaching the return edge back into the local session's PeerSet.
 pub struct RelayLeg {
     pub dial_url: String,
     pub cipher: Cipher,
     pub profile: ClientProfile,
+    pub peer_accept: Option<PeerAccept>,
+}
+
+// What an agent-scope leg needs to answer a reverse-edge offer: this session's own
+// announced identity (mirrors the dialer's `Attach.who` — announced, never derived by
+// the other side) and the producer half of the loop's runtime registrar (#52), which
+// the return edge is registered into.
+#[derive(Clone)]
+pub struct PeerAccept {
+    pub identity: ClientIdentity,
+    pub registrar: mpsc::UnboundedSender<PeerRegistration>,
 }
 
 // Headless daemon hosting the session over the relay (the `--daemon --relay`
@@ -114,7 +130,15 @@ pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Resu
         eprintln!("[daemon] hosting over relay at {}", leg.dial_url);
         let broker = broker.clone();
         tasks.push(tokio::spawn(async move {
-            relay_dial_loop(leg.dial_url, leg.cipher, broker, None, leg.profile).await;
+            relay_dial_loop(
+                leg.dial_url,
+                leg.cipher,
+                broker,
+                None,
+                leg.profile,
+                leg.peer_accept,
+            )
+            .await;
         }));
     }
     for t in tasks {
@@ -136,8 +160,19 @@ pub async fn serve_relay_handoff(
     broker: BrokerHandle,
     status: mpsc::Sender<HandoffStatus>,
     profile: ClientProfile,
+    peer_accept: Option<PeerAccept>,
 ) {
-    relay_dial_loop(relay_url, cipher, broker, Some(status), profile).await;
+    // Full/watch legs pass `None`; the agent-peer leg passes `Some`, so an inbound
+    // dialer's reverse-edge offer is accepted and the return edge registered (#61).
+    relay_dial_loop(
+        relay_url,
+        cipher,
+        broker,
+        Some(status),
+        profile,
+        peer_accept,
+    )
+    .await;
 }
 
 // Keep one spare host connection parked on the relay at all times. Each iteration
@@ -160,6 +195,7 @@ async fn relay_dial_loop(
     broker: BrokerHandle,
     status: Option<mpsc::Sender<HandoffStatus>>,
     profile: ClientProfile,
+    peer_accept: Option<PeerAccept>,
 ) {
     let mut announced = false;
     loop {
@@ -187,14 +223,25 @@ async fn relay_dial_loop(
                 // fresh spare so the next client pairs immediately. If the relay instead
                 // dropped our spare before any client paired (relay restart, etc.),
                 // recv_attach yields None and we just loop to re-dial.
-                if let Some((after_seq, who)) = recv_attach(&mut reader).await {
+                if let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await {
                     let broker = broker.clone();
                     // Every client through this leg is attached with the leg's profile —
                     // the rights are the room's, minted by the daemon, never presented by
                     // the client (which only sends its identity in the Attach frame).
                     let profile = profile.clone();
+                    let peer_accept = peer_accept.clone();
                     tokio::spawn(async move {
-                        bridge(reader, writer, &broker, after_seq, who, Some(profile)).await;
+                        bridge(
+                            reader,
+                            writer,
+                            &broker,
+                            after_seq,
+                            who,
+                            Some(profile),
+                            reverse_offer,
+                            peer_accept,
+                        )
+                        .await;
                     });
                 }
             }
@@ -221,12 +268,16 @@ async fn relay_dial_loop(
 // frame comes, so this pending `recv` *is* the parked-spare state. Resolves to the
 // attach params once a client pairs and sends its Attach; `None` on anything else
 // (wrong first frame, EOF, or error) — the client never bound, nothing to detach.
-async fn recv_attach<R>(reader: &mut R) -> Option<(Option<u64>, crate::core::ClientIdentity)>
+async fn recv_attach<R>(reader: &mut R) -> Option<(Option<u64>, ClientIdentity, bool)>
 where
     R: FrameReader<ClientFrame>,
 {
     match reader.recv().await {
-        Ok(Some(ClientFrame::Attach { after_seq, who })) => Some((after_seq, who)),
+        Ok(Some(ClientFrame::Attach {
+            after_seq,
+            who,
+            reverse_offer,
+        })) => Some((after_seq, who, reverse_offer)),
         _ => None,
     }
 }
@@ -240,9 +291,12 @@ where
     W: FrameWriter<ServerFrame>,
 {
     match recv_attach(&mut reader).await {
-        // The Unix debug host keeps the interim kind-derived profile (None): it's a
-        // localhost debugging transport, not the relay leg this phase hardens.
-        Some((after_seq, who)) => bridge(reader, writer, broker, after_seq, who, None).await,
+        // The Unix debug host keeps the interim kind-derived profile (None) and never
+        // accepts reverse-edge offers (it's a localhost debug transport, not a peer
+        // leg): a peer edge is a relay-only path this phase hardens.
+        Some((after_seq, who, _reverse_offer)) => {
+            bridge(reader, writer, broker, after_seq, who, None, false, None).await
+        }
         None => ConnOutcome::Disconnected,
     }
 }
@@ -252,21 +306,32 @@ where
 // and `who` come from the already-read Attach frame. `profile` is the rights the accept
 // path assigns by provenance: `Some(p)` from a relay leg (the pairing decides), `None`
 // on the Unix debug host (falls back to the kind-derived interim in `attach`).
+//
+// When `reverse_offer` is set and this leg has a `peer_accept`, the acceptor's half of
+// the duplex peer edge (#60) also rides this one socket: after `Attached` it announces
+// its own identity (`ReverseAttach`) and registers a return `Controller` into the local
+// session's PeerSet, so the acceptor drives/observes the dialer too. On any other leg
+// (a phone, a watch code, the Unix host) the offer is inert and the socket behaves
+// exactly as before — no `Reverse*` frame is ever produced, so those clients are
+// untouched.
+#[allow(clippy::too_many_arguments)]
 async fn bridge<R, W>(
     mut reader: R,
     mut writer: W,
     broker: &BrokerHandle,
     after_seq: Option<u64>,
-    who: crate::core::ClientIdentity,
+    who: ClientIdentity,
     profile: Option<ClientProfile>,
+    reverse_offer: bool,
+    peer_accept: Option<PeerAccept>,
 ) -> ConnOutcome
 where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
     let attached = match profile {
-        Some(profile) => broker.attach_as(who, profile).await,
-        None => broker.attach(who).await,
+        Some(profile) => broker.attach_as(who.clone(), profile).await,
+        None => broker.attach(who.clone()).await,
     };
     let controller = match attached {
         Some(c) => c,
@@ -281,6 +346,45 @@ where
     if writer.send(&ServerFrame::Attached).await.is_err() {
         // Returning drops `controller`, which detaches it — the session lives on.
         return ConnOutcome::Disconnected;
+    }
+
+    // Reverse edge (#60): only when the dialer offered it AND this is an agent leg.
+    // Announce our own identity first (before any forward Event, so it's the dialer's
+    // first post-Attached frame), then register a return Controller into the local
+    // PeerSet — its events are fed by inbound `ReverseEvent`s and its drives go out as
+    // `ReverseCommand`s. `rev_ev_tx`/`rev_ui_rx` are the socket-facing ends held here.
+    let mut rev_ev_tx: Option<mpsc::UnboundedSender<ControllerEvent>> = None;
+    let mut rev_ui_rx: Option<mpsc::Receiver<UiEvent>> = None;
+    if reverse_offer && let Some(pa) = peer_accept {
+        // WRITE-ORDER INVARIANT: `ReverseAttach` MUST be written here — after
+        // `Attached`, before the select loop below emits its first forward `Event` —
+        // because the dialer reads exactly one frame under a timeout for it and fails
+        // closed on anything else (`client::dial_peer`). The controller's replay events
+        // are already queued in `controller.events`, but nothing drains them until the
+        // loop, so this synchronous write is guaranteed first on the wire. A refactor
+        // that starts the event pump before this point would silently break dialing.
+        if writer
+            .send(&ServerFrame::ReverseAttach {
+                who: pa.identity.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return ConnOutcome::Disconnected;
+        }
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+        let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
+        // The return edge is unsupervised on both sides (host None, supervised false);
+        // it is named by what the DIALER announced (`who`), never derived here.
+        let _ = pa.registrar.send(PeerRegistration::new(
+            Controller {
+                events: ev_rx,
+                ui_tx,
+            },
+            who,
+        ));
+        rev_ev_tx = Some(ev_tx);
+        rev_ui_rx = Some(ui_rx);
     }
 
     let mut events = controller.events;
@@ -338,6 +442,15 @@ where
                             return ConnOutcome::SessionEnded; // broker gone
                         }
                     }
+                    // Reverse edge (#60): the dialer's own broker events → the return
+                    // Controller's stream (we observe the dialer). Dropped silently on a
+                    // non-agent leg (no `rev_ev_tx`) or once the local PeerSet reaped the
+                    // return peer.
+                    Ok(Some(ClientFrame::ReverseEvent { event, .. })) => {
+                        if let Some(tx) = &rev_ev_tx {
+                            let _ = tx.send(event);
+                        }
+                    }
                     // Explicit detach or a clean EOF (client dropped the socket):
                     // pause in place (dropping this controller detaches it) so a later
                     // client reattaches and replays.
@@ -350,6 +463,29 @@ where
                     Err(_) => return ConnOutcome::Disconnected,
                 }
             }
+            // Reverse edge (#60): the local PeerSet drives the return peer → out as
+            // `ReverseCommand` (we drive the dialer). Inert on a non-agent leg; a closed
+            // channel (the PeerSet reaped the return peer) just quiets the arm, leaving
+            // the forward direction running.
+            rev_ui = recv_opt_ui(&mut rev_ui_rx) => {
+                match rev_ui {
+                    Some(ui) => {
+                        if writer.send(&ServerFrame::ReverseCommand(ui)).await.is_err() {
+                            return ConnOutcome::Disconnected;
+                        }
+                    }
+                    None => rev_ui_rx = None,
+                }
+            }
         }
+    }
+}
+
+// Await the next drive for the reverse peer, or pend forever when this leg has no
+// reverse edge — so the bridge's select arm stays quiet on a plain (phone/watch) leg.
+async fn recv_opt_ui(rx: &mut Option<mpsc::Receiver<UiEvent>>) -> Option<UiEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }

@@ -11,6 +11,7 @@ use crate::core::{self, AgentConfig, Backend, ClientIdentity};
 use crate::llm;
 use crate::models::{DEFAULT_MODEL, MODELS, owned_models, resolve_models};
 use crate::spawn;
+use crate::transport;
 use crate::tui;
 
 pub const MAX_TOKENS: u32 = 16384;
@@ -51,6 +52,8 @@ pub async fn host(cli: Cli) -> Result<()> {
         pairing_code: None,
         pairing_qr_watch: None,
         pairing_code_watch: None,
+        pairing_qr_agent: None,
+        pairing_code_agent: None,
         // This process hosts the agent loop: it's the owner TUI (cosmetic badge only).
         is_owner: true,
         user_name: who.name.clone(),
@@ -144,6 +147,40 @@ pub async fn host(cli: Cli) -> Result<()> {
     // The executor behind the model-facing Spawn tool: this session may create
     // subagents (which themselves may not — the factory builds children without one).
     let factory = spawn::peer_factory(api_key.clone(), session.id.clone());
+
+    // This session's peer identity, announced on every peer edge: the renamed name if
+    // set, else a short session id (#53). Agent-kind — a peer edge is agent-to-agent.
+    let peer_identity = core::ClientIdentity {
+        kind: core::ClientKind::Agent,
+        name: session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.id.chars().take(8).collect()),
+        session_id: Some(session.id.clone()),
+        task: None,
+    };
+    // The runtime registrar (#52): its receiver goes to the loop, its sender to every
+    // runtime producer — the /connect-peer dialer below (the forward edge) and, under
+    // --daemon --peer, the agent leg (the reverse edge from a remote dialer).
+    let (peer_reg_tx, peer_reg_rx) =
+        tokio::sync::mpsc::unbounded_channel::<core::PeerRegistration>();
+    // The human-only /connect-peer dialer (#53): decode the pasted code, dial the far
+    // room with the reverse-edge offer, and register the forward edge via the registrar.
+    // The code is self-contained (relay URL + room + key), so this works even with no
+    // local relay configured. `core` names no transport, so the closure is built here.
+    let dialer_registrar = peer_reg_tx.clone();
+    let dialer_identity = peer_identity.clone();
+    let dialer: core::PeerDialer =
+        Box::new(move |code: String, self_broker: core::BrokerHandle| {
+            let registrar = dialer_registrar.clone();
+            let who = dialer_identity.clone();
+            Box::pin(async move {
+                let pairing = transport::Pairing::decode(&code)?;
+                let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
+                client.dial_peer(self_broker, registrar, who).await
+            })
+        });
+
     let host = core::SessionHost::spawn(
         cfg,
         provider,
@@ -154,6 +191,8 @@ pub async fn host(cli: Cli) -> Result<()> {
         core::PeerWiring {
             factory: Some(factory),
             initial_peers: Default::default(),
+            register_rx: Some(peer_reg_rx),
+            dialer: Some(dialer),
         },
     );
 
@@ -162,8 +201,17 @@ pub async fn host(cli: Cli) -> Result<()> {
     let relay = config.relay;
 
     if cli.daemon {
-        daemon::run(host, cli.socket, relay, cli.watch).await
+        // --daemon --peer parks an agent-scope leg that accepts a remote dialer's
+        // reverse-edge offer, registering the return edge into this loop (#53).
+        let peer_accept = cli.peer.then(|| transport::PeerAccept {
+            identity: peer_identity,
+            registrar: peer_reg_tx,
+        });
+        daemon::run(host, cli.socket, relay, cli.watch, peer_accept).await
     } else {
-        local::run(host, ui_cfg, who, relay).await
+        // The co-located handoff arms an agent-peer leg too (#61): once /background
+        // dials, this interactive session is simultaneously human-driven and dialable
+        // via /connect-peer, so it needs the same identity + registrar the dialer got.
+        local::run(host, ui_cfg, who, relay, peer_identity, peer_reg_tx).await
     }
 }

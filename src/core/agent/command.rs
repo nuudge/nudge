@@ -12,6 +12,8 @@ pub(super) enum Command {
     Mcp(McpCommand),
     // List the session's held peer edges (read-only).
     Peers,
+    // Dial a remote peer over the relay using a pasted pairing code (human-only).
+    ConnectPeer(String),
     // `/model` with no argument: not an error, but the pickerless path needs a hint.
     ModelUsage,
     // Anything unrecognized, echoed back so the client sees why nothing happened.
@@ -45,6 +47,10 @@ pub(super) fn parse(line: &str) -> Command {
             _ => McpCommand::Usage,
         }),
         Some("/peers") => Command::Peers,
+        Some("/connect-peer") => {
+            let arg = line["/connect-peer".len()..].trim();
+            Command::ConnectPeer(arg.to_string())
+        }
         _ => Command::Unknown(line.to_string()),
     }
 }
@@ -69,5 +75,34 @@ pub fn command_catalog() -> Vec<CommandInfo> {
             name: "/peers".into(),
             usage: "/peers — list held peer agents".into(),
         },
+        CommandInfo {
+            name: "/connect-peer".into(),
+            usage: "/connect-peer <pairing-code> — dial a remote peer agent over the relay".into(),
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `/connect-peer` takes the rest of the line as the pairing code; bare = empty
+    // (dispatch turns that into a usage hint).
+    #[test]
+    fn parses_connect_peer_with_and_without_code() {
+        match parse("/connect-peer nudge:abc123") {
+            Command::ConnectPeer(code) => assert_eq!(code, "nudge:abc123"),
+            _ => panic!("expected ConnectPeer with the code"),
+        }
+        match parse("/connect-peer") {
+            Command::ConnectPeer(code) => assert!(code.is_empty()),
+            _ => panic!("expected ConnectPeer with an empty code"),
+        }
+    }
+
+    // The command is advertised so front-ends render it (and know it exists).
+    #[test]
+    fn catalog_advertises_connect_peer() {
+        assert!(command_catalog().iter().any(|c| c.name == "/connect-peer"));
+    }
 }

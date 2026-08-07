@@ -164,11 +164,13 @@ impl SessionHost {
                 ui_rx: loop_ui_rx,
                 agent_tx: loop_agent_tx,
                 peers: peers.initial_peers,
-                // No runtime registrar wired yet — peers arrive at spawn (this seed)
-                // or via the loop's own Spawn tool. The AgentIo seam stays for a
-                // future producer (e.g. remotely-connected peers).
-                peer_register_rx: None,
+                // The runtime registrar: the composition root drives its producer
+                // half to hand this live loop new peers (a `/connect-peer` edge). None
+                // for a session with no runtime producer (a spawned child), leaving the
+                // loop's registration select arm inert.
+                peer_register_rx: peers.register_rx,
                 peer_factory: peers.factory,
+                peer_dialer: peers.dialer,
                 self_handle,
             },
         ));

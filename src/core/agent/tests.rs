@@ -189,6 +189,7 @@ fn mk_io(
         peers,
         peer_register_rx,
         peer_factory: None,
+        peer_dialer: None,
         self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
     }
 }
@@ -212,8 +213,8 @@ fn fake_peer() -> (
     )
 }
 
-// A peer attached at runtime drives the loop with no user message: its activity
-// surfaces to this agent's own front-end as a Notice (the watch substrate).
+// A SUPERVISED peer's activity surfaces to this agent's own front-end as a Notice
+// (the parent's watch substrate). Registered at runtime via the registrar.
 #[tokio::test]
 async fn peer_activity_surfaces_as_a_notice() {
     let (session, dir) = mk_session();
@@ -231,7 +232,7 @@ async fn peer_activity_surfaces_as_a_notice() {
 
     let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
     reg_tx
-        .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
+        .send(supervised_reg(peer_ctrl, agent_who("child-1")))
         .unwrap();
     peer_ev
         .send(ControllerEvent::AssistantText {
@@ -239,14 +240,19 @@ async fn peer_activity_surfaces_as_a_notice() {
         })
         .unwrap();
 
+    // The registration now emits a "connected to peer" Notice first; the activity
+    // Notice (what this test is about) follows it.
     let mut saw = None;
     while let Some(ev) = agent_rx.recv().await {
         if let AgentEvent::Notice { text } = ev {
+            if text.contains("connected to peer") {
+                continue;
+            }
             saw = Some(text);
             break;
         }
     }
-    let text = saw.expect("expected a peer Notice");
+    let text = saw.expect("expected a peer activity Notice");
     assert!(
         text.contains("child-1"),
         "notice should name the peer: {text}"
@@ -258,6 +264,167 @@ async fn peer_activity_surfaces_as_a_notice() {
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// #52: a peer handed to a LIVE loop through the composition-root wiring —
+// `PeerWiring.register_rx` → `AgentIo.peer_register_rx` — lands in the loop. Built on
+// the real `SessionHost::spawn` path (not `mk_io`), so it proves the seam the runtime
+// producer will drive: sending a registration through the channel makes the peer show
+// up in the re-emitted Capabilities roster.
+#[tokio::test]
+async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
+    use crate::core::PeerWiring;
+
+    let (session, dir) = mk_session();
+    let (peer_reg_tx, peer_reg_rx) = mpsc::unbounded_channel();
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring {
+            factory: None,
+            initial_peers: PeerSet::default(),
+            register_rx: Some(peer_reg_rx),
+            dialer: None,
+        },
+    );
+
+    let mut ctrl = host
+        .attach(ClientIdentity::human("watcher"))
+        .await
+        .expect("initial attach");
+
+    // Drive the registrar the way the runtime producer will: a completed edge arrives
+    // through the channel. The loop registers it and re-advertises the roster.
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peer_reg_tx
+        .send(PeerRegistration::new(peer_ctrl, agent_who("remote-1")))
+        .unwrap();
+
+    let saw_peer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut saw_notice = false;
+        loop {
+            match ctrl.events.recv().await {
+                // A runtime edge announces itself, so the "connecting…" line resolves.
+                Some(ControllerEvent::Notice { text })
+                    if text.contains("connected to peer remote-1") =>
+                {
+                    saw_notice = true;
+                }
+                Some(ControllerEvent::Capabilities { peers, .. })
+                    if peers.iter().any(|p| p.name == "remote-1") =>
+                {
+                    break saw_notice;
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the peer to appear in Capabilities");
+    assert!(
+        saw_peer,
+        "the registered peer must appear in the roster and announce a connect Notice"
+    );
+
+    host.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// #53: the /connect-peer command hands the pasted code to the injected dialer (off the
+// loop, non-blocking) and the completed forward edge lands via the registrar. A stub
+// dialer stands in for the network — it records the code it was handed and registers a
+// peer, whose far ends a keeper task holds alive so the edge isn't immediately reaped.
+#[tokio::test]
+async fn connect_peer_command_invokes_dialer_and_registers_edge() {
+    use crate::core::{BrokerHandle, PeerDialer, PeerWiring};
+
+    let (session, dir) = mk_session();
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel::<PeerRegistration>();
+    let (code_tx, mut code_rx) = mpsc::unbounded_channel::<String>();
+
+    let dialer: PeerDialer = Box::new(move |code: String, _self: BrokerHandle| {
+        let reg_tx = reg_tx.clone();
+        let code_tx = code_tx.clone();
+        Box::pin(async move {
+            let _ = code_tx.send(code);
+            let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+            let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(16);
+            // Hold the far ends so the registered peer isn't reaped before we observe it.
+            tokio::spawn(async move {
+                let _keep = (ev_tx, ui_rx);
+                std::future::pending::<()>().await;
+            });
+            reg_tx
+                .send(PeerRegistration::new(
+                    Controller {
+                        events: ev_rx,
+                        ui_tx,
+                    },
+                    agent_who("remote-peer"),
+                ))
+                .map_err(|_| anyhow::anyhow!("loop gone"))?;
+            Ok(())
+        })
+    });
+
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring {
+            factory: None,
+            initial_peers: PeerSet::default(),
+            register_rx: Some(reg_rx),
+            dialer: Some(dialer),
+        },
+    );
+    let mut ctrl = host
+        .attach(ClientIdentity::human("watcher"))
+        .await
+        .expect("attach");
+
+    ctrl.ui_tx
+        .send(UiEvent::Command {
+            line: "/connect-peer nudge:pastedcode".into(),
+        })
+        .await
+        .unwrap();
+
+    // The dialer was invoked with exactly the pasted code (parse + dispatch + hand-off).
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), code_rx.recv())
+        .await
+        .expect("dialer was not invoked")
+        .expect("code");
+    assert_eq!(got, "nudge:pastedcode");
+
+    // The forward edge lands through the registrar: the peer shows up in the roster.
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ctrl.events.recv().await {
+                Some(ControllerEvent::Capabilities { peers, .. })
+                    if peers.iter().any(|p| p.name == "remote-peer") =>
+                {
+                    break true;
+                }
+                Some(_) => continue,
+                None => break false,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the peer in Capabilities");
+    assert!(landed, "the dialed peer must appear in the roster");
+
+    host.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -556,7 +723,9 @@ async fn steering_failure_denies_safely_and_rolls_back() {
 
 // An UNSUPERVISED peer's permission request is never answered by this agent — its
 // own supervisor (or a human) holds that decision. This is what stops a child
-// rubber-stamping its parent's gated calls.
+// rubber-stamping its parent's gated calls. It is not narrated either (the peer's
+// prompts are its own session's business); the peer's Error event is the ordering
+// sentinel proving the prompt was processed before we assert.
 #[tokio::test]
 async fn unsupervised_check_in_is_not_answered() {
     let (session, dir) = mk_session();
@@ -583,13 +752,25 @@ async fn unsupervised_check_in_is_not_answered() {
             summary: "run ls".into(),
         })
         .unwrap();
+    peer_ev
+        .send(ControllerEvent::Error {
+            message: "sentinel".into(),
+        })
+        .unwrap();
 
-    // The observation surfaces (so a human can see it), explicitly unanswered here.
+    // Peer events are FIFO on one channel: the sentinel's notice proves the prompt
+    // was processed — silently (no "asks to use" narration precedes it).
     loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) if text.contains("not mine to answer") => break,
+            Some(AgentEvent::Notice { text }) if text.contains("sentinel") => break,
+            Some(AgentEvent::Notice { text }) => {
+                assert!(
+                    !text.contains("asks to use"),
+                    "unsupervised prompt must not narrate: {text}"
+                );
+            }
             Some(_) => {}
-            None => panic!("expected the not-mine Notice"),
+            None => panic!("expected the sentinel Notice"),
         }
     }
 
@@ -1144,6 +1325,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
             peers: PeerSet::default(),
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot)),
+            peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
         },
     ));
@@ -1239,6 +1421,7 @@ async fn spawn_denial_does_not_run_the_factory() {
             peers: PeerSet::default(),
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot.clone())),
+            peer_dialer: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
         },
     ));
@@ -1653,14 +1836,22 @@ async fn peer_change_reemits_capabilities_roster() {
     reg_tx
         .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
         .unwrap();
-    match agent_rx.recv().await {
-        Some(AgentEvent::Capabilities { peers, .. }) => {
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "child-1");
-            assert!(!peers[0].supervised);
+    // Registration emits a connect Notice, then the Capabilities roster re-advertise.
+    let mut saw_roster = false;
+    for _ in 0..4 {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Capabilities { peers, .. }) => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].name, "child-1");
+                assert!(!peers[0].supervised);
+                saw_roster = true;
+                break;
+            }
+            Some(_) => continue,
+            None => break,
         }
-        other => panic!("expected Capabilities after registration, got {other:?}"),
     }
+    assert!(saw_roster, "expected Capabilities after registration");
 
     // The peer disconnects: the loop reaps it (a Notice narrates that) and
     // re-advertises the now-empty roster.
@@ -1680,6 +1871,231 @@ async fn peer_change_reemits_capabilities_roster() {
     assert!(
         saw_empty_roster,
         "expected a Capabilities re-emit after reap"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// The model-facing roster block: None when peerless, else names each held peer and
+// distinguishes a spawned subagent from a connected peer, so the agent can address
+// one without guessing.
+#[test]
+fn roster_system_text_lists_held_peers() {
+    use super::peer_tools::roster_system_text;
+
+    let mut peers = PeerSet::default();
+    assert!(roster_system_text(&peers).is_none(), "peerless → no block");
+
+    let (a_ctrl, _a_ev, _a_ui) = fake_peer();
+    peers.register(supervised_reg(a_ctrl, agent_who("child-1")));
+    let (b_ctrl, _b_ev, _b_ui) = fake_peer();
+    peers.register(PeerRegistration::new(b_ctrl, agent_who("mate")));
+
+    let text = roster_system_text(&peers).expect("held peers → a block");
+    assert!(text.contains("MessagePeer"), "names the tool: {text}");
+    assert!(
+        text.contains("child-1 (subagent you spawned)"),
+        "supervised peer labelled: {text}"
+    );
+    assert!(
+        text.contains("mate (peer)"),
+        "unsupervised peer labelled: {text}"
+    );
+}
+
+// Consecutive messages from the same sender, already queued when the turn starts, are
+// coalesced into ONE user turn (same info to the model, fewer round-trips), attributed
+// once. Pre-buffering both before spawning the loop makes the drain deterministic.
+#[tokio::test]
+async fn consecutive_same_sender_messages_coalesce_into_one_turn() {
+    let (session, dir) = mk_session();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    let who = agent_who("child-1");
+    ui_tx
+        .send((
+            Some(who.clone()),
+            UiEvent::UserMessage { text: "one".into() },
+        ))
+        .await
+        .unwrap();
+    ui_tx
+        .send((Some(who), UiEvent::UserMessage { text: "two".into() }))
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        RecordingProvider { seen: seen.clone() },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+
+    let transcript = seen.lock().unwrap().clone();
+    assert_eq!(
+        transcript.len(),
+        1,
+        "coalesced into one turn (a single user message), not two: {transcript:?}"
+    );
+    match &transcript[0].content[0] {
+        ContentBlock::Text { text } => {
+            assert!(
+                text.contains("one") && text.contains("two"),
+                "both messages reach the model in one turn: {text}"
+            );
+            assert!(
+                text.starts_with("[message from peer child-1]"),
+                "attributed once, to the shared sender: {text}"
+            );
+        }
+        other => panic!("expected a coalesced user turn, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Different senders are NOT coalesced: a second sender's message is stashed and becomes
+// its own turn, so cross-driver messages stay attributable.
+#[tokio::test]
+async fn different_sender_messages_are_not_coalesced() {
+    let (session, dir) = mk_session();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    ui_tx
+        .send((
+            Some(agent_who("alice")),
+            UiEvent::UserMessage {
+                text: "from-a".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    ui_tx
+        .send((
+            Some(agent_who("bob")),
+            UiEvent::UserMessage {
+                text: "from-b".into(),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        RecordingProvider { seen: seen.clone() },
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    // Two distinct turns complete (one per sender).
+    let mut completed = 0;
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            completed += 1;
+            if completed == 2 {
+                break;
+            }
+        }
+    }
+
+    // The last recorded request holds both turns as separate user messages.
+    let transcript = seen.lock().unwrap().clone();
+    let user_texts: Vec<&str> = transcript
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| match &m.content[0] {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        user_texts.iter().any(|t| t.contains("from-a"))
+            && user_texts.iter().any(|t| t.contains("from-b")),
+        "each sender is its own turn: {user_texts:?}"
+    );
+    assert!(
+        user_texts
+            .iter()
+            .all(|t| !(t.contains("from-a") && t.contains("from-b"))),
+        "the two senders' messages are never merged into one turn: {user_texts:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// An UNSUPERVISED peer's activity is NOT narrated — its work belongs to its own
+// session; only its MessagePeer turns, errors, and lifecycle reach this one. The
+// peer's Error (always narrated) is the sentinel: events are processed in order, so
+// if the AssistantText had narrated, it would arrive before the error notice.
+#[tokio::test]
+async fn unsupervised_peer_activity_is_not_narrated() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+    ));
+
+    let (peer_ctrl, peer_ev, _peer_ui) = fake_peer();
+    reg_tx
+        .send(PeerRegistration::new(peer_ctrl, agent_who("mate")))
+        .unwrap();
+    peer_ev
+        .send(ControllerEvent::AssistantText {
+            text: "chatty peer output".into(),
+        })
+        .unwrap();
+    peer_ev
+        .send(ControllerEvent::Error {
+            message: "sentinel".into(),
+        })
+        .unwrap();
+
+    let mut first_activity_notice = None;
+    while let Some(ev) = agent_rx.recv().await {
+        if let AgentEvent::Notice { text } = ev {
+            if text.contains("connected to peer") {
+                continue;
+            }
+            first_activity_notice = Some(text);
+            break;
+        }
+    }
+    let text = first_activity_notice.expect("expected the sentinel error Notice");
+    assert!(
+        text.contains("sentinel"),
+        "the first narrated notice must be the error sentinel, not the suppressed \
+         activity: {text}"
+    );
+    assert!(
+        !text.contains("chatty peer output"),
+        "unsupervised activity must not narrate: {text}"
     );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();

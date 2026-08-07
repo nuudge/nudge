@@ -23,6 +23,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         pairing_code: None,
         pairing_qr_watch: None,
         pairing_code_watch: None,
+        pairing_qr_agent: None,
+        pairing_code_agent: None,
         // A --connect client is a guest: it attaches to a daemon it doesn't host
         // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,

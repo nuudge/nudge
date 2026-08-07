@@ -97,6 +97,10 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
                     // No factory: a child may not spawn its own subagents yet.
                     factory: None,
                     initial_peers: child_peers,
+                    register_rx: None,
+                    // No dialer: a subagent cannot open peer edges (provenance —
+                    // /connect-peer is human-only, and a child has no human).
+                    dialer: None,
                 },
             );
 

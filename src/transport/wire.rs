@@ -28,9 +28,15 @@ pub enum ClientFrame {
     // with `seq > after_seq`, so a client whose connection dropped catches up on
     // exactly what it missed. `None` = fresh attach → full replay from seq 0. `who`
     // is the attaching client's identity — the attach frame is the handshake.
+    // `reverse_offer` requests the duplex peer edge: the acceptor also drives/observes
+    // the dialer over this one socket (see `ReverseEvent`/`ServerFrame::ReverseCommand`).
+    // Defaulted + skipped when false, so a non-offering attach (every phone, every
+    // ordinary client) is byte-identical to before and the Kotlin mirror needs no change.
     Attach {
         after_seq: Option<u64>,
         who: ClientIdentity,
+        #[serde(default, skip_serializing_if = "is_false")]
+        reverse_offer: bool,
     },
     // Yield the session without ending it — the loop keeps running headless and
     // buffering. (Distinct from dropping the connection, though the daemon
@@ -39,6 +45,19 @@ pub enum ClientFrame {
     // An application-level command (user message, model switch, MCP, permission
     // answer, quit). Maps straight to the in-memory `UiEvent`.
     Command(UiEvent),
+    // The dialer's OWN broker events, streamed to the acceptor over a reverse-offered
+    // edge (the acceptor observes the dialer — the reverse half of the mutual peer
+    // pair). Its own monotonic `seq` is the reverse direction's replay cursor. Only
+    // ever produced by a duplex dialer; a phone never offers, so never sends it.
+    ReverseEvent {
+        seq: u64,
+        event: ControllerEvent,
+    },
+}
+
+// serde skip predicate: keep a non-offering `Attach` byte-for-byte as it was.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // Daemon → client.
@@ -54,6 +73,14 @@ pub enum ServerFrame {
     // counts every event the session has ever emitted (replay + live share one
     // sequence), so it is a stable resume cursor across reconnects.
     Event { seq: u64, event: ControllerEvent },
+    // The acceptor's own identity, announced once right after `Attached` iff the dialer
+    // offered a reverse edge and this leg accepts peers. Lets the dialer name the return
+    // peer and stamp the acceptor's drives — the mirror of the dialer's `Attach.who`.
+    // Never sent to a non-offering client, so a phone never receives it.
+    ReverseAttach { who: ClientIdentity },
+    // The acceptor's drives, streamed to the dialer's broker over a reverse-offered edge
+    // (the acceptor drives the dialer). Never sent to a non-offering client.
+    ReverseCommand(UiEvent),
 }
 
 // Write one frame as a single newline-terminated JSON line and flush. Flushing
@@ -300,6 +327,7 @@ mod tests {
             &ClientFrame::Attach {
                 after_seq: Some(7),
                 who: ClientIdentity::human("alice"),
+                reverse_offer: false,
             },
         )
         .await
@@ -313,12 +341,79 @@ mod tests {
             other => panic!("expected Command(PermissionResponse), got {other:?}"),
         }
         match read_frame::<_, ClientFrame>(&mut reader).await.unwrap() {
-            Some(ClientFrame::Attach { after_seq, who }) => {
+            Some(ClientFrame::Attach { after_seq, who, .. }) => {
                 assert_eq!(after_seq, Some(7));
                 assert_eq!(who.name, "alice");
                 assert!(matches!(who.kind, crate::core::identity::ClientKind::Human));
             }
             other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    // A non-offering Attach serializes byte-identically to before the reverse_offer
+    // field existed (skip_serializing_if), so the phone/ordinary-client wire is
+    // unchanged; an offering Attach carries the flag. The reverse-direction frames
+    // round-trip across the same framing.
+    #[test]
+    fn reverse_edge_frames_wire_bytes_and_round_trip() {
+        // A plain attach omits reverse_offer entirely (pins the phone-compatible bytes).
+        let plain = ClientFrame::Attach {
+            after_seq: None,
+            who: ClientIdentity::human("alice"),
+            reverse_offer: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"Attach":{"after_seq":null,"who":{"kind":"Human","name":"alice","session_id":null,"task":null}}}"#
+        );
+        // An offering attach carries the flag.
+        let offering = ClientFrame::Attach {
+            after_seq: None,
+            who: ClientIdentity::human("alice"),
+            reverse_offer: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&offering).unwrap(),
+            r#"{"Attach":{"after_seq":null,"who":{"kind":"Human","name":"alice","session_id":null,"task":null},"reverse_offer":true}}"#
+        );
+
+        let rev_ev = ClientFrame::ReverseEvent {
+            seq: 3,
+            event: ControllerEvent::AssistantText { text: "hi".into() },
+        };
+        match serde_json::from_str::<ClientFrame>(&serde_json::to_string(&rev_ev).unwrap()).unwrap()
+        {
+            ClientFrame::ReverseEvent { seq, event } => {
+                assert_eq!(seq, 3);
+                assert!(matches!(event, ControllerEvent::AssistantText { text } if text == "hi"));
+            }
+            other => panic!("expected ReverseEvent, got {other:?}"),
+        }
+
+        let rev_att = ServerFrame::ReverseAttach {
+            who: ClientIdentity {
+                kind: crate::core::identity::ClientKind::Agent,
+                name: "peer-b".into(),
+                session_id: Some("s1".into()),
+                task: None,
+            },
+        };
+        match serde_json::from_str::<ServerFrame>(&serde_json::to_string(&rev_att).unwrap())
+            .unwrap()
+        {
+            ServerFrame::ReverseAttach { who } => {
+                assert_eq!(who.name, "peer-b");
+                assert!(matches!(who.kind, crate::core::identity::ClientKind::Agent));
+            }
+            other => panic!("expected ReverseAttach, got {other:?}"),
+        }
+
+        let rev_cmd = ServerFrame::ReverseCommand(UiEvent::UserMessage { text: "go".into() });
+        match serde_json::from_str::<ServerFrame>(&serde_json::to_string(&rev_cmd).unwrap())
+            .unwrap()
+        {
+            ServerFrame::ReverseCommand(UiEvent::UserMessage { text }) => assert_eq!(text, "go"),
+            other => panic!("expected ReverseCommand(UserMessage), got {other:?}"),
         }
     }
 
