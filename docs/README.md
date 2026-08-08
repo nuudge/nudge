@@ -32,8 +32,6 @@ then dive into whichever component you're using.
 - **[Symmetric communication](symmetric-communication.md)** — the design philosophy behind
   remote control, multi-client co-op, and multi-agent: a human, a phone, and an agent are
   the same client.
-- **[Multi-agent models](multi-agent-models.md)** — subagents vs. peers: the two models,
-  what each is for, and the open design questions.
 
 ## Operation
 
@@ -41,6 +39,8 @@ then dive into whichever component you're using.
   with links to the tracking issues.
 - **[Architecture](../ARCHITECTURE.md)** — the layered module design, the session
   host/broker runtime, and selected design decisions (developer-facing).
+- **[Multi-agent models](multi-agent-models.md)** — the maintainer's design notes on
+  subagents vs. peers: decisions, reasoning, and open questions (developer-facing).
 - **[Deploying the relay](../deploy/README.md)** — stand up your own public relay box
   with TLS.
 - **[Contributing](../CONTRIBUTING.md)** — toolchain, local checks, and the PR workflow.

@@ -1,4 +1,10 @@
-# Multi-agent models: subagents vs. peers — working notes
+# Multi-agent models: subagents vs. peers — design notes
+
+**These are the maintainer's design notes and thought process, not a user guide.** If you
+want to *use* the multi-agent features, read [Subagents](subagents.md) and
+[Peer agents](peers.md). This doc records how the design got where it is — the taxonomy,
+the decisions and their reasoning, and what remains deliberately unsettled — so future
+work (and future contributors) don't re-litigate it from scratch.
 
 **Status: both models are shipped; several design questions remain open.** This began as
 a design discussion (2026-02, around narrowing
