@@ -34,6 +34,22 @@ The pairing code (a 128-bit rendezvous secret carried inside the QR) is the whol
 the session: anyone you hand it to can join, and no one else — not even the relay — can
 find or decrypt it. See [Security](security.md).
 
+## Pairing scopes
+
+A session mints **three** codes, each its own room and key — which code you hand over
+decides what its holder can do:
+
+| Scope | Grants | Hand it to |
+| --- | --- | --- |
+| **full-access** | see everything, drive, answer permission prompts | yourself (your phone), a trusted co-driver |
+| **watch-only** | see everything; cannot drive, run commands, or answer prompts | a teammate who should observe, not steer |
+| **agent-peer** | connect another nudge session's *agent* as a peer | another human, for their session to `/connect-peer` — see [Peer agents](peers.md) |
+
+On the `/background` pair screen, press `w` to cycle which code is shown. Headless, `nudge
+--daemon` prints the full-access code; add `--watch` and/or `--peer` for the others. The
+scope is enforced by *which room the connection arrives through* — a code's rights can't be
+upgraded by tampering with it.
+
 ## Multi-client co-op
 
 Sessions are multi-attach. The daemon lives behind a broker, not a terminal, so your
@@ -41,7 +57,8 @@ teammate, your phone, and your laptop can all attach to the same running agent a
 Everyone sees the same event stream, anyone can drive, and a permission you approve on one
 client clears on all of them. It's real multi-client concurrency, not screen-sharing —
 co-op mode for a coding agent. Each client announces an identity when it attaches, so the
-shared transcript shows who said what.
+shared transcript shows who said what — and once a second driver connects, the *agent* sees
+senders named too, so it can tell you and your teammate apart and answer each by name.
 
 ## Headless / debug attach without a relay
 

@@ -104,11 +104,13 @@ start with `/`, e.g. a pasted path, still goes to the model):
 
 | Command | Action |
 |---|---|
-| `/model` | open the model picker |
+| `/model` | open the model picker (`/model <id>` switches directly) |
 | `/mcp` | list loaded MCP servers and the dormant ones available to load |
 | `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
 | `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
-| `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR — reattach with `Enter` |
+| `/peers` | list connected peer agents and spawned subagents |
+| `/connect-peer <code>` | connect this agent to another session's agent — see [Peer agents](peers.md) |
+| `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR (`w` cycles full-access → watch-only → agent-peer) — reattach with `Enter` |
 
 ## Sessions
 

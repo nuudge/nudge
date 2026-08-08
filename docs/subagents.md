@@ -6,6 +6,13 @@ stream. There is no special subagent runtime — a child agent attaches to its p
 exact same way as any other client (a TUI, the Android app). Same handshake, same wire. The
 entire multi-agent story is one tiny protocol.
 
+Subagents are one of nudge's two multi-agent models: a subagent is *spawned and
+supervised* — you buy its conclusion, not its context. The other model is a **peer**: an
+agent in someone else's independently-run session, laterally connected with
+`/connect-peer` — you buy its context, not its conclusion. This page covers subagents; see
+[Peer agents](peers.md) for peers, and [multi-agent models](multi-agent-models.md) for the
+design behind both. `/peers` lists both kinds.
+
 ## How it works
 
 Ask for a subagent in plain language — *"spawn a subagent to analyze the largest files in

@@ -1,13 +1,15 @@
 # nudge
 
-**A coding agent you can drive from your phone — and share with your whole team.**
+**A coding agent you can drive from your phone, share with your whole team — and connect
+to other agents.**
 
 Scan a QR and your running session becomes a live controller in your pocket, over an
 end-to-end-encrypted link that only ever sees ciphertext — approve an edit from the bus,
 redirect it from the couch. Your laptop, your phone, and your teammate can all attach to the
 *same* running agent at once: everyone sees the same stream, anyone can drive, an approval
-clears everywhere. It's co-op mode for a coding agent — one that doesn't sleep, doesn't quit,
-and follows you home.
+clears everywhere. And agents attach too — spawn a supervised subagent, or paste one code
+and your agent is consulting a colleague's agent on another machine. It's co-op mode for a
+coding agent — one that doesn't sleep, doesn't quit, and follows you home.
 
 <p align="center">
   <video src="https://github.com/user-attachments/assets/17d6523d-d66f-4ec2-b3eb-6075815539a2" controls width="800"></video>
@@ -16,9 +18,9 @@ and follows you home.
 </p>
 
 Under the hood that's one simple idea: **agent communications are symmetric.** You're just a
-client, your phone is just a client, and a subagent is just a client too. Every client
-reaches a session through the exact same handshake and wire — so the entire multi-agent
-story, and multi-attach co-op, is one tiny protocol.
+client, your phone is just a client, and an agent is just a client too. Every client reaches
+a session through the exact same handshake and wire — so subagents, cross-machine peer
+agents, and multi-attach co-op aren't three features: they're one tiny protocol.
 
 Written in Rust from scratch — no agent SDK, no framework, no abstraction tax, just the raw
 LLM API over HTTP. Every moving part is out in the open: the loop, the tool-use protocol,
@@ -52,11 +54,17 @@ weekend.
 - **Real multi-client co-op.** The session lives behind a broker, not a terminal — your
   phone, your laptop, and your teammate can all attach to the same running agent at once.
   Everyone sees the same stream, anyone can drive, a permission you approve clears
-  everywhere. Not screen-sharing. → [Remote control & relay](docs/remote-and-relay.md)
+  everywhere — and the agent knows who's speaking, so it can answer each of you by name.
+  Hand a teammate a watch-only code to let them observe without driving. Not
+  screen-sharing. → [Remote control & relay](docs/remote-and-relay.md)
 - **Subagents are just clients.** No special sub-agent runtime — a child agent attaches to
   its parent the exact same way your phone does, same handshake, same wire. The parent
-  supervises the kid's tool calls and escalates the scary ones to you. The entire
-  multi-agent story is one tiny protocol. → [Subagents](docs/subagents.md)
+  supervises the kid's tool calls and escalates the scary ones to you. → 
+  [Subagents](docs/subagents.md)
+- **Agents connect across machines.** Paste one code and your agent holds a live,
+  bidirectional edge to a colleague's agent — yours consults theirs about the codebase it
+  actually knows, over the same encrypted relay your phone uses, with every tool call still
+  gated by its own human. → [Peer agents](docs/peers.md)
 - **Secure by design.** The whole transport is end-to-end encrypted (host your own relay if
   you want full control). `Bash` makes the model declare its *intent* before you approve;
   there's no generic `Write` tool (only `Edit` and `CreateNew`); read-before-write is
@@ -103,6 +111,7 @@ excuses.
   self-hosting a relay.
 - **[Mobile app](docs/mobile-app.md)** — the Android client.
 - **[Subagents](docs/subagents.md)** — spawn, supervise, converse, and the design behind them.
+- **[Peer agents](docs/peers.md)** — connect two sessions' agents across machines.
 - **[MCP servers](docs/mcp.md)** — connect external Model Context Protocol servers.
 - **[Skills](docs/skills.md)** — package reusable expertise.
 - **[Security](docs/security.md)** — encryption, the permission model, safe file tools.

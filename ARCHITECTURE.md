@@ -152,12 +152,19 @@ debug path.
 
 | Invocation                                   | Topology                                                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and shows a QR (if set). |
-| `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR.           |
+| `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and arms three scoped pairing legs — full-access, watch-only, agent-peer (`w` cycles the QR). |
+| `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR. `--watch` / `--peer` mint and park the watch-only / agent-peer scopes too.    |
 | `nudge --connect --pair-code <code>`         | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
 | `nudge --daemon --socket <path>`             | Headless host bound to a local Unix socket (debugging the transport without a relay).             |
 | `nudge --connect --socket <path>`            | Front-end only (`SocketClient`) over a local Unix socket (debug).                                 |
 | `nudge --print-prompt`                       | Standalone one-shot action, then exit.                                                            |
+
+Each pairing scope is a distinct room + key mapped daemon-side to a `ClientProfile`
+(rights are the room's, never the client's claim). An agent-peer room accepts
+`/connect-peer` dials: both directed edges of the resulting peer relationship ride the one
+socket (the duplex `ReverseAttach`/`ReverseEvent`/`ReverseCommand` frames, offered at
+attach and invisible to non-offering clients like the phone), and the finished edge is
+handed to the running loop through the runtime peer registrar.
 
 ## The coding agent (`coding/`)
 
