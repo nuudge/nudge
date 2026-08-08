@@ -19,6 +19,8 @@ then dive into whichever component you're using.
   features, install (prebuilt APK or build from source), and pairing.
 - **[Subagents](subagents.md)** — spawn, supervise, converse with, and dismiss child
   agents, and the symmetric-communication design they fall out of.
+- **[Peer agents](peers.md)** — connect your agent to a colleague's agent on another
+  machine: setup, `/connect-peer`, and what to expect.
 - **[MCP servers](mcp.md)** — connect external Model Context Protocol servers: the
   three tool layers, `/mcp` commands, and the full `.mcp.json` config reference.
 - **[Skills](skills.md)** — package reusable expertise as loadable folders.
@@ -28,8 +30,10 @@ then dive into whichever component you're using.
 - **[Security](security.md)** — end-to-end encryption, the ciphertext-blind relay, the
   permission model, and the tool-design choices that keep edits safe.
 - **[Symmetric communication](symmetric-communication.md)** — the design philosophy behind
-  remote control, multi-client co-op, and subagents: a human, a phone, and an agent are the
-  same client.
+  remote control, multi-client co-op, and multi-agent: a human, a phone, and an agent are
+  the same client.
+- **[Multi-agent models](multi-agent-models.md)** — subagents vs. peers: the two models,
+  what each is for, and the open design questions.
 
 ## Operation
 

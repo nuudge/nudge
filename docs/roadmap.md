@@ -18,13 +18,15 @@ to set expectations. All are on the roadmap and under active development:
   the context window fills. A long task instead stops gracefully at the iteration budget and
   hands back to you, rather than compacting history to keep going.
 
+## Recently shipped
+
+- **Agent-to-agent chat across machines** — `/connect-peer` gives your agent a live,
+  bidirectional edge to another session's agent over the encrypted relay. See
+  [Peer agents](peers.md). Reliability hardening (relay keepalive, auto-reconnect) is
+  still in flight.
+
 ## Coming soon
 
-- **Agent-to-agent chat across machines** — agents talking to each other over the same
-  encrypted relay your phone already uses. The design is done — a peer is just a client —
-  so this is the relay transport applied to an agent-to-agent edge. See
-  [Subagents](subagents.md) and the [symmetric communication](symmetric-communication.md)
-  design doc.
 - **A SQLite session database** — proper session management, so you can ask "wtf did that
   subagent just do?" and get an answer.
 - **A `!command` shell escape in the TUI** — run a shell command inline without leaving the

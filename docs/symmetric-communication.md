@@ -162,13 +162,15 @@ subsystem collapse into compositions of the primitives above:
 - **Multi-client co-op** — several clients on one session is just the broker fanning events
   to N controllers and merging their input. A permission prompt goes to everyone attached and
   the first answer wins, so an approval clears everywhere.
-- **Watch-mode** — a human observing while a peer drives is not a mode; it's a second attach.
+- **Watch-mode** — a human observing while a peer drives is not a mode; it's a second attach
+  (shipped as the watch-only pairing scope: same code mechanism, a profile that observes but
+  cannot drive).
 - **Subagents** — spawn is *create an agent + mutually attach*. Supervision rides the observe
   channel; conversation rides the drive channel; roles follow from who spawned whom.
 - **Cross-machine multi-agent** — an agent driving another agent across the network is the
   same operation with the relay transport, exactly the encrypted path your phone already
-  uses. The transport is built; wiring agents to dial each other over it is the next edge on
-  the [roadmap](roadmap.md).
+  uses. Shipped: `/connect-peer` dials an agent-scoped pairing and both directed edges of
+  the pair ride one duplex socket — see [Peer agents](peers.md) for the user-facing guide.
 
 ## Why it matters
 
