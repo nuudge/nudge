@@ -47,27 +47,43 @@ Every arrow in this picture is the same operation — `attach`, whether the tran
 underneath is an in-process channel, a Unix socket, or the encrypted relay:
 
 ```mermaid
-graph TD
+graph LR
   T["your terminal"] -->|attach| ABr
   P["your phone (relay)"] -->|attach| ABr
   W["a teammate (watch-only)"] -->|attach| ABr
   subgraph A["your session"]
     ABr["broker"]
   end
-  subgraph B["another agent — a spawned child, or a peer on another machine"]
-    BBr["broker"]
+  subgraph C["a subagent it spawned"]
+    CBr["broker"]
   end
-  A -.->|attach| BBr
-  B -.->|attach| ABr
+  subgraph R["a peer agent on another machine"]
+    RBr["broker"]
+  end
+  A -.->|attach| CBr
+  C -.->|attach| ABr
+  A -.->|"attach (relay)"| RBr
+  R -.->|"attach (relay)"| ABr
 ```
 
-| You get | It's the same connection… | Read more |
-|---|---|---|
-| **Phone control** — scan a QR, approve an edit from the bus | …over an E2E-encrypted relay that only ever sees ciphertext | [Remote & relay](docs/remote-and-relay.md), [Mobile app](docs/mobile-app.md) |
-| **Multi-client co-op** — laptop, phone, and a teammate on one running agent; anyone drives, an approval clears everywhere, and the agent answers each of you by name | …N of them at once: events fan out to every client, input merges back | [Remote & relay](docs/remote-and-relay.md) |
-| **Watch-mode** — hand someone a code to observe without driving | …whose pairing scope can observe but not drive | [Remote & relay](docs/remote-and-relay.md) |
-| **Supervised subagents** — spawn a worker; its parent reviews every tool call and escalates the scary ones to you | …pointed at a child, plus one pointing back — supervision rides *observe*, conversation rides *drive* | [Subagents](docs/subagents.md) |
-| **Peer agents across machines** — paste one code; your agent consults a colleague's agent about the codebase it actually knows | …the phone's relay transport with the return edge offered, both directions over one socket | [Peer agents](docs/peers.md) |
+- **Phone control** — scan a QR, approve an edit from the bus. The same connection, over an
+  E2E-encrypted relay that only ever sees ciphertext.
+  → [Remote & relay](docs/remote-and-relay.md), [Mobile app](docs/mobile-app.md)
+- **Multi-client co-op** — laptop, phone, and a teammate on one running agent; anyone drives,
+  an approval clears everywhere, and the agent answers each of you by name. The same
+  connection, N of them at once: events fan out to every client, input merges back.
+  → [Remote & relay](docs/remote-and-relay.md)
+- **Watch-mode** — hand someone a code to observe without driving. The same connection, with
+  a pairing scope that can observe but not drive.
+  → [Remote & relay](docs/remote-and-relay.md)
+- **Supervised subagents** — spawn a worker; its parent reviews every tool call and escalates
+  the scary ones to you. The same connection, pointed at a child, plus one pointing back —
+  supervision rides *observe*, conversation rides *drive*.
+  → [Subagents](docs/subagents.md)
+- **Peer agents across machines** — paste one code; your agent consults a colleague's agent
+  about the codebase it actually knows. The same connection, on the phone's relay transport
+  with the return edge offered — both directions over one socket.
+  → [Peer agents](docs/peers.md)
 
 The design test behind all of it: if you can't tell whether a human or an agent is on the
 other end of a connection — and nothing behaves differently — the design is right. The full
