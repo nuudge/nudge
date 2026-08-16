@@ -120,15 +120,24 @@ skills. → [Terminal agent](docs/terminal-agent.md), [MCP servers](docs/mcp.md)
 
 Requires Rust (edition 2024, via [rustup](https://rustup.rs)) and an Anthropic API key.
 
+Install straight from git and run:
+
+```bash
+cargo install --git https://github.com/nuudge/nudge nudge
+mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
+nudge
+```
+
+Or build from a clone:
+
 ```bash
 git clone https://github.com/nuudge/nudge.git && cd nudge
 mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
 cargo run
 ```
 
-Prefer a binary? `cargo install --git https://github.com/nuudge/nudge`, or grab a prebuilt
-build from the [releases page](https://github.com/nuudge/nudge/releases). Full install
-matrix, API-key configuration, the relay, and the Android app are in
+Prebuilt builds are on the [releases page](https://github.com/nuudge/nudge/releases). Full
+install matrix, API-key configuration, the relay, and the Android app are in
 **[Getting started](docs/getting-started.md)**.
 
 ## Components
