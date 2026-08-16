@@ -32,8 +32,8 @@ cargo run --manifest-path /path/to/nudge/Cargo.toml
 from any directory:
 
 ```bash
-cargo install --path .                                # from a local checkout
-cargo install --git https://github.com/nuudge/nudge   # straight from git
+cargo install --path .                                      # from a local checkout
+cargo install --git https://github.com/nuudge/nudge nudge   # straight from git
 ```
 
 ## Download a prebuilt binary
