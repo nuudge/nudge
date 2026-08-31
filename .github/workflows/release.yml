@@ -122,3 +122,69 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+
+  # Keep `brew install nuudge/tap/nudge` current: regenerate the tap's formula
+  # from the checksums the release job just published and push it to
+  # nuudge/homebrew-tap. The formula is rewritten wholesale — the tap carries
+  # no state worth merging. TAP_PUSH_TOKEN is a fine-grained PAT with
+  # contents:write on the tap repo (GITHUB_TOKEN can't push cross-repo).
+  homebrew:
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir sums
+          echo "DARWIN_SHA=$(awk '{print $1}' sums/nudge-aarch64-apple-darwin.sha256)" >> "$GITHUB_ENV"
+          echo "LINUX_SHA=$(awk '{print $1}' sums/nudge-x86_64-unknown-linux-gnu.sha256)" >> "$GITHUB_ENV"
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Regenerate formula and push to tap
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/nuudge/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/nudge.rb <<EOF
+          class Nudge < Formula
+            desc "A coding agent for your terminal and on the go"
+            homepage "https://github.com/nuudge/nudge"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/nuudge/nudge/releases/download/v$VERSION/nudge-aarch64-apple-darwin"
+                sha256 "$DARWIN_SHA"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/nuudge/nudge/releases/download/v$VERSION/nudge-x86_64-unknown-linux-gnu"
+                sha256 "$LINUX_SHA"
+              end
+            end
+
+            livecheck do
+              url :stable
+              strategy :github_latest
+            end
+
+            def install
+              # The release asset is a bare binary named after its target triple;
+              # rename it to plain "nudge" on install.
+              bin.install Dir["nudge-*"].first => "nudge"
+            end
+
+            test do
+              assert_match "$VERSION", shell_output("#{bin}/nudge --version")
+            end
+          end
+          EOF
+          cd tap
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "nudge $VERSION"
+          git push
