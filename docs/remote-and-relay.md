@@ -82,15 +82,20 @@ two ways to get one.
 
 ### Use the shared relay
 
-If you trust the maintainer's relay box, point nudge at it — set it in
-`~/.nudge/config.env`, a project `.env`, or your shell:
+Fresh installs get this by default: the `~/.nudge/config.env` template that nudge creates
+on first run points `NUDGE_RELAY` at the maintainer's relay box, so phone handoff and
+remote peers work out of the box. If your config predates this (or you deleted the line),
+set it in `~/.nudge/config.env`, a project `.env`, or your shell:
 
 ```bash
 NUDGE_RELAY=wss://35.244.115.57.sslip.io
 ```
 
-The relay can't read your traffic (it's end-to-end encrypted), but you're still trusting
-that machine to be online and honest. For truly sensitive workloads, run your own.
+The relay can't read your traffic (it's end-to-end encrypted) and is only dialed when you
+use `/background`, `--daemon`, or `/connect-peer` — but it does see connection metadata
+(your IP, timing), and you're trusting that machine to be online and honest. To opt out,
+delete the `NUDGE_RELAY` line from your config. For truly sensitive workloads, run your
+own.
 
 ### Run your own
 

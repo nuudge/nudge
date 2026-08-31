@@ -62,12 +62,13 @@ Macs, or Windows — build from source with `cargo install` above.
 The installed binary reads `ANTHROPIC_API_KEY` from the environment. There are three
 sources, in increasing precedence:
 
-1. **Global config** at `~/.nudge/config.env` — so you don't set it per project:
+1. **Global config** at `~/.nudge/config.env` — so you don't set it per project. nudge
+   writes this file on first run as a working config with sensible defaults; the only
+   thing missing is your API key. Uncomment the `ANTHROPIC_API_KEY` line and fill it in:
 
    ```bash
-   mkdir -p ~/.nudge
-   echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
-   nudge
+   nudge            # first run creates ~/.nudge/config.env
+   $EDITOR ~/.nudge/config.env
    ```
 
 2. **A `.env` in the current directory** — takes precedence over the global config.
@@ -79,8 +80,19 @@ sources, in increasing precedence:
    nudge
    ```
 
-`~/.nudge/config.env` is also where you set `NUDGE_RELAY` to enable phone handoff — see
-[Remote control & relay](remote-and-relay.md).
+## Global defaults
+
+The generated `~/.nudge/config.env` starts you on these defaults — edit the file (or
+override per project / per shell via the sources above) to change them; removing a
+line falls back to the built-in default:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NUDGE_MODEL` | `claude-fable-5` | Model a new session starts on (change live with `/model`) |
+| `NUDGE_THINKING` | `summarized` | Thinking display: `summarized` or `omitted` (the `--thinking` flag overrides) |
+| `NUDGE_MAX_ITERATIONS` | `50` | Model calls allowed per turn before the agent pauses for guidance |
+| `NUDGE_NAME` | `$USER` | Your display name in transcripts (commented out in the generated file) |
+| `NUDGE_RELAY` | shared relay | Relay WebSocket URL for phone handoff and remote peers — see [Remote control & relay](remote-and-relay.md) |
 
 ## Next steps
 

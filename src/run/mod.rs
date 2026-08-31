@@ -9,7 +9,7 @@ use crate::coding;
 use crate::config::Config;
 use crate::core::{self, AgentConfig, Backend, ClientIdentity};
 use crate::llm;
-use crate::models::{DEFAULT_MODEL, MODELS, owned_models, resolve_models};
+use crate::models::{MODELS, owned_models, resolve_models};
 use crate::spawn;
 use crate::transport;
 use crate::tui;
@@ -17,10 +17,15 @@ use crate::tui;
 pub const MAX_TOKENS: u32 = 16384;
 pub const MAX_ITERATIONS: usize = 50;
 
-// The local user's identity, announced at attach. `$USER` if set, else a neutral
-// default — a `--name` override can come later.
+// The local user's identity, announced at attach: `NUDGE_NAME` if set, else
+// `$USER`, else a neutral default.
 pub fn local_identity() -> ClientIdentity {
-    let name = std::env::var("USER").unwrap_or_else(|_| "human".into());
+    let name = std::env::var("NUDGE_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "human".into());
     ClientIdentity::human(name)
 }
 
@@ -40,12 +45,12 @@ pub async fn host(cli: Cli) -> Result<()> {
         }
     };
 
-    let thinking_display = cli.thinking.as_display();
+    let thinking_display = crate::config::resolve_thinking(cli.thinking.as_ref())?;
     let who = local_identity();
     let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
         session_name: session.name.clone(),
-        model: DEFAULT_MODEL.into(),
+        model: config.model.clone(),
         thinking_display: thinking_display.clone(),
         // Filled in the local branch when --relay arms remote pairing.
         pairing_qr: None,
@@ -60,9 +65,9 @@ pub async fn host(cli: Cli) -> Result<()> {
         models: owned_models(MODELS),
     };
     let cfg = AgentConfig {
-        model: DEFAULT_MODEL.into(),
+        model: config.model.clone(),
         max_tokens: MAX_TOKENS,
-        max_iterations: MAX_ITERATIONS,
+        max_iterations: config.max_iterations,
         thinking_display,
         // Filled from the resolved catalog just below, once the provider exists.
         models: Vec::new(),
@@ -146,7 +151,12 @@ pub async fn host(cli: Cli) -> Result<()> {
     );
     // The executor behind the model-facing Spawn tool: this session may create
     // subagents (which themselves may not — the factory builds children without one).
-    let factory = spawn::peer_factory(api_key.clone(), session.id.clone());
+    let factory = spawn::peer_factory(
+        api_key.clone(),
+        session.id.clone(),
+        config.model.clone(),
+        config.max_iterations,
+    );
 
     // This session's peer identity, announced on every peer edge: the renamed name if
     // set, else a short session id (#53). Agent-kind — a peer edge is agent-to-agent.
