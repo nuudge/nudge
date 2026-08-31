@@ -15,7 +15,7 @@ use crate::transport;
 use crate::tui;
 
 pub const MAX_TOKENS: u32 = 16384;
-pub const MAX_ITERATIONS: usize = 25;
+pub const MAX_ITERATIONS: usize = 50;
 
 // The local user's identity, announced at attach. `$USER` if set, else a neutral
 // default — a `--name` override can come later.

@@ -436,6 +436,7 @@ fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistrati
         who,
         host: None,
         supervised: true,
+        spawner: false,
     }
 }
 
@@ -1286,6 +1287,7 @@ fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> P
                 who,
                 host: None,
                 supervised: true,
+                spawner: false,
             })
         })
     })
@@ -2179,5 +2181,57 @@ async fn second_connected_human_makes_messages_attributed() {
 
     drop(alice);
     host.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A turn that exhausts max_iterations reports up the spawner edge as a UserMessage
+// (the path a MessagePeer takes), so the spawner's model is woken to send 'continue'
+// or re-scope — instead of the child stalling until a human notices.
+#[tokio::test]
+async fn maxed_out_turn_reports_up_the_spawner_edge() {
+    let (session, dir) = mk_session();
+    let provider = ScriptedProvider {
+        // tool_use on every call, so the turn never ends before the budget does.
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("FakeTool", serde_json::json!({})),
+            tool_use_response("FakeTool", serde_json::json!({})),
+        ]),
+        seen_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let mut cfg = mk_cfg();
+    cfg.max_iterations = 2;
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, mut peer_ui) = fake_peer();
+    let mut reg = PeerRegistration::new(peer_ctrl, agent_who("parent-1"));
+    reg.spawner = true;
+    peers.register(reg);
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, _agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        cfg,
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::UserMessage { text }) => {
+            assert!(text.contains("iteration limit (2)"), "{text}");
+        }
+        other => panic!("expected the limit report driven up the spawner edge, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }

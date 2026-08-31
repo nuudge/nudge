@@ -84,7 +84,11 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
                 .await
                 .context("child could not attach back to its spawner")?;
             let mut child_peers = core::peer::PeerSet::default();
-            child_peers.register(core::PeerRegistration::new(parent_ctrl, parent_who.clone()));
+            let mut parent_reg = core::PeerRegistration::new(parent_ctrl, parent_who.clone());
+            // Marks the return edge so the child reports up it when it stalls
+            // (e.g. hits its iteration limit) — waking the spawner's model.
+            parent_reg.spawner = true;
+            child_peers.register(parent_reg);
 
             let child = core::SessionHost::spawn(
                 cfg,
@@ -125,6 +129,7 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
                 // Direction of creation: the spawner steers this peer's check-ins
                 // and may dismiss it. The child's return edge stays unsupervised.
                 supervised: true,
+                spawner: false,
             })
         })
     })

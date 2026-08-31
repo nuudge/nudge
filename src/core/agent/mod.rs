@@ -371,6 +371,23 @@ pub async fn run_agent<P: Provider, B: Backend>(
                 last_good_snapshot = messages.len();
                 session.commit().await?;
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
+                // A subagent's parent is the only party that can send 'continue', and
+                // Notices never reach its model — report up the return edge (the same
+                // path a MessagePeer takes), so the spawner is woken to steer instead
+                // of the child stalling until a human notices.
+                if let Some(spawner) = peers.spawner_id() {
+                    peers
+                        .drive(
+                            spawner,
+                            UiEvent::UserMessage {
+                                text: format!(
+                                    "I've hit my iteration limit ({}) for this turn; my work is paused and partial. Reply 'continue' via MessagePeer to let me resume, or ask me for a status report so you can decide what to do next.",
+                                    cfg.max_iterations
+                                ),
+                            },
+                        )
+                        .await;
+                }
                 emit_session_info_if_changed(
                     &agent_tx,
                     &cfg.model,
