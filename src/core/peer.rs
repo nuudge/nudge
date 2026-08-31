@@ -63,6 +63,10 @@ struct Peer {
     // to its spawner is unsupervised — which is what stops a child answering its
     // parent's gated calls (first-responder-wins would let it beat the human).
     supervised: bool,
+    // The mirror of `supervised`: true = this peer spawned this agent (the return
+    // edge seeded at spawn). The loop reports up this edge when it stalls (e.g.
+    // hitting the iteration limit), so the spawner's model is woken to steer.
+    spawner: bool,
     // Compact activity digest for the NEXT steering check-in (supervised peers
     // only): a capped ring of one-line records, drained when a check-in is composed
     // and folded nowhere else — supervision cost scales with check-ins, not with
@@ -85,6 +89,9 @@ pub struct PeerRegistration {
     // Set only by this agent's own Spawn path (trust-by-wiring — never announced
     // over the handshake, so a peer cannot claim it).
     pub supervised: bool,
+    // Set only when seeding a child's return edge (trust-by-wiring, like
+    // `supervised`): this peer is the agent's spawner.
+    pub spawner: bool,
 }
 
 // The peer capabilities an agent is born with: whether it may spawn subagents (the
@@ -109,6 +116,7 @@ impl PeerRegistration {
             who,
             host: None,
             supervised: false,
+            spawner: false,
         }
     }
 }
@@ -134,6 +142,7 @@ impl PeerSet {
                 controller: reg.controller,
                 _host: reg.host,
                 supervised: reg.supervised,
+                spawner: reg.spawner,
                 recent: VecDeque::new(),
             },
         );
@@ -142,6 +151,14 @@ impl PeerSet {
 
     pub fn is_supervised(&self, id: PeerId) -> bool {
         self.peers.get(&id).is_some_and(|p| p.supervised)
+    }
+
+    // The edge to this agent's spawner, if it has one (a factory-made child).
+    pub fn spawner_id(&self) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|(_, p)| p.spawner)
+            .map(|(id, _)| *id)
     }
 
     // Whether any held peer is supervised — gates the RespondToPeer/DismissPeer
