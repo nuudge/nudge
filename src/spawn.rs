@@ -3,8 +3,7 @@ use anyhow::Context;
 use crate::coding;
 use crate::core::{self, AgentConfig, ClientIdentity, ClientKind};
 use crate::llm;
-use crate::models::DEFAULT_MODEL;
-use crate::run::{MAX_ITERATIONS, MAX_TOKENS};
+use crate::run::MAX_TOKENS;
 
 // Identity a spawned agent announces at attach — the first real use of
 // `ClientKind::Agent`. `session_id`/`task` give a peer legible provenance in the other
@@ -28,10 +27,16 @@ fn agent_identity(
 // the task, and returns the registration — including the child's `SessionHost`, which
 // the spawner's `Peer` then owns as the keep-alive (reaping the peer ends the child).
 // The child gets NO factory of its own, so there is no recursive spawning yet.
-pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFactory {
+pub fn peer_factory(
+    api_key: String,
+    parent_session_id: String,
+    model: String,
+    max_iterations: usize,
+) -> core::PeerFactory {
     Box::new(move |task: String, parent: core::BrokerHandle| {
         let api_key = api_key.clone();
         let parent_session_id = parent_session_id.clone();
+        let model = model.clone();
         Box::pin(async move {
             let session = coding::open_new()?;
             let child_id = session.id.clone();
@@ -56,9 +61,9 @@ pub fn peer_factory(api_key: String, parent_session_id: String) -> core::PeerFac
             let backend = coding::CodingBackend::new(cwd, mcp, skills)
                 .into_subagent(coding::prompt::subagent_role(&parent_who.name));
             let cfg = AgentConfig {
-                model: DEFAULT_MODEL.into(),
+                model,
                 max_tokens: MAX_TOKENS,
-                max_iterations: MAX_ITERATIONS,
+                max_iterations,
                 thinking_display: "omitted".into(),
                 // A subagent's only controller is its spawner (an agent), which renders
                 // no picker; the model catalog is a human-front-end concern.

@@ -40,9 +40,9 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
-    /// Thinking display.
-    #[arg(long, default_value = "summarized", value_name = "mode")]
-    pub thinking: Thinking,
+    /// Thinking display (overrides NUDGE_THINKING; default: summarized).
+    #[arg(long, value_name = "mode")]
+    pub thinking: Option<Thinking>,
 
     /// Print the assembled system prompt + tool schemas and their token cost, then exit.
     #[arg(long)]
