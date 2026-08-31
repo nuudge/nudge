@@ -381,7 +381,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                             spawner,
                             UiEvent::UserMessage {
                                 text: format!(
-                                    "I've hit my iteration limit ({}) for this turn; my work is paused and partial. Reply 'continue' via MessagePeer to let me resume, send refined guidance, or dismiss me if the partial result suffices.",
+                                    "I've hit my iteration limit ({}) for this turn; my work is paused and partial. Reply 'continue' via MessagePeer to let me resume, or ask me for a status report so you can decide what to do next.",
                                     cfg.max_iterations
                                 ),
                             },
