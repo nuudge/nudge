@@ -3,8 +3,12 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::cli::Thinking;
-use crate::models::DEFAULT_MODEL;
 use crate::run::MAX_ITERATIONS;
+
+// The model when NUDGE_MODEL is absent everywhere. Fresh configs set it
+// explicitly (the template ships it uncommented), so this only covers configs
+// that predate the template or had the line removed.
+const FALLBACK_MODEL: &str = "claude-fable-5";
 
 /// Layer the .env files into the process environment. Side-effect only: this
 /// makes the files' contents visible to every later `env::var` read in the
@@ -79,10 +83,17 @@ impl Config {
                 "ANTHROPIC_API_KEY not set (shell env, project .env, or ~/.nudge/config.env)",
             )?,
             relay: env::var("NUDGE_RELAY").ok(),
-            model: nonempty_var("NUDGE_MODEL").unwrap_or_else(|| DEFAULT_MODEL.into()),
+            model: default_model(),
             max_iterations: parse_max_iterations(nonempty_var("NUDGE_MAX_ITERATIONS").as_deref())?,
         })
     }
+}
+
+/// The effective default model: `NUDGE_MODEL` > built-in fallback. A free
+/// function (like [`resolve_thinking`]) so the guest `--connect` path — which
+/// has no API key and thus no `Config` — resolves it identically.
+pub fn default_model() -> String {
+    nonempty_var("NUDGE_MODEL").unwrap_or_else(|| FALLBACK_MODEL.into())
 }
 
 /// The effective thinking display: explicit CLI flag > `NUDGE_THINKING` >
@@ -140,24 +151,25 @@ mod tests {
 
         ensure_global_config(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
-        // The vendored example hardcodes its values; pin them to the code
-        // constants so the two can't drift apart.
-        assert!(
-            written.contains(&format!("# NUDGE_MODEL={DEFAULT_MODEL}")),
+        // The template ships these four as ACTIVE lines (a seamless default
+        // setup); everything else is commented-out documentation. The vendored
+        // example hardcodes its values, so pin them to the code constants —
+        // and to the validated thinking modes — so the two can't drift apart.
+        let active: Vec<&str> = written
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        assert_eq!(
+            active,
+            vec![
+                format!("NUDGE_MODEL={FALLBACK_MODEL}"),
+                format!("NUDGE_THINKING={}", thinking_from(None).unwrap()),
+                format!("NUDGE_MAX_ITERATIONS={MAX_ITERATIONS}"),
+                format!("NUDGE_RELAY={DEFAULT_RELAY}"),
+            ],
             "{written}"
         );
-        assert!(
-            written.contains(&format!("# NUDGE_MAX_ITERATIONS={MAX_ITERATIONS}")),
-            "{written}"
-        );
-        // Everything is commented out (documentation, not behavior) except the
-        // one deliberate template default: the shared relay.
-        for line in written.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            assert_eq!(line, format!("NUDGE_RELAY={DEFAULT_RELAY}"), "{written}");
-        }
 
         std::fs::write(&path, "NUDGE_MODEL=my-model\n").unwrap();
         ensure_global_config(&path).unwrap();

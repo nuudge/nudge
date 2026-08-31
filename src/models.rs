@@ -15,7 +15,6 @@ pub const MODELS: &[(&str, &str)] = &[
     ("Opus 4.6", "claude-opus-4-6"),
     ("Sonnet 4.6", "claude-sonnet-4-6"),
 ];
-pub const DEFAULT_MODEL: &str = "claude-fable-5";
 
 pub fn owned_models(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs

@@ -1,7 +1,6 @@
 use anyhow::{Result, bail};
 
 use crate::cli::Cli;
-use crate::models::DEFAULT_MODEL;
 use crate::run::local_identity;
 use crate::transport;
 use crate::tui;
@@ -16,7 +15,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let ui_cfg = tui::UiConfig {
         session_id: "(connecting…)".into(),
         session_name: None,
-        model: DEFAULT_MODEL.into(),
+        model: crate::config::default_model(),
         thinking_display: crate::config::resolve_thinking(cli.thinking.as_ref())?,
         // A --connect client never hosts a relay, so it shows no pairing QR.
         pairing_qr: None,
