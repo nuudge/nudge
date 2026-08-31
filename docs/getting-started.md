@@ -63,8 +63,8 @@ The installed binary reads `ANTHROPIC_API_KEY` from the environment. There are t
 sources, in increasing precedence:
 
 1. **Global config** at `~/.nudge/config.env` — so you don't set it per project. nudge
-   creates this file on first run as a fully commented-out template; uncomment and fill
-   in the key:
+   writes this file on first run as a working config with sensible defaults; the only
+   thing missing is your API key. Uncomment the `ANTHROPIC_API_KEY` line and fill it in:
 
    ```bash
    nudge            # first run creates ~/.nudge/config.env
@@ -82,16 +82,17 @@ sources, in increasing precedence:
 
 ## Global defaults
 
-Beyond the API key, `~/.nudge/config.env` (or any of the sources above) sets personal
-defaults. Built-in defaults apply when unset:
+The generated `~/.nudge/config.env` starts you on these defaults — edit the file (or
+override per project / per shell via the sources above) to change them; removing a
+line falls back to the built-in default:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `NUDGE_MODEL` | `claude-fable-5` | Model a new session starts on (change live with `/model`) |
 | `NUDGE_THINKING` | `summarized` | Thinking display: `summarized` or `omitted` (the `--thinking` flag overrides) |
 | `NUDGE_MAX_ITERATIONS` | `50` | Model calls allowed per turn before the agent pauses for guidance |
-| `NUDGE_NAME` | `$USER` | Your display name in transcripts |
-| `NUDGE_RELAY` | shared relay (fresh configs) | Relay WebSocket URL for phone handoff and remote peers — see [Remote control & relay](remote-and-relay.md) |
+| `NUDGE_NAME` | `$USER` | Your display name in transcripts (commented out in the generated file) |
+| `NUDGE_RELAY` | shared relay | Relay WebSocket URL for phone handoff and remote peers — see [Remote control & relay](remote-and-relay.md) |
 
 ## Next steps
 
