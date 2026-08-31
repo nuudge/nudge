@@ -87,7 +87,7 @@ defaults. Built-in defaults apply when unset:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NUDGE_MODEL` | `claude-opus-4-8` | Model a new session starts on (change live with `/model`) |
+| `NUDGE_MODEL` | `claude-fable-5` | Model a new session starts on (change live with `/model`) |
 | `NUDGE_THINKING` | `summarized` | Thinking display: `summarized` or `omitted` (the `--thinking` flag overrides) |
 | `NUDGE_MAX_ITERATIONS` | `50` | Model calls allowed per turn before the agent pauses for guidance |
 | `NUDGE_NAME` | `$USER` | Your display name in transcripts |

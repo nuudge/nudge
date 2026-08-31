@@ -43,45 +43,13 @@ fn ensure_global_config(path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(path, global_config_template())?;
+    std::fs::write(path, TEMPLATE)?;
     Ok(())
 }
 
-fn global_config_template() -> String {
-    format!(
-        "\
-# nudge global defaults (env format), created on first run.
-# Precedence: shell env > project .env > this file > built-in defaults.
-# Every entry is optional; uncomment a line to override.
-
-# Required to talk to the API (unless set in your shell or a project .env):
-# ANTHROPIC_API_KEY=sk-ant-...
-
-# Default model id (see the TUI's /model list for the catalog):
-# NUDGE_MODEL={DEFAULT_MODEL}
-
-# Thinking display: summarized | omitted
-# NUDGE_THINKING=summarized
-
-# Model calls allowed per turn before the agent pauses for guidance:
-# NUDGE_MAX_ITERATIONS={MAX_ITERATIONS}
-
-# Your display name in transcripts (defaults to $USER):
-# NUDGE_NAME=
-
-# Relay for phone handoff and remote peers (/background, --daemon). Only ever
-# dialed when you use those features. This default is the maintainer's shared
-# relay: it forwards end-to-end-encrypted frames and cannot read your session,
-# but it does see connection metadata (your IP, timing). Delete the line to
-# disable, or self-host your own (see deploy/README.md in the nudge repo):
-NUDGE_RELAY={DEFAULT_RELAY}
-"
-    )
-}
-
-/// The maintainer's shared relay, written into fresh global configs (a template
-/// default, not a code fallback: deleting the line from config.env disables it).
-pub const DEFAULT_RELAY: &str = "wss://35.244.115.57.sslip.io";
+// The first-run template, vendored at the repo root so it's readable without
+// digging into source. The test below pins its values to the code constants.
+const TEMPLATE: &str = include_str!("../config.env.example");
 
 /// nudge's own configuration, read from the process environment after
 /// [`load_dotenv`] has layered the .env files in. This is the canonical list
@@ -160,6 +128,11 @@ fn nonempty_var(key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // The maintainer's shared relay — a template default, not a code fallback
+    // (deleting the line from config.env disables it), so it lives here purely
+    // to pin the example file.
+    const DEFAULT_RELAY: &str = "wss://35.244.115.57.sslip.io";
+
     #[test]
     fn template_is_created_once_and_never_overwritten() {
         let dir = std::env::temp_dir().join(format!("nudge-config-{}", uuid::Uuid::new_v4()));
@@ -167,8 +140,16 @@ mod tests {
 
         ensure_global_config(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("NUDGE_MODEL"), "{written}");
-        assert!(written.contains("NUDGE_MAX_ITERATIONS"), "{written}");
+        // The vendored example hardcodes its values; pin them to the code
+        // constants so the two can't drift apart.
+        assert!(
+            written.contains(&format!("# NUDGE_MODEL={DEFAULT_MODEL}")),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!("# NUDGE_MAX_ITERATIONS={MAX_ITERATIONS}")),
+            "{written}"
+        );
         // Everything is commented out (documentation, not behavior) except the
         // one deliberate template default: the shared relay.
         for line in written.lines().map(str::trim) {
