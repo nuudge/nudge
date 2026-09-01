@@ -125,9 +125,7 @@ jobs:
 
   # Keep `brew install nuudge/tap/nudge` current: regenerate the tap's formula
   # from the checksums the release job just published and push it to
-  # nuudge/homebrew-tap. The formula is rewritten wholesale — the tap carries
-  # no state worth merging. TAP_PUSH_TOKEN is a fine-grained PAT with
-  # contents:write on the tap repo (GITHUB_TOKEN can't push cross-repo).
+  # nuudge/homebrew-tap.
   homebrew:
     needs: [release]
     runs-on: ubuntu-latest
