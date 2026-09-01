@@ -118,21 +118,25 @@ skills. → [Terminal agent](docs/terminal-agent.md), [MCP servers](docs/mcp.md)
 
 ## Quick start
 
-Requires Rust (edition 2024, via [rustup](https://rustup.rs)) and an Anthropic API key.
+Requires an Anthropic API key.
 
-Install straight from git and run:
+Install with Homebrew (macOS & Linux x86-64) and run:
+
+```bash
+brew install nuudge/tap/nudge
+nudge      # first run creates ~/.nudge/config.env — add your ANTHROPIC_API_KEY there
+```
+
+Or install straight from git (requires Rust, edition 2024, via [rustup](https://rustup.rs)):
 
 ```bash
 cargo install --git https://github.com/nuudge/nudge nudge
-mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
-nudge
 ```
 
 Or build from a clone:
 
 ```bash
 git clone https://github.com/nuudge/nudge.git && cd nudge
-mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
 cargo run
 ```
 

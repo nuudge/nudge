@@ -12,7 +12,7 @@ tokio-tungstenite = "0.24"
 
 [package]
 name = "nudge"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A coding agent for your terminal and on the go, written in Rust from scratch."
 license = "MIT"

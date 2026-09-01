@@ -8,6 +8,18 @@ alone.
 This page covers installing and configuring the agent. For the relay see [Remote control &
 relay](remote-and-relay.md); for the phone client see [Mobile app](mobile-app.md).
 
+## Install with Homebrew (macOS & Linux x86-64)
+
+The quickest route — a prebuilt binary, no Rust toolchain, and no Gatekeeper quarantine
+dance on macOS:
+
+```bash
+brew install nuudge/tap/nudge
+```
+
+Upgrades arrive with `brew upgrade nudge`; every release updates the
+[tap](https://github.com/nuudge/homebrew-tap) automatically.
+
 ## Run from source
 
 Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API
@@ -54,8 +66,9 @@ chmod +x nudge && sudo mv nudge /usr/local/bin/   # or anywhere on your PATH
 Each binary ships a matching `.sha256` on the release if you want to verify the download.
 The binaries are **not code-signed**, so on macOS Gatekeeper blocks the first launch — clear
 the quarantine flag with `xattr -d com.apple.quarantine /usr/local/bin/nudge` (or right-click
-→ Open once). No prebuilt is published for older Linux (glibc < 2.35), Linux on ARM, Intel
-Macs, or Windows — build from source with `cargo install` above.
+→ Open once; Homebrew installs skip this entirely). No prebuilt is published for older Linux
+(glibc < 2.35), Linux on ARM, Intel Macs, or Windows — build from source with `cargo install`
+above.
 
 ## Configure your API key
 
