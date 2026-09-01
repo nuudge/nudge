@@ -8,10 +8,9 @@ alone.
 This page covers installing and configuring the agent. For the relay see [Remote control &
 relay](remote-and-relay.md); for the phone client see [Mobile app](mobile-app.md).
 
-## Install with Homebrew (macOS & Linux x86-64)
+Whichever installation method you choose, you need to [add your Anthropic API key](#configure-your-api-key).
 
-The quickest route — a prebuilt binary, no Rust toolchain, and no Gatekeeper quarantine
-dance on macOS:
+## Install with Homebrew (macOS & Linux x86-64)
 
 ```bash
 brew install nuudge/tap/nudge
@@ -22,12 +21,10 @@ Upgrades arrive with `brew upgrade nudge`; every release updates the
 
 ## Run from source
 
-Requires Rust (edition 2024, install via [rustup](https://rustup.rs)) and an Anthropic API
-key. CI builds on stable Rust.
+Requires Rust (edition 2024, install via [rustup](https://rustup.rs)). CI builds on stable Rust.
 
 ```bash
 git clone https://github.com/nuudge/nudge.git && cd nudge
-mkdir -p ~/.nudge && echo 'ANTHROPIC_API_KEY=sk-ant-...' > ~/.nudge/config.env
 cargo run
 ```
 
@@ -77,12 +74,7 @@ sources, in increasing precedence:
 
 1. **Global config** at `~/.nudge/config.env` — so you don't set it per project. nudge
    writes this file on first run as a working config with sensible defaults; the only
-   thing missing is your API key. Uncomment the `ANTHROPIC_API_KEY` line and fill it in:
-
-   ```bash
-   nudge            # first run creates ~/.nudge/config.env
-   $EDITOR ~/.nudge/config.env
-   ```
+   thing missing is your API key. Uncomment the `ANTHROPIC_API_KEY` line and fill it in.
 
 2. **A `.env` in the current directory** — takes precedence over the global config.
 
