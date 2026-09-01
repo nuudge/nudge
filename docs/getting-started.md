@@ -16,7 +16,12 @@ Whichever installation method you choose, you need to [add your Anthropic API ke
 brew install nuudge/tap/nudge
 ```
 
-Upgrades arrive with `brew upgrade nudge`; every release updates the
+Recent Homebrew versions refuse third-party taps until you trust them — if you see
+"untrusted tap", run `brew trust nuudge/tap` and install again.
+
+Always use the full `nuudge/tap/nudge` name: a bare `brew install nudge` resolves to an
+**unrelated cask** (macadmins' Nudge, a macOS update-enforcement tool). Upgrades arrive
+with `brew upgrade nuudge/tap/nudge`; every release updates the
 [tap](https://github.com/nuudge/homebrew-tap) automatically.
 
 ## Run from source

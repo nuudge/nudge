@@ -123,9 +123,12 @@ Requires an Anthropic API key.
 Install with Homebrew (macOS & Linux x86-64) and run:
 
 ```bash
-brew install nuudge/tap/nudge
+brew install nuudge/tap/nudge      # if brew says "untrusted tap": brew trust nuudge/tap
 nudge      # first run creates ~/.nudge/config.env — add your ANTHROPIC_API_KEY there
 ```
+
+Use the full `nuudge/tap/nudge` name — a bare `brew install nudge` resolves to an
+unrelated cask.
 
 Or install straight from git (requires Rust, edition 2024, via [rustup](https://rustup.rs)):
 
