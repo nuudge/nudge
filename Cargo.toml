@@ -50,3 +50,4 @@ clap = { workspace = true }
 # the unicode terminal QR, so drop them to keep the dependency tree lean.
 qrcode = { version = "0.14", default-features = false }
 base64 = "0.22"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
