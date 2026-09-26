@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
+use crate::core::store::SessionStore;
 use crate::llm::ContentBlock;
 
 pub mod backend;
@@ -106,23 +107,27 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
     out
 }
 
-// Session storage policy: sessions are keyed by working directory under
-// ~/.nudge/projects/<flattened-cwd>/. The core session mechanism is
-// agnostic to this; the cwd-keyed layout is a coding-agent convention (a
-// different agent type could key by something else entirely).
+// Session storage policy: one shared SQLite database at ~/.nudge/nudge.db. The
+// core session/store mechanism is agnostic to this; the single-db-in-home layout
+// is a coding-agent convention (a different agent type could store elsewhere).
+fn db_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    Ok(PathBuf::from(home).join(".nudge").join("nudge.db"))
+}
+
 pub fn open_new() -> Result<Session> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let dir = project_dir(&cwd)?;
-    Session::create(cwd, dir)
+    let store = SessionStore::open(&db_path()?)?;
+    Session::create(cwd, store)
 }
 
 // Resume by either a session uuid or a human name: a name is resolved to its id
-// against this project's index before opening (see `session::resolve_reference`).
+// against this cwd's sessions before opening (see `store::resolve_reference`).
 pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let dir = project_dir(&cwd)?;
-    let id = crate::core::session::resolve_reference(&dir, reference);
-    Session::open(&id, cwd, dir)
+    let store = SessionStore::open(&db_path()?)?;
+    let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
+    Session::open(&id, cwd, store)
 }
 
 // One row for `nudge --list`: a session in the current project, with its name
@@ -140,8 +145,9 @@ pub struct SessionListing {
 // Enumerate the current project's sessions: every `<id>.jsonl` transcript in the
 // cwd-keyed dir, joined with the name index. Returns most-recently-modified first.
 // An empty/missing project dir yields an empty list (no sessions here yet).
+// Still reads the legacy JSONL layout — new sessions live in the store; the
+// listing moves there (with the importer) in the migration's next steps.
 pub fn list_sessions() -> Result<Vec<SessionListing>> {
-    use crate::core::session::read_index;
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let dir = project_dir(&cwd)?;
     let index = read_index(&dir.join("index.json"));
@@ -176,6 +182,22 @@ pub fn list_sessions() -> Result<Vec<SessionListing>> {
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.modified));
     Ok(out)
+}
+
+// One row of the legacy per-project name index (`index.json`), read leniently:
+// a missing/corrupt index just means "no names", never a hard error.
+#[derive(serde::Deserialize)]
+struct IndexEntry {
+    name: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+fn read_index(index_path: &Path) -> std::collections::BTreeMap<String, IndexEntry> {
+    std::fs::read_to_string(index_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 fn project_dir(cwd: &Path) -> Result<PathBuf> {

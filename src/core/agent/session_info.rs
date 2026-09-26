@@ -6,16 +6,19 @@ use crate::core::session::Session;
 
 // Emit SessionInfo only when the (model, branch, name) tuple changed, so headers track
 // the daemon without an identical event flooding the replay buffer each turn. `branch`
-// is read by the caller *before* the await — holding `&Backend` across it would force a
-// `B: Sync` bound on the whole loop.
+// — and the session fields — are read by the caller *before* the await: holding
+// `&Backend` across it would force a `B: Sync` bound on the whole loop, and holding
+// `&Session` would demand `Sync` of the store connection.
 pub(super) async fn emit_session_info_if_changed(
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
     branch: Option<String>,
-    session: &Session,
+    session_id: String,
+    cwd: String,
+    session_name: Option<String>,
     last: &mut (String, Option<String>, Option<String>),
 ) {
-    let current = (model.to_string(), branch, session.name.clone());
+    let current = (model.to_string(), branch, session_name);
     if current == *last {
         return;
     }
@@ -23,9 +26,9 @@ pub(super) async fn emit_session_info_if_changed(
     let _ = tx
         .send(AgentEvent::SessionInfo {
             model: current.0,
-            cwd: session.cwd_display(),
+            cwd,
             git_branch: current.1,
-            session_id: session.id.clone(),
+            session_id,
             session_name: current.2,
         })
         .await;
@@ -49,7 +52,16 @@ pub(super) async fn finalize_rename(
                     text: format!("session renamed to '{name}'"),
                 })
                 .await;
-            emit_session_info_if_changed(tx, &cfg.model, branch, session, last_ctx).await;
+            emit_session_info_if_changed(
+                tx,
+                &cfg.model,
+                branch,
+                session.id.clone(),
+                session.cwd_display(),
+                session.name.clone(),
+                last_ctx,
+            )
+            .await;
         }
         Err(e) => {
             let _ = tx

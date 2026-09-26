@@ -10,6 +10,7 @@ use crate::core::host::Controller;
 use crate::core::identity::{ClientIdentity, ClientKind};
 use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet};
 use crate::core::session::Session;
+use crate::core::store::SessionStore;
 use crate::core::{SessionHandle, SessionHost};
 use crate::llm::{ContentBlock, Message, Provider, Request, Response, SystemBlock, Usage};
 
@@ -162,7 +163,9 @@ fn mk_cfg() -> AgentConfig {
 
 fn mk_session() -> (Session, PathBuf) {
     let dir = std::env::temp_dir().join(format!("nudge-agent-{}", uuid::Uuid::new_v4()));
-    let session = Session::create(dir.clone(), dir.clone()).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = SessionStore::open(&dir.join("nudge.db")).unwrap();
+    let session = Session::create(dir.clone(), store).unwrap();
     (session, dir)
 }
 
@@ -1081,21 +1084,13 @@ async fn peer_message_is_attributed_in_the_transcript() {
 
     // The log stores the other half of the invariant: clean text + the sender,
     // so resume can re-derive exactly the attributed form the provider saw.
-    let jsonl = std::fs::read_dir(&dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .expect("session log written");
-    let first = std::fs::read_to_string(&jsonl)
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .to_string();
-    let envelope: Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(envelope["message"]["content"][0]["text"], "task done");
-    assert_eq!(envelope["sender"]["name"], "child-1");
+    let rows = logged_rows(&dir);
+    let first: Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert_eq!(first["content"][0]["text"], "task done");
+    assert_eq!(
+        rows[0].sender.as_ref().expect("sender persisted").name,
+        "child-1"
+    );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
@@ -1545,31 +1540,29 @@ fn resume_messages_applies_attribution_from_persisted_sender() {
     }
 }
 
-// Locate the session's JSONL and return each entry's message role, in order. An
-// absent file (nothing ever committed) reads as empty.
+// Each committed entry's message role, in order. An empty transcript (nothing
+// ever committed) reads as empty.
 fn logged_roles(dir: &std::path::Path) -> Vec<String> {
     logged_lines(dir)
         .iter()
-        .map(|line| {
-            let env: Value = serde_json::from_str(line).unwrap();
-            env["message"]["role"].as_str().unwrap().to_string()
+        .map(|content| {
+            let msg: Value = serde_json::from_str(content).unwrap();
+            msg["role"].as_str().unwrap().to_string()
         })
         .collect()
 }
 
-// The raw non-empty JSONL lines for the session, or empty if the file is absent.
+// The committed transcript of the test's (single) session, as the stored message
+// JSON strings, read back through a fresh store connection on the temp database.
 fn logged_lines(dir: &std::path::Path) -> Vec<String> {
-    let path = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"));
-    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(raw) => raw
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(String::from)
-            .collect(),
+    logged_rows(dir).into_iter().map(|r| r.content).collect()
+}
+
+fn logged_rows(dir: &std::path::Path) -> Vec<crate::core::store::MessageRow> {
+    let store = SessionStore::open(&dir.join("nudge.db")).unwrap();
+    let listings = store.list_by_cwd(&dir.display().to_string()).unwrap();
+    match listings.first() {
+        Some(l) => store.load_transcript(&l.row.id).unwrap(),
         None => Vec::new(),
     }
 }
@@ -1652,7 +1645,12 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
     );
 
     // A resume rebuilds the same clean, alternating transcript.
-    let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+    let resumed = Session::open(
+        &id,
+        dir.clone(),
+        SessionStore::open(&dir.join("nudge.db")).unwrap(),
+    )
+    .unwrap();
     let msgs = super::resume_messages(&resumed.entries);
     let roles: Vec<&str> = msgs.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
