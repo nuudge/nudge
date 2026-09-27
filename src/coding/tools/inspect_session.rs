@@ -368,12 +368,19 @@ fn search(
     Ok(out)
 }
 
-// A one-line window of the stored content centered on the (case-insensitive)
-// match when it's findable, else the content's prefix. Operates on the
-// unescaped text: stored content is message JSON, so tool_use/tool_result
-// hits would otherwise render raw \n and \" escapes.
+// A one-line window of the entry's text centered on the (case-insensitive)
+// match when it's findable, else the text's prefix. The stored content is the
+// serialized message JSON; windowing that raw string leaked envelope syntax
+// ("role":…, tool_use ids) into snippets whenever the match landed near
+// structure — so extract the blocks' display text first, mirroring
+// `render_entry`'s conventions. A row that doesn't parse as a typed message
+// falls back to the raw string, unescaped for display. A match that lived only
+// in JSON structure (not in any block's text) lands in the prefix fallback.
 fn snippet(content: &str, query: &str) -> String {
-    let flat = one_line(&unescape_json(content));
+    let flat = match serde_json::from_str::<Message>(content) {
+        Ok(msg) => one_line(&flat_text(&msg)),
+        Err(_) => one_line(&unescape_json(content)),
+    };
     let lowered = flat.to_lowercase();
     match lowered.find(&query.to_lowercase()) {
         Some(byte_pos) => {
@@ -394,6 +401,31 @@ fn snippet(content: &str, query: &str) -> String {
         }
         None => truncate(&flat, SNIPPET_CHARS),
     }
+}
+
+// The blocks' display text in reading order, tagged like `render_entry` so tool
+// activity stays recognizable inside a snippet.
+fn flat_text(msg: &Message) -> String {
+    msg.content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                format!("(thinking) {thinking}")
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                "(thinking)".into()
+            }
+            ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}: {input}"),
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                let tag = if *is_error { " (error)" } else { "" };
+                format!("tool_result{tag}: {content}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -855,5 +887,21 @@ mod tests {
         let content = format!("{} NEEDLE after the dotted capital", "İ".repeat(40));
         let out = snippet(&content, "needle");
         assert!(out.contains("NEEDLE"), "{out}");
+    }
+
+    // A hit inside a tool_use renders as the block's display text, not a window
+    // into the serialized envelope (no "role":/id leakage).
+    #[test]
+    fn snippet_renders_parsed_blocks_not_envelope_json() {
+        let content = r#"{"role":"assistant","content":[{"type":"text","text":"running the suite"},{"type":"tool_use","id":"toolu_01AbCdEf","name":"Bash","input":{"command":"cargo test store::"}}]}"#;
+        let out = snippet(content, "cargo test");
+        assert!(out.contains("tool_use Bash:"), "{out}");
+        assert!(out.contains("cargo test store::"), "{out}");
+        assert!(!out.contains("toolu_01AbCdEf"), "{out}");
+        assert!(!out.contains(r#""role""#), "{out}");
+
+        // A match found only in JSON structure falls back to the text's prefix.
+        let structural = snippet(content, "toolu_01AbCdEf");
+        assert!(structural.starts_with("running the suite"), "{structural}");
     }
 }
