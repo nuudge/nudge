@@ -12,8 +12,8 @@ pub fn print_sessions() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<28}  {:<36}  {:<16}  {:>8}  LAST USED",
-        "NAME", "ID", "BRANCH", "TURNS"
+        "{:<28}  {:<36}  {:<16}  {:<7}  {:>8}  LAST USED",
+        "NAME", "ID", "BRANCH", "STATE", "TURNS"
     );
     for s in &sessions {
         let when = s
@@ -21,10 +21,11 @@ pub fn print_sessions() -> Result<()> {
             .with_timezone(&chrono::Local)
             .format("%Y-%m-%d %H:%M");
         println!(
-            "{:<28}  {:<36}  {:<16}  {:>8}  {}",
+            "{:<28}  {:<36}  {:<16}  {:<7}  {:>8}  {}",
             s.name.as_deref().unwrap_or("(unnamed)"),
             s.id,
             s.branch.as_deref().unwrap_or("-"),
+            s.state.as_str(),
             s.turns,
             when,
         );

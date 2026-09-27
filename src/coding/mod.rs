@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
-use crate::core::store::SessionStore;
+use crate::core::store::{SessionState, SessionStore};
 use crate::llm::ContentBlock;
 
 pub mod backend;
@@ -135,6 +135,14 @@ pub fn open_new() -> Result<Session> {
     Session::create(cwd, store)
 }
 
+// A spawned child's session: same storage policy, plus the provenance edge
+// (spawned_by = the parent's session id, spawn_task = what it was asked to do).
+pub fn open_new_spawned(spawned_by: &str, spawn_task: &str) -> Result<Session> {
+    let cwd = std::env::current_dir().context("could not determine cwd")?;
+    let store = open_store()?;
+    Session::create_spawned(cwd, store, spawned_by, spawn_task)
+}
+
 // Resume by either a session uuid or a human name: a name is resolved to its id
 // against this cwd's sessions before opening (see `store::resolve_reference`).
 pub fn open_resume(reference: &str) -> Result<Resumed> {
@@ -148,11 +156,13 @@ pub fn open_resume(reference: &str) -> Result<Resumed> {
 // it's been renamed. `last_activity` (the store row's commit-touched timestamp)
 // sorts most-recent-first so the list reads like a recency-ordered history.
 // `turns` is the live (non-superseded) message count, a proxy for how much
-// history the session holds.
+// history the session holds. `state` is honest-best-effort: 'ended' is written
+// on graceful teardown, so a crashed session still reads 'running'.
 pub struct SessionListing {
     pub id: String,
     pub name: Option<String>,
     pub branch: Option<String>,
+    pub state: SessionState,
     pub last_activity: chrono::DateTime<chrono::Utc>,
     pub turns: i64,
 }
@@ -173,6 +183,7 @@ pub fn list_sessions() -> Result<Vec<SessionListing>> {
                 id: l.row.id,
                 name: l.row.name,
                 branch: l.row.branch,
+                state: l.row.state,
                 last_activity,
                 turns: l.turns,
             })

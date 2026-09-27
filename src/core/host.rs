@@ -228,6 +228,14 @@ impl SessionHost {
         let _ = self.broker_task.await;
         loop_result
     }
+
+    // Fire-and-forget quit for drop-path teardown (a dismissed child's `Peer`):
+    // dropping a `SessionHost` only detaches its JoinHandles, and the loop holds
+    // its own broker handle, so without this nudge a dismissed child would idle
+    // forever instead of winding down. Idempotent like `shutdown`.
+    pub(crate) fn request_quit(&self) {
+        let _ = self.ctl_tx.send(HostCommand::Quit);
+    }
     // Attach with an explicit profile, assigned by whoever knows the provenance of the
     // edge (e.g. `spawn.rs` gives a spawned child's supervisor edge a supervisor
     // profile). `SessionHandle::attach` is the identity-only door that derives an

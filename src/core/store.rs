@@ -37,7 +37,7 @@ pub enum SessionState {
 }
 
 impl SessionState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             SessionState::Running => "running",
             SessionState::Ended => "ended",
@@ -297,8 +297,6 @@ impl SessionStore {
         Ok(())
     }
 
-    // Unused until host shutdown records the session lifecycle.
-    #[allow(dead_code)]
     pub fn set_state(&self, id: &str, state: SessionState) -> Result<()> {
         self.conn
             .execute(

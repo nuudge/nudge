@@ -10,7 +10,7 @@ use crate::core::host::Controller;
 use crate::core::identity::{ClientIdentity, ClientKind};
 use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet};
 use crate::core::session::Session;
-use crate::core::store::SessionStore;
+use crate::core::store::{SessionState, SessionStore};
 use crate::core::{SessionHandle, SessionHost};
 use crate::llm::{ContentBlock, Message, Provider, Request, Response, SystemBlock, Usage};
 
@@ -861,6 +861,142 @@ async fn dismiss_peer_ends_the_supervised_child() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// The lifecycle contract at the loop level: the row is 'running' while the loop
+// lives, 'ended' after a graceful teardown (Quit), and 'running' again once a
+// resume re-opens it. A crash writes nothing — untestable here and honest by design.
+#[tokio::test]
+async fn session_state_ends_on_teardown_and_runs_again_on_open() {
+    let (session, dir) = mk_session();
+    let id = session.id.clone();
+    let state = |dir: &std::path::Path| {
+        SessionStore::open(&dir.join("nudge.db"))
+            .unwrap()
+            .session(&id)
+            .unwrap()
+            .unwrap()
+            .state
+    };
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, _agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    assert_eq!(state(&dir), SessionState::Running);
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert_eq!(state(&dir), SessionState::Ended);
+
+    let resumed = Session::open(
+        &id,
+        dir.clone(),
+        SessionStore::open(&dir.join("nudge.db")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state(&dir), SessionState::Running);
+    drop(resumed);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Dismissal ends the child for real: dropping the parent's Peer sends the child's
+// host a Quit, its loop winds down, and its session row reads 'ended'.
+#[tokio::test]
+async fn dismissed_child_session_row_reads_ended() {
+    let (parent_session, parent_dir) = mk_session();
+    let (child_session, child_dir) = mk_session();
+    let child_id = child_session.id.clone();
+    let child_host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        child_session,
+        Vec::new(),
+        Vec::new(),
+        crate::core::PeerWiring::default(),
+    );
+    let child_ctrl = child_host
+        .attach(agent_who("parent"))
+        .await
+        .expect("attach to child");
+
+    let mut peers = PeerSet::default();
+    peers.register(PeerRegistration {
+        controller: child_ctrl,
+        who: agent_who("child-1"),
+        host: Some(child_host),
+        supervised: true,
+        spawner: false,
+    });
+
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: Default::default(),
+        seen_tools: Default::default(),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        parent_session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "dismiss the child".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    // The child's loop processes its Quit asynchronously; poll briefly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state = SessionStore::open(&child_dir.join("nudge.db"))
+            .unwrap()
+            .session(&child_id)
+            .unwrap()
+            .unwrap()
+            .state;
+        if state == SessionState::Ended {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dismissed child's row never read 'ended'"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&parent_dir).ok();
+    std::fs::remove_dir_all(&child_dir).ok();
 }
 
 // Dismissal is supervised-only: the return edge to your own spawner is refused.

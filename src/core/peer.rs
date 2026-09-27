@@ -74,6 +74,18 @@ struct Peer {
     recent: VecDeque<String>,
 }
 
+// Dropping a held child (dismissal, reap, or this agent itself ending) must
+// actually end it: the child's loop holds its own broker handle, so only an
+// explicit Quit reaches it — this is what makes "dropping the Peer ends the
+// child" true, letting the child's loop wind down and mark its row 'ended'.
+impl Drop for Peer {
+    fn drop(&mut self) {
+        if let Some(host) = &self._host {
+            host.request_quit();
+        }
+    }
+}
+
 // The most a steering check-in may carry from the activity ring: these caps are the
 // context-frugality contract (see supervision_plan.md decision 2).
 const RECENT_LINES_CAP: usize = 10;

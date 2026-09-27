@@ -28,10 +28,27 @@ use session_info::{emit_session_info_if_changed, finalize_rename};
 use supervision::{attribute_message, recv_registration, supervise_peer_event};
 
 pub async fn run_agent<P: Provider, B: Backend>(
+    cfg: AgentConfig,
+    provider: P,
+    backend: B,
+    mut session: Session,
+    initial_messages: Vec<Message>,
+    io: AgentIo,
+) -> Result<()> {
+    let result = run_loop(cfg, provider, backend, &mut session, initial_messages, io).await;
+    // The single graceful-teardown seam: every way the loop winds down — quit,
+    // input channels closing, a loop error — funnels through this return. Only a
+    // process crash skips it, honestly leaving the row 'running' (last_activity
+    // is the staleness signal then).
+    let ended = session.end();
+    result.and(ended)
+}
+
+async fn run_loop<P: Provider, B: Backend>(
     mut cfg: AgentConfig,
     provider: P,
     mut backend: B,
-    mut session: Session,
+    session: &mut Session,
     initial_messages: Vec<Message>,
     io: AgentIo,
 ) -> Result<()> {
@@ -104,7 +121,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                                 &cfg,
                                 &provider,
                                 &backend,
-                                &mut session,
+                                session,
                                 &mut messages,
                                 &mut last_good_snapshot,
                                 &mut peers,
@@ -132,7 +149,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                         &mut cfg,
                         &provider,
                         &mut backend,
-                        &mut session,
+                        session,
                         &messages,
                         &peers,
                         &agent_tx,
@@ -321,7 +338,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                                 &mut cfg,
                                 &provider,
                                 &mut backend,
-                                &mut session,
+                                session,
                                 &messages,
                                 &peers,
                                 &agent_tx,

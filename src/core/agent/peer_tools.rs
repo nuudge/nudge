@@ -248,8 +248,9 @@ pub(super) async fn execute(
         // A RespondToPeer outside a steering turn has nothing to answer — the forced
         // call during steering is handled by `steering::run_steering_turn`, never here.
         RESPOND_TO_PEER => bail!("no pending peer check-in to respond to"),
-        // Dropping the Peer drops its owned SessionHost: the child's broker forwards
-        // a final Quit and the child ends cleanly; its JSONL persists on disk.
+        // Dropping the Peer sends its owned SessionHost a final Quit: the child's
+        // loop winds down cleanly and marks its session row ended; the transcript
+        // persists in the store.
         DISMISS_PEER => {
             let Some(peer) = input.get("peer").and_then(Value::as_str) else {
                 bail!("DismissPeer requires a 'peer' string");
