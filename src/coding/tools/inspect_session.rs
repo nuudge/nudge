@@ -23,6 +23,8 @@ struct Input {
     #[serde(default)]
     last_n: Option<i64>,
     #[serde(default)]
+    around_ordinal: Option<i64>,
+    #[serde(default)]
     include_superseded: bool,
     #[serde(default)]
     all_projects: bool,
@@ -35,7 +37,7 @@ struct Input {
 pub fn schema() -> Value {
     json!({
         "name": "InspectSession",
-        "description": "Read past agent sessions from the session store (read-only). Three modes:\n- `inspect`: one session's metadata (state, spawn provenance, timestamps) and its last N transcript entries, compactly rendered. `include_superseded` adds the audit view: entries dropped by resume truncation, flagged.\n- `list`: sessions for the current project (or `all_projects`) — id, name, state, turns, last activity, spawn edges.\n- `search`: naive substring search over stored message content, capped snippets.\n\nWhen to use: answering \"what did session X actually do?\" for an ENDED, dismissed, or crashed session; finding an old session; recovering context from history. For a LIVE peer you hold a connection to, prefer MessagePeer — the peer compresses with its own reasoning, while a raw transcript is the expensive channel. State honesty: 'running' can also mean the process crashed (nothing marks a crash) — judge liveness by last_activity.",
+        "description": "Read past agent sessions from the session store (read-only). Three modes:\n- `inspect`: one session's metadata (state, spawn provenance, timestamps) and a compact transcript view — the last N entries by default, or a window centered on `around_ordinal` (e.g. an ordinal from a search hit). `include_superseded` adds the audit view: entries dropped by resume truncation, flagged.\n- `list`: sessions for the current project (or `all_projects`) — id, name, state, turns, last activity, spawn edges.\n- `search`: naive substring search over stored message content; each hit carries session, ordinal, timestamp, and a capped snippet. Scope to one session with `session`.\nlist/search disclose truncation with a leading \"showing N of M\" line when the limit cut results.\n\nWhen to use: answering \"what did session X actually do?\" for an ENDED, dismissed, or crashed session; finding an old session; recovering context from history. For a LIVE peer you hold a connection to, prefer MessagePeer — the peer compresses with its own reasoning, while a raw transcript is the expensive channel. State honesty: 'running' can also mean the process crashed (nothing marks a crash) — judge liveness by last_activity.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -46,11 +48,15 @@ pub fn schema() -> Value {
                 },
                 "session": {
                     "type": "string",
-                    "description": "inspect mode: session id, or a session name (resolved within the current project)."
+                    "description": "inspect mode (required) or search mode (optional): session id, or a session name (resolved within the current project). In search mode, scopes the search to that one session."
                 },
                 "last_n": {
                     "type": "integer",
-                    "description": "inspect mode: how many trailing transcript entries to show. Default 10, max 50."
+                    "description": "inspect mode: how many transcript entries to show — the trailing N, or the window size around `around_ordinal`. Default 10, max 50."
+                },
+                "around_ordinal": {
+                    "type": "integer",
+                    "description": "inspect mode: center the transcript view on this ordinal (as reported by search hits and entry headers) instead of the tail. Window size is `last_n`."
                 },
                 "include_superseded": {
                     "type": "boolean",
@@ -84,7 +90,13 @@ pub fn summarize(input: &Value) -> String {
                 "list sessions".into()
             }
         }
-        "search" => format!("search /{}/", input["query"].as_str().unwrap_or("?")),
+        "search" => {
+            let query = input["query"].as_str().unwrap_or("?");
+            match input["session"].as_str() {
+                Some(session) => format!("search /{query}/ in {session}"),
+                None => format!("search /{query}/"),
+            }
+        }
         other => format!("{other}?"),
     }
 }
@@ -109,7 +121,14 @@ pub(crate) fn run(input: &Value, store: &SessionStore, cwd: &str) -> Result<Stri
                 bail!("InspectSession: inspect mode requires a `session` (id or name)");
             };
             let last_n = input.last_n.unwrap_or(DEFAULT_LAST_N).clamp(1, MAX_LAST_N);
-            inspect(store, cwd, reference, last_n, input.include_superseded)
+            inspect(
+                store,
+                cwd,
+                reference,
+                last_n,
+                input.around_ordinal,
+                input.include_superseded,
+            )
         }
         "list" => {
             let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -120,7 +139,14 @@ pub(crate) fn run(input: &Value, store: &SessionStore, cwd: &str) -> Result<Stri
                 bail!("InspectSession: search mode requires a `query` string");
             };
             let limit = input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-            search(store, cwd, query, input.all_projects, limit)
+            search(
+                store,
+                cwd,
+                query,
+                input.session.as_deref(),
+                input.all_projects,
+                limit,
+            )
         }
         other => bail!("InspectSession: unknown mode {other:?}; expected inspect | list | search"),
     }
@@ -131,6 +157,7 @@ fn inspect(
     cwd: &str,
     reference: &str,
     last_n: i64,
+    around_ordinal: Option<i64>,
     include_superseded: bool,
 ) -> Result<String> {
     let id = store.resolve_reference(cwd, reference)?;
@@ -160,17 +187,26 @@ fn inspect(
     }
     out.push_str(&format!("live turns: {turns}\n"));
 
-    let tail = store.transcript_tail(&id, last_n, include_superseded)?;
-    if tail.is_empty() {
-        out.push_str("\n(no transcript entries)\n");
+    let entries = match around_ordinal {
+        Some(center) => store.transcript_around(&id, center, last_n, include_superseded)?,
+        None => store.transcript_tail(&id, last_n, include_superseded)?,
+    };
+    if entries.is_empty() {
+        match around_ordinal {
+            Some(center) => out.push_str(&format!("\n(no entries around ordinal {center})\n")),
+            None => out.push_str("\n(no transcript entries)\n"),
+        }
         return Ok(out);
     }
-    out.push_str(&format!(
-        "\nlast {} entr{}:\n",
-        tail.len(),
-        plural_ies(tail.len())
-    ));
-    for entry in &tail {
+    match around_ordinal {
+        Some(center) => out.push_str(&format!("\nentries around ordinal {center}:\n")),
+        None => out.push_str(&format!(
+            "\nlast {} entr{}:\n",
+            entries.len(),
+            plural_ies(entries.len())
+        )),
+    }
+    for entry in &entries {
         out.push_str(&render_entry(entry));
     }
     Ok(out)
@@ -230,12 +266,13 @@ fn render_entry(entry: &InspectRow) -> String {
 }
 
 fn list(store: &SessionStore, cwd: &str, all_projects: bool, limit: i64) -> Result<String> {
-    let listings = if all_projects {
-        store.list_all(limit)?
+    let (listings, total) = if all_projects {
+        (store.list_all(limit)?, store.session_count()?)
     } else {
         let mut rows = store.list_by_cwd(cwd)?;
+        let total = rows.len() as i64;
         rows.truncate(limit as usize);
-        rows
+        (rows, total)
     };
     if listings.is_empty() {
         return Ok(if all_projects {
@@ -245,6 +282,13 @@ fn list(store: &SessionStore, cwd: &str, all_projects: bool, limit: i64) -> Resu
         });
     }
     let mut out = String::new();
+    if total > listings.len() as i64 {
+        out.push_str(&format!(
+            "showing {} of {} sessions\n",
+            listings.len(),
+            total
+        ));
+    }
     for l in &listings {
         out.push_str(&render_listing(l, all_projects));
     }
@@ -274,15 +318,35 @@ fn search(
     store: &SessionStore,
     cwd: &str,
     query: &str,
+    session: Option<&str>,
     all_projects: bool,
     limit: i64,
 ) -> Result<String> {
-    let scope = if all_projects { None } else { Some(cwd) };
-    let hits = store.search_messages(query, scope, limit)?;
+    let session_id = match session {
+        Some(reference) => {
+            let id = store.resolve_reference(cwd, reference)?;
+            if store.session(&id)?.is_none() {
+                bail!("no session {reference:?} in the store (by id or name in this project)");
+            }
+            Some(id)
+        }
+        None => None,
+    };
+    // A session filter fully pins the scope; the cwd filter applies otherwise.
+    let scope = if all_projects || session_id.is_some() {
+        None
+    } else {
+        Some(cwd)
+    };
+    let hits = store.search_messages(query, scope, session_id.as_deref(), limit)?;
     if hits.is_empty() {
         return Ok("(no matches)".into());
     }
     let mut out = String::new();
+    let total = store.search_message_count(query, scope, session_id.as_deref())?;
+    if total > hits.len() as i64 {
+        out.push_str(&format!("showing {} of {} hits\n", hits.len(), total));
+    }
     for h in &hits {
         let who = h.sender_name.as_deref().unwrap_or(&h.role);
         let scope_note = if all_projects {
@@ -291,10 +355,11 @@ fn search(
             String::new()
         };
         out.push_str(&format!(
-            "{} ({}) [{}] {}: {}{}\n",
+            "{} ({}) [{}] {}  {}: {}{}\n",
             h.session_id,
             h.session_name.as_deref().unwrap_or("unnamed"),
             h.ordinal,
+            h.timestamp,
             who,
             snippet(&h.content, query),
             scope_note
@@ -303,14 +368,27 @@ fn search(
     Ok(out)
 }
 
-// A one-line window of the stored content centered on the (case-insensitive)
-// match when it's findable, else the content's prefix.
+// A one-line window of the entry's text centered on the (case-insensitive)
+// match when it's findable, else the text's prefix. The stored content is the
+// serialized message JSON; windowing that raw string leaked envelope syntax
+// ("role":…, tool_use ids) into snippets whenever the match landed near
+// structure — so extract the blocks' display text first, mirroring
+// `render_entry`'s conventions. A row that doesn't parse as a typed message
+// falls back to the raw string. A match that lived only
+// in JSON structure (not in any block's text) lands in the prefix fallback.
 fn snippet(content: &str, query: &str) -> String {
-    let flat = one_line(content);
-    let pos = flat.to_lowercase().find(&query.to_lowercase());
-    match pos {
+    let flat = match serde_json::from_str::<Message>(content) {
+        Ok(msg) => one_line(&flat_text(&msg)),
+        Err(_) => one_line(content),
+    };
+    let lowered = flat.to_lowercase();
+    match lowered.find(&query.to_lowercase()) {
         Some(byte_pos) => {
-            let chars_before = flat[..byte_pos].chars().count();
+            // Count the prefix on `lowered`, where byte_pos is guaranteed a char
+            // boundary — lowercasing can change byte lengths (İ → i̇), so the
+            // offset must never index `flat` directly. The count may drift a
+            // char or two on such input; the window is fuzzy anyway.
+            let chars_before = lowered[..byte_pos].chars().count();
             let start = chars_before.saturating_sub(SNIPPET_CHARS / 2);
             let windowed: String = flat.chars().skip(start).take(SNIPPET_CHARS).collect();
             let prefix = if start > 0 { "…" } else { "" };
@@ -323,6 +401,31 @@ fn snippet(content: &str, query: &str) -> String {
         }
         None => truncate(&flat, SNIPPET_CHARS),
     }
+}
+
+// The blocks' display text in reading order, tagged like `render_entry` so tool
+// activity stays recognizable inside a snippet.
+fn flat_text(msg: &Message) -> String {
+    msg.content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                format!("(thinking) {thinking}")
+            }
+            ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                "(thinking)".into()
+            }
+            ContentBlock::ToolUse { name, input, .. } => format!("tool_use {name}: {input}"),
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                let tag = if *is_error { " (error)" } else { "" };
+                format!("tool_result{tag}: {content}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -519,7 +622,10 @@ mod tests {
         );
 
         let capped = run(&json!({"mode": "list", "limit": 1}), &s, "/proj").unwrap();
-        assert_eq!(capped.lines().count(), 1, "{capped}");
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+        assert!(capped.starts_with("showing 1 of 2 sessions\n"), "{capped}");
+        // An uncut list carries no disclosure line.
+        assert!(!scoped.contains("showing"), "{scoped}");
     }
 
     #[test]
@@ -591,5 +697,184 @@ mod tests {
         assert!(run(&json!({"mode": "nope"}), &s, "/proj").is_err());
         assert!(run(&json!({"mode": "inspect"}), &s, "/proj").is_err());
         assert!(run(&json!({"mode": "search"}), &s, "/proj").is_err());
+    }
+
+    #[test]
+    fn search_scopes_to_one_session_by_name_and_rejects_unknown() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        s.set_name("a", "alpha", None).unwrap();
+        s.insert_session("b", "/proj", None, None).unwrap();
+        s.append_message("a", "user", &text_content("user", "NEEDLE in a"), None)
+            .unwrap();
+        s.append_message("b", "user", &text_content("user", "NEEDLE in b"), None)
+            .unwrap();
+
+        let scoped = run(
+            &json!({"mode": "search", "query": "NEEDLE", "session": "alpha"}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(scoped.contains("NEEDLE in a"), "{scoped}");
+        assert!(!scoped.contains("NEEDLE in b"), "{scoped}");
+
+        // A session filter reaches by id even across projects.
+        s.insert_session("c", "/other", None, None).unwrap();
+        s.append_message("c", "user", &text_content("user", "NEEDLE in c"), None)
+            .unwrap();
+        let by_id = run(
+            &json!({"mode": "search", "query": "NEEDLE", "session": "c"}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(by_id.contains("NEEDLE in c"), "{by_id}");
+        assert!(!by_id.contains("NEEDLE in a"), "{by_id}");
+
+        let err = run(
+            &json!({"mode": "search", "query": "NEEDLE", "session": "ghost"}),
+            &s,
+            "/proj",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no session"), "{err}");
+    }
+
+    #[test]
+    fn search_hits_carry_the_entry_timestamp() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        s.append_message("a", "user", &text_content("user", "NEEDLE"), None)
+            .unwrap();
+        let stored_ts = s.transcript_tail("a", 1, false).unwrap()[0]
+            .row
+            .timestamp
+            .clone();
+
+        let out = run(&json!({"mode": "search", "query": "NEEDLE"}), &s, "/proj").unwrap();
+        assert!(out.contains(&stored_ts), "{out}");
+    }
+
+    #[test]
+    fn around_ordinal_windows_the_middle_and_handles_out_of_range() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        for i in 0..30 {
+            s.append_message("a", "user", &text_content("user", &format!("msg{i}")), None)
+                .unwrap();
+        }
+
+        let out = run(
+            &json!({"mode": "inspect", "session": "a", "around_ordinal": 15, "last_n": 5}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(out.contains("entries around ordinal 15:"), "{out}");
+        // Window is [13, 17]: start = 15 - 5/2, five entries.
+        for i in 13..=17 {
+            assert!(out.contains(&format!("msg{i}\n")), "{out}");
+        }
+        assert!(
+            !out.contains("msg12\n") && !out.contains("msg18\n"),
+            "{out}"
+        );
+
+        let past_end = run(
+            &json!({"mode": "inspect", "session": "a", "around_ordinal": 500}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(
+            past_end.contains("(no entries around ordinal 500)"),
+            "{past_end}"
+        );
+
+        // A window anchored before the start clamps to the transcript head.
+        let at_start = run(
+            &json!({"mode": "inspect", "session": "a", "around_ordinal": 0, "last_n": 4}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(
+            at_start.contains("msg0\n") && at_start.contains("msg3\n"),
+            "{at_start}"
+        );
+        assert!(!at_start.contains("msg4\n"), "{at_start}");
+    }
+
+    #[test]
+    fn search_snippet_shows_block_text_free_of_json_escapes() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        // Stored content is message JSON: the text's newline and quotes are
+        // escaped on disk (\n, \") and must not render that way in the snippet.
+        s.append_message(
+            "a",
+            "user",
+            &text_content("user", "line1\nline2 \"quoted\""),
+            None,
+        )
+        .unwrap();
+
+        let out = run(&json!({"mode": "search", "query": "line2"}), &s, "/proj").unwrap();
+        assert!(out.contains("line1 line2 \"quoted\""), "{out}");
+        assert!(!out.contains("\\n") && !out.contains("\\\""), "{out}");
+    }
+
+    #[test]
+    fn search_disclosure_line_appears_only_when_hits_were_cut() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        for i in 0..3 {
+            s.append_message(
+                "a",
+                "user",
+                &text_content("user", &format!("NEEDLE {i}")),
+                None,
+            )
+            .unwrap();
+        }
+
+        let cut = run(
+            &json!({"mode": "search", "query": "NEEDLE", "limit": 2}),
+            &s,
+            "/proj",
+        )
+        .unwrap();
+        assert!(cut.starts_with("showing 2 of 3 hits\n"), "{cut}");
+        assert_eq!(cut.lines().count(), 3, "{cut}");
+
+        let full = run(&json!({"mode": "search", "query": "NEEDLE"}), &s, "/proj").unwrap();
+        assert!(!full.contains("showing"), "{full}");
+    }
+
+    // Lowercasing can grow byte lengths (İ U+0130 → i + U+0307), so the match
+    // offset from the lowered string must never index the original — this input
+    // panicked on a mid-char slice before the fix.
+    #[test]
+    fn snippet_survives_case_folding_that_changes_byte_length() {
+        let content = format!("{} NEEDLE after the dotted capital", "İ".repeat(40));
+        let out = snippet(&content, "needle");
+        assert!(out.contains("NEEDLE"), "{out}");
+    }
+
+    // A hit inside a tool_use renders as the block's display text, not a window
+    // into the serialized envelope (no "role":/id leakage).
+    #[test]
+    fn snippet_renders_parsed_blocks_not_envelope_json() {
+        let content = r#"{"role":"assistant","content":[{"type":"text","text":"running the suite"},{"type":"tool_use","id":"toolu_01AbCdEf","name":"Bash","input":{"command":"cargo test store::"}}]}"#;
+        let out = snippet(content, "cargo test");
+        assert!(out.contains("tool_use Bash:"), "{out}");
+        assert!(out.contains("cargo test store::"), "{out}");
+        assert!(!out.contains("toolu_01AbCdEf"), "{out}");
+        assert!(!out.contains(r#""role""#), "{out}");
+
+        // A match found only in JSON structure falls back to the text's prefix.
+        let structural = snippet(content, "toolu_01AbCdEf");
+        assert!(structural.starts_with("running the suite"), "{structural}");
     }
 }

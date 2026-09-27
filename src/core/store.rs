@@ -93,6 +93,7 @@ pub struct SearchHit {
     pub session_name: Option<String>,
     pub cwd: String,
     pub ordinal: i64,
+    pub timestamp: String,
     pub role: String,
     pub sender_name: Option<String>,
     pub content: String,
@@ -432,6 +433,43 @@ impl SessionStore {
         Ok(rows)
     }
 
+    // A bounded window of transcript entries around one ordinal (roughly half
+    // before, half after), in append order — how search-surfaced ordinals in
+    // the middle of a long session become inspectable. Same SQL-level bound
+    // and superseded semantics as `transcript_tail`.
+    pub fn transcript_around(
+        &self,
+        session_id: &str,
+        ordinal: i64,
+        limit: i64,
+        include_superseded: bool,
+    ) -> Result<Vec<InspectRow>> {
+        let start = ordinal - limit / 2;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ordinal, timestamp, content,
+                        sender_kind, sender_name, sender_session_id, sender_task,
+                        role, superseded
+                 FROM messages
+                 WHERE session_id = ?1 AND ordinal >= ?2 AND (?4 OR superseded = 0)
+                 ORDER BY ordinal ASC LIMIT ?3",
+            )
+            .context("preparing transcript window query")?;
+        let rows = stmt
+            .query_map(params![session_id, start, limit, include_superseded], |r| {
+                Ok(InspectRow {
+                    row: message_row(r)?,
+                    role: r.get(7)?,
+                    superseded: r.get::<_, i64>(8)? != 0,
+                })
+            })
+            .context("querying transcript window")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("loading transcript window of session {session_id}"))?;
+        Ok(rows)
+    }
+
     // Live (non-superseded) entry count for one session.
     pub fn turn_count(&self, session_id: &str) -> Result<i64> {
         self.conn
@@ -543,33 +581,34 @@ impl SessionStore {
         &self,
         query: &str,
         cwd: Option<&str>,
+        session_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<SearchHit>> {
-        let escaped = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
+        let pattern = like_pattern(query);
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT m.session_id, s.name, s.cwd, m.ordinal, m.role, m.sender_name, m.content
+                "SELECT m.session_id, s.name, s.cwd, m.ordinal, m.timestamp,
+                        m.role, m.sender_name, m.content
                  FROM messages m JOIN sessions s ON s.id = m.session_id
-                 WHERE (?1 IS NULL OR s.cwd = ?1) AND m.content LIKE ?2 ESCAPE '\\'
+                 WHERE (?1 IS NULL OR s.cwd = ?1)
+                   AND (?4 IS NULL OR m.session_id = ?4)
+                   AND m.content LIKE ?2 ESCAPE '\\'
                  ORDER BY s.last_activity DESC, m.session_id, m.ordinal
                  LIMIT ?3",
             )
             .context("preparing search query")?;
         let rows = stmt
-            .query_map(params![cwd, pattern, limit], |r| {
+            .query_map(params![cwd, pattern, limit, session_id], |r| {
                 Ok(SearchHit {
                     session_id: r.get(0)?,
                     session_name: r.get(1)?,
                     cwd: r.get(2)?,
                     ordinal: r.get(3)?,
-                    role: r.get(4)?,
-                    sender_name: r.get(5)?,
-                    content: r.get(6)?,
+                    timestamp: r.get(4)?,
+                    role: r.get(5)?,
+                    sender_name: r.get(6)?,
+                    content: r.get(7)?,
                 })
             })
             .context("querying message search")?
@@ -577,6 +616,47 @@ impl SessionStore {
             .context("searching messages")?;
         Ok(rows)
     }
+
+    // Total match count for the same predicate as `search_messages` — lets the
+    // caller disclose truncation ("showing N of M") when hits were capped.
+    pub fn search_message_count(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<i64> {
+        let pattern = like_pattern(query);
+        self.conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM messages m JOIN sessions s ON s.id = m.session_id
+                 WHERE (?1 IS NULL OR s.cwd = ?1)
+                   AND (?3 IS NULL OR m.session_id = ?3)
+                   AND m.content LIKE ?2 ESCAPE '\\'",
+                params![cwd, pattern, session_id],
+                |r| r.get(0),
+            )
+            .context("counting search matches")
+    }
+
+    // Total session count across every project — the truncation-disclosure
+    // companion to `list_all` (the cwd-scoped list is unbounded, so its caller
+    // already holds the full count).
+    pub fn session_count(&self) -> Result<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .context("counting sessions")
+    }
+}
+
+// LIKE pattern for a literal substring: escape the wildcard characters, then
+// wrap in `%…%`. Pairs with `ESCAPE '\'` in the queries that bind it.
+fn like_pattern(query: &str) -> String {
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
 }
 
 fn now() -> String {
@@ -932,5 +1012,60 @@ mod tests {
             s.insert_session("orphan", "/proj", Some("no-such-parent"), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transcript_around_windows_by_ordinal_and_respects_superseded() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        for _ in 0..20 {
+            s.append_message("a", "user", "{}", None).unwrap();
+        }
+
+        let ordinals = |rows: &[InspectRow]| rows.iter().map(|e| e.row.ordinal).collect::<Vec<_>>();
+        let win = s.transcript_around("a", 10, 5, false).unwrap();
+        assert_eq!(ordinals(&win), vec![8, 9, 10, 11, 12]);
+
+        // Anchors clamp at the edges; past the end is empty, not an error.
+        let head = s.transcript_around("a", 0, 5, false).unwrap();
+        assert_eq!(ordinals(&head), vec![0, 1, 2, 3, 4]);
+        assert!(s.transcript_around("a", 100, 5, false).unwrap().is_empty());
+
+        // Superseded rows drop from the live window, appear flagged in audit.
+        s.mark_superseded_after("a", 9).unwrap();
+        let live = s.transcript_around("a", 10, 5, false).unwrap();
+        assert_eq!(ordinals(&live), vec![8, 9]);
+        let audit = s.transcript_around("a", 10, 5, true).unwrap();
+        assert_eq!(ordinals(&audit), vec![8, 9, 10, 11, 12]);
+        assert!(audit.iter().filter(|e| e.superseded).count() == 3);
+    }
+
+    #[test]
+    fn search_session_filter_counts_and_session_count() {
+        let mut s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        s.insert_session("b", "/proj", None, None).unwrap();
+        s.append_message("a", "user", "needle one", None).unwrap();
+        s.append_message("a", "user", "needle two", None).unwrap();
+        s.append_message("b", "user", "needle three", None).unwrap();
+
+        let scoped = s.search_messages("needle", None, Some("a"), 10).unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|h| h.session_id == "a"));
+        assert!(!scoped[0].timestamp.is_empty());
+
+        assert_eq!(s.search_message_count("needle", None, None).unwrap(), 3);
+        assert_eq!(
+            s.search_message_count("needle", None, Some("b")).unwrap(),
+            1
+        );
+        assert_eq!(
+            s.search_message_count("needle", Some("/proj"), None)
+                .unwrap(),
+            3
+        );
+        assert_eq!(s.search_message_count("nothing", None, None).unwrap(), 0);
+
+        assert_eq!(s.session_count().unwrap(), 2);
     }
 }
