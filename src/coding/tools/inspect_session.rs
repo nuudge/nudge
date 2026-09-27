@@ -374,10 +374,14 @@ fn search(
 // hits would otherwise render raw \n and \" escapes.
 fn snippet(content: &str, query: &str) -> String {
     let flat = one_line(&unescape_json(content));
-    let pos = flat.to_lowercase().find(&query.to_lowercase());
-    match pos {
+    let lowered = flat.to_lowercase();
+    match lowered.find(&query.to_lowercase()) {
         Some(byte_pos) => {
-            let chars_before = flat[..byte_pos].chars().count();
+            // Count the prefix on `lowered`, where byte_pos is guaranteed a char
+            // boundary — lowercasing can change byte lengths (İ → i̇), so the
+            // offset must never index `flat` directly. The count may drift a
+            // char or two on such input; the window is fuzzy anyway.
+            let chars_before = lowered[..byte_pos].chars().count();
             let start = chars_before.saturating_sub(SNIPPET_CHARS / 2);
             let windowed: String = flat.chars().skip(start).take(SNIPPET_CHARS).collect();
             let prefix = if start > 0 { "…" } else { "" };
@@ -841,5 +845,15 @@ mod tests {
 
         let full = run(&json!({"mode": "search", "query": "NEEDLE"}), &s, "/proj").unwrap();
         assert!(!full.contains("showing"), "{full}");
+    }
+
+    // Lowercasing can grow byte lengths (İ U+0130 → i + U+0307), so the match
+    // offset from the lowered string must never index the original — this input
+    // panicked on a mid-char slice before the fix.
+    #[test]
+    fn snippet_survives_case_folding_that_changes_byte_length() {
+        let content = format!("{} NEEDLE after the dotted capital", "İ".repeat(40));
+        let out = snippet(&content, "needle");
+        assert!(out.contains("NEEDLE"), "{out}");
     }
 }
