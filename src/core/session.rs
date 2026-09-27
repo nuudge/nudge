@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::core::identity::ClientIdentity;
-use crate::core::store::SessionStore;
+use crate::core::store::{SessionState, SessionStore};
 use crate::llm::{ContentBlock, Message};
 
 pub struct Session {
@@ -48,8 +48,29 @@ impl Session {
     // ~/.nudge/nudge.db); session identity (the uuid) and the transcript rows are
     // the mechanism owned here, where the database file lives is not.
     pub fn create(cwd: PathBuf, store: SessionStore) -> Result<Self> {
+        Self::create_with(cwd, store, None, None)
+    }
+
+    // A session spawned by another agent: identical, plus the provenance edge —
+    // spawned_by (the parent's session id, a foreign key) and the spawn task —
+    // recorded on the row so "which child did what, and why" is queryable later.
+    pub fn create_spawned(
+        cwd: PathBuf,
+        store: SessionStore,
+        spawned_by: &str,
+        spawn_task: &str,
+    ) -> Result<Self> {
+        Self::create_with(cwd, store, Some(spawned_by), Some(spawn_task))
+    }
+
+    fn create_with(
+        cwd: PathBuf,
+        store: SessionStore,
+        spawned_by: Option<&str>,
+        spawn_task: Option<&str>,
+    ) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
-        store.insert_session(&id, &cwd.display().to_string(), None, None)?;
+        store.insert_session(&id, &cwd.display().to_string(), spawned_by, spawn_task)?;
         Ok(Self {
             id,
             cwd,
@@ -63,11 +84,13 @@ impl Session {
     // returned message vec ends on a valid alternating-role boundary that the
     // Messages API will accept on the next request; the truncated tail is marked
     // superseded in the store (excluded from future reads, never deleted) so a
-    // later resume doesn't replay the orphaned entries mid-transcript.
+    // later resume doesn't replay the orphaned entries mid-transcript. The row
+    // flips back to 'running' — a resumed session is live again.
     pub fn open(id: &str, cwd: PathBuf, store: SessionStore) -> Result<Resumed> {
         let row = store
             .session(id)?
             .with_context(|| format!("no session {id} in the store"))?;
+        store.set_state(id, SessionState::Running)?;
 
         let mut ordinals = Vec::new();
         let mut entries: Vec<LoggedMessage> = Vec::new();
@@ -159,6 +182,13 @@ impl Session {
     // so they never reach the store.
     pub fn rollback(&mut self) {
         self.staged.clear();
+    }
+
+    // Graceful teardown: mark the row 'ended'. Called once when the agent loop
+    // winds down (quit, dismissal, or a loop error); a crash never gets here,
+    // honestly leaving 'running' — last_activity is the staleness signal then.
+    pub fn end(&self) -> Result<()> {
+        self.store.set_state(&self.id, SessionState::Ended)
     }
 }
 
@@ -358,6 +388,44 @@ mod tests {
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 0);
         assert_eq!(resumed.entries.len(), 2);
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    // The provenance edge: a spawned session's row carries spawned_by (an
+    // enforced FK to the parent) and the task; a plain create leaves both NULL.
+    #[test]
+    fn create_spawned_records_provenance_edge() {
+        let db = temp_db();
+        let parent = Session::create(cwd(), store_at(&db)).unwrap();
+        let child =
+            Session::create_spawned(cwd(), store_at(&db), &parent.id, "fix the bug").unwrap();
+
+        let row = store_at(&db).session(&child.id).unwrap().unwrap();
+        assert_eq!(row.spawned_by.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(row.spawn_task.as_deref(), Some("fix the bug"));
+        let row = store_at(&db).session(&parent.id).unwrap().unwrap();
+        assert!(row.spawned_by.is_none());
+        assert!(row.spawn_task.is_none());
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    // The state lifecycle: born running, ended on graceful teardown, running
+    // again when a resume re-opens it.
+    #[test]
+    fn end_marks_row_ended_and_open_marks_running_again() {
+        let db = temp_db();
+        let s = Session::create(cwd(), store_at(&db)).unwrap();
+        let id = s.id.clone();
+        let state = |db: &Path| store_at(db).session(&id).unwrap().unwrap().state;
+
+        assert_eq!(state(&db), SessionState::Running);
+        s.end().unwrap();
+        assert_eq!(state(&db), SessionState::Ended);
+
+        let _resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(state(&db), SessionState::Running);
 
         std::fs::remove_file(&db).ok();
     }

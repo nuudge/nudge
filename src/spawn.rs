@@ -38,7 +38,7 @@ pub fn peer_factory(
         let parent_session_id = parent_session_id.clone();
         let model = model.clone();
         Box::pin(async move {
-            let session = coding::open_new()?;
+            let session = coding::open_new_spawned(&parent_session_id, &task)?;
             let child_id = session.id.clone();
             let cwd = session.cwd.clone();
 
