@@ -999,6 +999,139 @@ async fn dismissed_child_session_row_reads_ended() {
     std::fs::remove_dir_all(&child_dir).ok();
 }
 
+// Issue #26's done-when, end to end: spawn a real child (its session row carries
+// the spawn edge), let it log a turn, dismiss it — then answer "what did the
+// child actually do?" from InspectSession alone, in the parent's context.
+#[tokio::test]
+async fn dismissed_child_is_answerable_from_inspect_session_alone() {
+    let (parent_session, dir) = mk_session();
+    let parent_id = parent_session.id.clone();
+    let db = dir.join("nudge.db");
+
+    // The child shares the parent's store, so the spawned_by FK edge is real.
+    let child_session = Session::create_spawned(
+        dir.clone(),
+        SessionStore::open(&db).unwrap(),
+        &parent_id,
+        "count the files",
+    )
+    .unwrap();
+    let child_id = child_session.id.clone();
+    let child_host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        child_session,
+        Vec::new(),
+        Vec::new(),
+        crate::core::PeerWiring::default(),
+    );
+
+    // Drive one child turn so its transcript has content to inspect.
+    let mut driver = child_host
+        .attach(ClientIdentity::human("tester"))
+        .await
+        .expect("attach driver to child");
+    driver
+        .ui_tx
+        .send(UiEvent::UserMessage {
+            text: "count the files".into(),
+        })
+        .await
+        .unwrap();
+    loop {
+        match driver.events.recv().await {
+            Some(ControllerEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("child stream ended before its turn completed"),
+        }
+    }
+    drop(driver);
+
+    // Parent loop dismisses the child.
+    let child_ctrl = child_host
+        .attach(agent_who("parent"))
+        .await
+        .expect("attach parent edge to child");
+    let mut peers = PeerSet::default();
+    peers.register(PeerRegistration {
+        controller: child_ctrl,
+        who: agent_who("child-1"),
+        host: Some(child_host),
+        supervised: true,
+        spawner: false,
+    });
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: Default::default(),
+        seen_tools: Default::default(),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        parent_session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "dismiss the child".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let state = SessionStore::open(&db)
+            .unwrap()
+            .session(&child_id)
+            .unwrap()
+            .unwrap()
+            .state;
+        if state == SessionState::Ended {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "child never ended");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // The tool alone answers what the child did: identity, provenance, final
+    // state, and the logged turns.
+    let out = crate::coding::tools::inspect_session::run(
+        &serde_json::json!({"mode": "inspect", "session": child_id}),
+        &SessionStore::open(&db).unwrap(),
+        &dir.display().to_string(),
+    )
+    .unwrap();
+    assert!(out.contains(&format!("session {child_id}")), "{out}");
+    assert!(out.contains("state: ended"), "{out}");
+    assert!(out.contains(&format!("spawned by: {parent_id}")), "{out}");
+    assert!(out.contains("task: count the files"), "{out}");
+    assert!(out.contains("live turns: 2"), "{out}");
+    assert!(out.contains("count the files"), "{out}");
+    assert!(out.contains("ok"), "the child's reply is visible: {out}");
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // Dismissal is supervised-only: the return edge to your own spawner is refused.
 #[tokio::test]
 async fn dismiss_refuses_an_unsupervised_peer() {
