@@ -53,19 +53,23 @@ impl SessionState {
     }
 }
 
-// Most fields are read only by the upcoming --list / lifecycle / InspectSession
-// consumers; resume needs just `name` for now.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     pub id: String,
+    // The allowed fields are read only by the upcoming importer / lifecycle /
+    // InspectSession consumers; resume and --list use the rest.
+    #[allow(dead_code)]
     pub cwd: String,
     pub name: Option<String>,
     pub branch: Option<String>,
+    #[allow(dead_code)]
     pub created: String,
     pub last_activity: String,
+    #[allow(dead_code)]
     pub state: SessionState,
+    #[allow(dead_code)]
     pub spawned_by: Option<String>,
+    #[allow(dead_code)]
     pub spawn_task: Option<String>,
 }
 
@@ -82,8 +86,6 @@ pub struct MessageRow {
 }
 
 // A session row joined with its live (non-superseded) message count, for --list.
-// Unused until the `--list` policy moves onto the store.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionListing {
     pub row: SessionRow,
@@ -319,9 +321,7 @@ impl SessionStore {
     }
 
     // Sessions for one project directory, most recently active first, with live
-    // turn counts — the `--list` query. Unused (outside tests) until the `--list`
-    // policy moves onto the store.
-    #[allow(dead_code)]
+    // turn counts — the `--list` query.
     pub fn list_by_cwd(&self, cwd: &str) -> Result<Vec<SessionListing>> {
         let mut stmt = self
             .conn
