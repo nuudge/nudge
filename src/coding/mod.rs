@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
@@ -130,98 +130,38 @@ pub fn open_resume(reference: &str) -> Result<Resumed> {
     Session::open(&id, cwd, store)
 }
 
-// One row for `nudge --list`: a session in the current project, with its name
-// (from the index) if it's been renamed. `modified` is the transcript file's mtime,
-// used to sort most-recent-first so the list reads like a recency-ordered history.
-// `size` is the transcript's byte length, a rough proxy for how much history it holds.
+// One row for `nudge --list`: a session in the current project, with its name if
+// it's been renamed. `last_activity` (the store row's commit-touched timestamp)
+// sorts most-recent-first so the list reads like a recency-ordered history.
+// `turns` is the live (non-superseded) message count, a proxy for how much
+// history the session holds.
 pub struct SessionListing {
     pub id: String,
     pub name: Option<String>,
     pub branch: Option<String>,
-    pub modified: std::time::SystemTime,
-    pub size: u64,
+    pub last_activity: chrono::DateTime<chrono::Utc>,
+    pub turns: i64,
 }
 
-// Enumerate the current project's sessions: every `<id>.jsonl` transcript in the
-// cwd-keyed dir, joined with the name index. Returns most-recently-modified first.
-// An empty/missing project dir yields an empty list (no sessions here yet).
-// Still reads the legacy JSONL layout — new sessions live in the store; the
-// listing moves there (with the importer) in the migration's next steps.
+// Enumerate the current project's sessions from the store, most recently active
+// first. A fresh database yields an empty list (no sessions here yet).
 pub fn list_sessions() -> Result<Vec<SessionListing>> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let dir = project_dir(&cwd)?;
-    let index = read_index(&dir.join("index.json"));
-
-    let mut out = Vec::new();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(out), // no sessions recorded for this project yet
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let fs_meta = entry.metadata().ok();
-        let modified = fs_meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let size = fs_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        let meta = index.get(id);
-        out.push(SessionListing {
-            id: id.to_string(),
-            name: meta.map(|e| e.name.clone()),
-            branch: meta.and_then(|e| e.branch.clone()),
-            modified,
-            size,
-        });
-    }
-    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
-    Ok(out)
-}
-
-// One row of the legacy per-project name index (`index.json`), read leniently:
-// a missing/corrupt index just means "no names", never a hard error.
-#[derive(serde::Deserialize)]
-struct IndexEntry {
-    name: String,
-    #[serde(default)]
-    branch: Option<String>,
-}
-
-fn read_index(index_path: &Path) -> std::collections::BTreeMap<String, IndexEntry> {
-    std::fs::read_to_string(index_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn project_dir(cwd: &Path) -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME env var not set")?;
-    Ok(PathBuf::from(home)
-        .join(".nudge")
-        .join("projects")
-        .join(flatten_cwd(cwd)))
-}
-
-fn flatten_cwd(cwd: &Path) -> String {
-    // Mirror Claude Code's flattening convention (any non-[a-zA-Z0-9-] → `-`)
-    // so that future migration or interop is straightforward. Storage root is
-    // ~/.nudge/ rather than ~/.claude/ to keep nudge's sessions
-    // separate from a co-installed Claude Code.
-    cwd.display()
-        .to_string()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
+    let store = SessionStore::open(&db_path()?)?;
+    store
+        .list_by_cwd(&cwd.display().to_string())?
+        .into_iter()
+        .map(|l| {
+            let last_activity = chrono::DateTime::parse_from_rfc3339(&l.row.last_activity)
+                .with_context(|| format!("invalid last_activity on session {}", l.row.id))?
+                .with_timezone(&chrono::Utc);
+            Ok(SessionListing {
+                id: l.row.id,
+                name: l.row.name,
+                branch: l.row.branch,
+                last_activity,
+                turns: l.turns,
+            })
         })
         .collect()
 }
