@@ -374,12 +374,12 @@ fn search(
 // ("role":…, tool_use ids) into snippets whenever the match landed near
 // structure — so extract the blocks' display text first, mirroring
 // `render_entry`'s conventions. A row that doesn't parse as a typed message
-// falls back to the raw string, unescaped for display. A match that lived only
+// falls back to the raw string. A match that lived only
 // in JSON structure (not in any block's text) lands in the prefix fallback.
 fn snippet(content: &str, query: &str) -> String {
     let flat = match serde_json::from_str::<Message>(content) {
         Ok(msg) => one_line(&flat_text(&msg)),
-        Err(_) => one_line(&unescape_json(content)),
+        Err(_) => one_line(content),
     };
     let lowered = flat.to_lowercase();
     match lowered.find(&query.to_lowercase()) {
@@ -439,33 +439,6 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-// Undo JSON string escapes for display. Deliberately shallow — the input is a
-// serialized message, not a lone JSON string, so full parsing doesn't apply;
-// unknown escapes pass through unchanged.
-fn unescape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(other) => {
-                out.push('\\');
-                out.push(other);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
 }
 
 fn short_id(id: &str) -> String {
@@ -834,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn search_snippet_unescapes_json_escapes() {
+    fn search_snippet_shows_block_text_free_of_json_escapes() {
         let mut s = store();
         s.insert_session("a", "/proj", None, None).unwrap();
         // Stored content is message JSON: the text's newline and quotes are
