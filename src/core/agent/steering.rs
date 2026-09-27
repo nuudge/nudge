@@ -206,7 +206,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     });
     session.stage(messages.last().unwrap(), None);
     *last_good_snapshot = messages.len();
-    session.commit().await?;
+    session.commit()?;
 
     let _ = agent_tx.send(AgentEvent::Notice { text: closing }).await;
     Ok(())

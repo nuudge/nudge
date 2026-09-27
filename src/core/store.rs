@@ -53,6 +53,9 @@ impl SessionState {
     }
 }
 
+// Most fields are read only by the upcoming --list / lifecycle / InspectSession
+// consumers; resume needs just `name` for now.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     pub id: String,
@@ -71,12 +74,16 @@ pub struct SessionRow {
 #[derive(Debug, Clone)]
 pub struct MessageRow {
     pub ordinal: i64,
+    // Unused until transcript views (--list detail, InspectSession) land.
+    #[allow(dead_code)]
     pub timestamp: String,
     pub content: String,
     pub sender: Option<ClientIdentity>,
 }
 
 // A session row joined with its live (non-superseded) message count, for --list.
+// Unused until the `--list` policy moves onto the store.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SessionListing {
     pub row: SessionRow,
@@ -99,6 +106,7 @@ impl SessionStore {
     }
 
     // Tests only: a private in-memory database (no WAL — it's meaningless there).
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory().context("opening in-memory store")?)
     }
@@ -192,6 +200,8 @@ impl SessionStore {
         Ok(())
     }
 
+    // Unused until host shutdown records the session lifecycle.
+    #[allow(dead_code)]
     pub fn set_state(&self, id: &str, state: SessionState) -> Result<()> {
         self.conn
             .execute(
@@ -309,7 +319,9 @@ impl SessionStore {
     }
 
     // Sessions for one project directory, most recently active first, with live
-    // turn counts — the `--list` query.
+    // turn counts — the `--list` query. Unused (outside tests) until the `--list`
+    // policy moves onto the store.
+    #[allow(dead_code)]
     pub fn list_by_cwd(&self, cwd: &str) -> Result<Vec<SessionListing>> {
         let mut stmt = self
             .conn

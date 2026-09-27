@@ -253,13 +253,15 @@ pub async fn run_agent<P: Provider, B: Backend>(
             if resp.stop_reason != "tool_use" {
                 messages.push(assistant_msg);
                 last_good_snapshot = messages.len();
-                session.commit().await?;
+                session.commit()?;
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
                 emit_session_info_if_changed(
                     &agent_tx,
                     &cfg.model,
                     backend.git_branch(),
-                    &session,
+                    session.id.clone(),
+                    session.cwd_display(),
+                    session.name.clone(),
                     &mut last_session_ctx,
                 )
                 .await;
@@ -293,7 +295,9 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     &agent_tx,
                     &cfg.model,
                     backend.git_branch(),
-                    &session,
+                    session.id.clone(),
+                    session.cwd_display(),
+                    session.name.clone(),
                     &mut last_session_ctx,
                 )
                 .await;
@@ -369,7 +373,7 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     .await;
                 messages.push(synthetic);
                 last_good_snapshot = messages.len();
-                session.commit().await?;
+                session.commit()?;
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
                 // A subagent's parent is the only party that can send 'continue', and
                 // Notices never reach its model — report up the return edge (the same
@@ -392,7 +396,9 @@ pub async fn run_agent<P: Provider, B: Backend>(
                     &agent_tx,
                     &cfg.model,
                     backend.git_branch(),
-                    &session,
+                    session.id.clone(),
+                    session.cwd_display(),
+                    session.name.clone(),
                     &mut last_session_ctx,
                 )
                 .await;
@@ -448,7 +454,9 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 agent_tx,
                 &cfg.model,
                 backend.git_branch(),
-                session,
+                session.id.clone(),
+                session.cwd_display(),
+                session.name.clone(),
                 last_session_ctx,
             )
             .await;

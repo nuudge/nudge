@@ -1,52 +1,34 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 
 use crate::core::identity::ClientIdentity;
+use crate::core::store::SessionStore;
 use crate::llm::{ContentBlock, Message};
 
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
-    pub log_path: PathBuf,
     // Human-readable label for the session, layered on top of the immutable
     // uuid `id`. `None` until the user renames (see `set_name`). The uuid stays
-    // the on-disk identity (filename, log envelopes, resume cursor); the name is
-    // pure metadata stored in the per-project index, so renaming never touches
-    // the transcript or breaks resume.
+    // the stored identity (session row, message rows, resume cursor); the name
+    // is pure metadata on the session row, so renaming never touches the
+    // transcript or breaks resume.
     pub name: Option<String>,
-    // The per-project name index, `<dir>/index.json` (id → entry). Path policy is
-    // the caller's (it owns `dir`); the read/write mechanism lives here.
-    index_path: PathBuf,
-    // Log entries produced by the in-flight turn but not yet on disk. They mirror the
-    // messages the loop pushed past its `last_good_snapshot`: `commit` flushes them when
-    // the turn lands on a valid boundary, `rollback` drops them when a provider error
-    // (or steering failure) rolls memory back — so the JSONL always holds exactly the
-    // committed prefix of the transcript, never an entry the live model didn't keep.
+    store: SessionStore,
+    // Log entries produced by the in-flight turn but not yet in the store. They mirror
+    // the messages the loop pushed past its `last_good_snapshot`: `commit` flushes them
+    // when the turn lands on a valid boundary, `rollback` drops them when a provider
+    // error (or steering failure) rolls memory back — so the store always holds exactly
+    // the committed prefix of the transcript, never an entry the live model didn't keep.
     staged: Vec<(Message, Option<ClientIdentity>)>,
 }
-
-// One row of the per-project session index: the human name plus light context
-// for the `--list` picker. Keyed by session uuid in the on-disk map.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexEntry {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    pub updated: String,
-}
-
-type Index = BTreeMap<String, IndexEntry>;
 
 // One logged transcript entry: the model-facing message plus, for a typed user
 // turn, the identity of whoever sent it. The stored text is CLEAN — attribution
 // (the `[message from peer …]` prefix the model sees, the `name > ` stamp a UI
-// shows) is derived from `sender` at build time, never baked into the log. Old
-// logs predate the field and deserialize with `sender: None`; their user text
-// may carry an already-baked prefix, which the absent sender leaves untouched.
+// shows) is derived from `sender` at build time, never baked into the log.
+// Entries stored without a sender read back as `None` (unattributed); their user
+// text may carry an already-baked prefix, which the absent sender leaves untouched.
 pub struct LoggedMessage {
     pub message: Message,
     pub sender: Option<ClientIdentity>,
@@ -62,90 +44,64 @@ pub struct Resumed {
 }
 
 impl Session {
-    // `dir` is the storage directory (the caller's policy — e.g. a cwd-keyed
-    // project folder); the log lives at `<dir>/<id>.jsonl`. Session identity
-    // (the uuid) and the JSONL transcript are the mechanism owned here; where
-    // it lands on disk is not.
-    pub fn create(cwd: PathBuf, dir: PathBuf) -> Result<Self> {
+    // `store` is the storage endpoint (the caller's policy — e.g. the shared
+    // ~/.nudge/nudge.db); session identity (the uuid) and the transcript rows are
+    // the mechanism owned here, where the database file lives is not.
+    pub fn create(cwd: PathBuf, store: SessionStore) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("could not create session dir {}", dir.display()))?;
-        let log_path = dir.join(format!("{id}.jsonl"));
-        let index_path = dir.join("index.json");
+        store.insert_session(&id, &cwd.display().to_string(), None, None)?;
         Ok(Self {
             id,
             cwd,
-            log_path,
             name: None,
-            index_path,
+            store,
             staged: Vec::new(),
         })
     }
 
-    // Re-open a session by ID from `dir`. Applies strict truncation so the
+    // Re-open a session by ID from the store. Applies strict truncation so the
     // returned message vec ends on a valid alternating-role boundary that the
-    // Messages API will accept on the next request.
-    pub fn open(id: &str, cwd: PathBuf, dir: PathBuf) -> Result<Resumed> {
-        let log_path = dir.join(format!("{id}.jsonl"));
-        let index_path = dir.join("index.json");
-        let name = read_index(&index_path).remove(id).map(|e| e.name);
+    // Messages API will accept on the next request; the truncated tail is marked
+    // superseded in the store (excluded from future reads, never deleted) so a
+    // later resume doesn't replay the orphaned entries mid-transcript.
+    pub fn open(id: &str, cwd: PathBuf, store: SessionStore) -> Result<Resumed> {
+        let row = store
+            .session(id)?
+            .with_context(|| format!("no session {id} in the store"))?;
 
-        // A missing transcript is normally a hard error (a typo'd --resume id). But a
-        // session the index knows about (it has a name) with no transcript is just an
-        // empty session — renamed before its first turn, or its file removed — so
-        // recover it as empty rather than failing. An *unknown* id keeps erroring.
-        let raw = match std::fs::read_to_string(&log_path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && name.is_some() => String::new(),
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("could not read session log {}", log_path.display()));
-            }
-        };
-
+        let mut ordinals = Vec::new();
         let mut entries: Vec<LoggedMessage> = Vec::new();
-        for (i, line) in raw.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let envelope: Value = serde_json::from_str(line).with_context(|| {
-                format!("invalid JSON on line {} of {}", i + 1, log_path.display())
-            })?;
-            let msg_value = envelope.get("message").with_context(|| {
+        for msg_row in store.load_transcript(id)? {
+            let message: Message = serde_json::from_str(&msg_row.content).with_context(|| {
                 format!(
-                    "missing `message` field on line {} of {}",
-                    i + 1,
-                    log_path.display()
+                    "invalid message at ordinal {} of session {id}",
+                    msg_row.ordinal
                 )
             })?;
-            let msg: Message = serde_json::from_value(msg_value.clone()).with_context(|| {
-                format!(
-                    "invalid message on line {} of {}",
-                    i + 1,
-                    log_path.display()
-                )
-            })?;
-            // Absent on pre-sender logs (and lenient on malformed): None = unattributed.
-            let sender = envelope
-                .get("sender")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            ordinals.push(msg_row.ordinal);
             entries.push(LoggedMessage {
-                message: msg,
-                sender,
+                message,
+                sender: msg_row.sender,
             });
         }
 
         let original_len = entries.len();
         truncate_to_clean_boundary(&mut entries);
         let dropped = original_len - entries.len();
+        if dropped > 0 {
+            let last_kept = match entries.len() {
+                0 => -1,
+                n => ordinals[n - 1],
+            };
+            store.mark_superseded_after(id, last_kept)?;
+        }
 
         Ok(Resumed {
             session: Self {
                 id: id.to_string(),
                 cwd,
-                log_path,
-                name,
-                index_path,
+                name: row.name,
+                store,
                 staged: Vec::new(),
             },
             entries,
@@ -153,29 +109,11 @@ impl Session {
         })
     }
 
-    // Set (or replace) the session's human label and persist it to the per-project
-    // index. The uuid `id` — filename, log envelopes, resume cursor — is untouched;
-    // this only writes the id → {name, branch, updated} row. `branch` is recorded as
-    // context for the `--list` picker. Last writer wins on the index file.
+    // Set (or replace) the session's human label. The uuid `id` — session row,
+    // message rows, resume cursor — is untouched; this only updates the row's
+    // name/branch columns. `branch` is recorded as context for the `--list` picker.
     pub fn set_name(&mut self, name: String, branch: Option<String>) -> Result<()> {
-        // A rename is an explicit "keep this session" signal, so materialize its
-        // transcript now if it hasn't logged anything yet. Without this, a fresh
-        // session renamed before its first turn would leave an index entry pointing at
-        // a nonexistent <id>.jsonl, and resume would fail with "No such file". Touch the
-        // file *before* writing the index so an interruption in between can only leave a
-        // resumable file without a name — never a name without a file.
-        ensure_log_exists(&self.log_path)?;
-
-        let mut index = read_index(&self.index_path);
-        index.insert(
-            self.id.clone(),
-            IndexEntry {
-                name: name.clone(),
-                branch,
-                updated: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-        write_index(&self.index_path, &index)?;
+        self.store.set_name(&self.id, &name, branch.as_deref())?;
         self.name = Some(name);
         Ok(())
     }
@@ -189,37 +127,20 @@ impl Session {
 
     // Log a message with the identity of whoever sent it (a typed user turn).
     // The message's text must be the clean, unattributed form — see `LoggedMessage`.
-    pub async fn log_from(&self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
-        let mut event = json!({
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "sessionId": self.id,
-            "cwd": self.cwd.display().to_string(),
-            "message": message,
-        });
-        if let Some(who) = sender {
-            event["sender"] = serde_json::to_value(who).context("serializing sender")?;
-        }
-        let line = format!("{event}\n");
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-            .await
-            .with_context(|| format!("could not open session log {}", self.log_path.display()))?;
-        file.write_all(line.as_bytes())
-            .await
-            .context("failed to write to session log")?;
-        // tokio::fs::File buffers internally: write_all returning only means the bytes
-        // were accepted, and drop flushes them in the BACKGROUND — so without an
-        // explicit flush a caller can observe the file before the line lands (the
-        // commit→TurnComplete ordering, and any test reading the log back). flush()
-        // waits for the OS write; durability (fsync) is deliberately not needed here.
-        file.flush().await.context("failed to flush session log")?;
+    // The message is serialized ONCE here and stored byte-exact; `open` reads those
+    // same bytes back, which the floating cache breakpoint depends on. The write is
+    // a single sub-millisecond INSERT at a turn boundary, so it runs inline rather
+    // than through spawn_blocking.
+    pub fn log_from(&mut self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
+        let content = serde_json::to_string(message).context("serializing message")?;
+        self.store
+            .append_message(&self.id, &message.role, &content, sender)?;
         Ok(())
     }
 
     // Buffer a log entry for the in-flight turn. The message's text must be the clean,
-    // unattributed form (see `LoggedMessage`); it reaches disk only when `commit` runs.
+    // unattributed form (see `LoggedMessage`); it reaches the store only when `commit`
+    // runs.
     pub fn stage(&mut self, message: &Message, sender: Option<&ClientIdentity>) {
         self.staged.push((message.clone(), sender.cloned()));
     }
@@ -227,70 +148,18 @@ impl Session {
     // The turn landed on a valid boundary: flush every staged entry to the transcript
     // and clear the buffer. A write error surfaces as the turn's error exactly as an
     // eager `log` would today — no entry is silently dropped on a failed flush.
-    pub async fn commit(&mut self) -> Result<()> {
+    pub fn commit(&mut self) -> Result<()> {
         for (message, sender) in std::mem::take(&mut self.staged) {
-            self.log_from(&message, sender.as_ref()).await?;
+            self.log_from(&message, sender.as_ref())?;
         }
         Ok(())
     }
 
     // The turn rolled back (provider error, steering failure): drop its staged entries
-    // so they never reach disk.
+    // so they never reach the store.
     pub fn rollback(&mut self) {
         self.staged.clear();
     }
-}
-
-// Read the per-project name index, returning an empty map when the file is absent
-// or unparseable — a missing/corrupt index just means "no names yet", never a hard
-// error (the uuid identity always works regardless).
-pub fn read_index(index_path: &Path) -> Index {
-    std::fs::read_to_string(index_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-// Write the index atomically: serialize to a sibling temp file, then rename over
-// the target so a crash mid-write can't leave a half-written (and thus unparseable)
-// index. The parent dir already exists (the session created it).
-fn write_index(index_path: &Path, index: &Index) -> Result<()> {
-    let tmp = index_path.with_extension("json.tmp");
-    let body = serde_json::to_vec_pretty(index).context("serializing session index")?;
-    std::fs::write(&tmp, &body)
-        .with_context(|| format!("writing session index temp {}", tmp.display()))?;
-    std::fs::rename(&tmp, index_path)
-        .with_context(|| format!("replacing session index {}", index_path.display()))?;
-    Ok(())
-}
-
-// Create the transcript file if it's absent, without truncating an existing one
-// (create + append never clobbers). Mirrors how `log` opens it.
-fn ensure_log_exists(log_path: &Path) -> Result<()> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .with_context(|| format!("could not create session log {}", log_path.display()))?;
-    Ok(())
-}
-
-// Resolve a user-supplied reference (a uuid or a human name) to a concrete session
-// id within `dir`. A reference whose transcript file already exists is taken as a
-// literal id. Otherwise it's looked up by name in the index (most-recently-updated
-// wins when names collide). Falling through returns the reference unchanged so the
-// subsequent `open` surfaces a clear "log not found" error.
-pub fn resolve_reference(dir: &Path, reference: &str) -> String {
-    if dir.join(format!("{reference}.jsonl")).exists() {
-        return reference.to_string();
-    }
-    let index = read_index(&dir.join("index.json"));
-    index
-        .iter()
-        .filter(|(_, e)| e.name == reference)
-        .max_by(|a, b| a.1.updated.cmp(&b.1.updated))
-        .map(|(id, _)| id.clone())
-        .unwrap_or_else(|| reference.to_string())
 }
 
 // Collapse a leading $HOME to `~` for display. Falls back to the full path when HOME
@@ -339,19 +208,33 @@ mod tests {
     use super::*;
     use crate::core::identity::ClientKind;
 
-    // Unique temp directory per test, mirroring the transport tests' temp-path style.
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nudge-session-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    // File-backed temp database so `open` can attach a fresh store connection to
+    // the same data a `create`d session wrote (WAL allows both live at once).
+    fn temp_db() -> PathBuf {
+        std::env::temp_dir().join(format!("nudge-session-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    fn store_at(db: &Path) -> SessionStore {
+        SessionStore::open(db).unwrap()
+    }
+
+    fn cwd() -> PathBuf {
+        PathBuf::from("/proj")
+    }
+
+    fn text_msg(role: &str, text: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
     }
 
     // log_from persists the sender next to the (clean) message; open restores it.
     // Messages logged without a sender (assistant turns) round-trip as None.
-    #[tokio::test]
-    async fn log_from_persists_sender_and_open_restores_it() {
-        let dir = temp_dir();
-        let s = Session::create(dir.clone(), dir.clone()).unwrap();
+    #[test]
+    fn log_from_persists_sender_and_open_restores_it() {
+        let db = temp_db();
+        let mut s = Session::create(cwd(), store_at(&db)).unwrap();
         let id = s.id.clone();
         let who = ClientIdentity {
             kind: ClientKind::Agent,
@@ -359,28 +242,11 @@ mod tests {
             session_id: None,
             task: None,
         };
-        s.log_from(
-            &Message {
-                role: "user".into(),
-                content: vec![ContentBlock::Text {
-                    text: "clean text".into(),
-                }],
-            },
-            Some(&who),
-        )
-        .await
-        .unwrap();
-        s.log_from(
-            &Message {
-                role: "assistant".into(),
-                content: vec![ContentBlock::Text { text: "ok".into() }],
-            },
-            None,
-        )
-        .await
-        .unwrap();
+        s.log_from(&text_msg("user", "clean text"), Some(&who))
+            .unwrap();
+        s.log_from(&text_msg("assistant", "ok"), None).unwrap();
 
-        let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.entries.len(), 2);
         match &resumed.entries[0].message.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "clean text"),
@@ -394,156 +260,105 @@ mod tests {
         assert_eq!(sender.kind, ClientKind::Agent);
         assert!(resumed.entries[1].sender.is_none());
 
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
-    // A pre-sender log line (no `sender` field in the envelope) deserializes as
-    // unattributed — the backward-compatibility contract for existing transcripts.
+    // set_name updates the session row and the in-memory name; a fresh store
+    // connection sees the persisted name with its branch context.
     #[test]
-    fn open_reads_pre_sender_log_as_unattributed() {
-        let dir = temp_dir();
-        let log = concat!(
-            r#"{"timestamp":"t","sessionId":"old","cwd":"/","message":{"role":"user","content":[{"type":"text","text":"[message from peer x]\nlegacy"}]}}"#,
-            "\n",
-            r#"{"timestamp":"t","sessionId":"old","cwd":"/","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#,
-            "\n",
-        );
-        std::fs::write(dir.join("old.jsonl"), log).unwrap();
-
-        let resumed = Session::open("old", dir.clone(), dir.clone()).unwrap();
-        assert_eq!(resumed.entries.len(), 2);
-        assert!(resumed.entries[0].sender.is_none());
-        match &resumed.entries[0].message.content[0] {
-            // The baked prefix stays in the text — absent sender leaves it alone.
-            ContentBlock::Text { text } => assert_eq!(text, "[message from peer x]\nlegacy"),
-            other => panic!("expected text block, got {other:?}"),
-        }
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // set_name writes the index row and updates the in-memory name; a fresh
-    // read_index sees the persisted entry with its branch context.
-    #[test]
-    fn set_name_persists_to_index() {
-        let dir = temp_dir();
-        let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
+    fn set_name_persists_to_store() {
+        let db = temp_db();
+        let mut s = Session::create(cwd(), store_at(&db)).unwrap();
         let id = s.id.clone();
         s.set_name("auth-fix".into(), Some("main".into())).unwrap();
 
         assert_eq!(s.name.as_deref(), Some("auth-fix"));
-        let index = read_index(&dir.join("index.json"));
-        let entry = index.get(&id).expect("index row written");
-        assert_eq!(entry.name, "auth-fix");
-        assert_eq!(entry.branch.as_deref(), Some("main"));
+        let row = store_at(&db).session(&id).unwrap().expect("row written");
+        assert_eq!(row.name.as_deref(), Some("auth-fix"));
+        assert_eq!(row.branch.as_deref(), Some("main"));
 
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // A reference whose transcript exists is taken as a literal id; a name resolves
-    // to its id (most-recently-updated wins on a collision); an unknown reference is
-    // returned unchanged for `open` to error on.
-    #[test]
-    fn resolve_reference_prefers_file_then_index() {
-        let dir = temp_dir();
-
-        // An existing transcript means the reference is a literal id.
-        std::fs::write(dir.join("real-id.jsonl"), "").unwrap();
-        assert_eq!(resolve_reference(&dir, "real-id"), "real-id");
-
-        // Two sessions share the name "dup"; the later `updated` wins.
-        let mut index = Index::new();
-        index.insert(
-            "old".into(),
-            IndexEntry {
-                name: "dup".into(),
-                branch: None,
-                updated: "2026-01-01T00:00:00Z".into(),
-            },
-        );
-        index.insert(
-            "new".into(),
-            IndexEntry {
-                name: "dup".into(),
-                branch: None,
-                updated: "2026-06-01T00:00:00Z".into(),
-            },
-        );
-        write_index(&dir.join("index.json"), &index).unwrap();
-        assert_eq!(resolve_reference(&dir, "dup"), "new");
-
-        // Unknown reference passes through unchanged.
-        assert_eq!(resolve_reference(&dir, "nope"), "nope");
-
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
     // A renamed session's label survives a create → log → open round-trip: open
-    // reloads the name from the index keyed by the uuid.
-    #[tokio::test]
-    async fn open_reloads_persisted_name() {
-        let dir = temp_dir();
-        let id;
-        {
-            let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
-            id = s.id.clone();
+    // reloads the name from the session row keyed by the uuid.
+    #[test]
+    fn open_reloads_persisted_name() {
+        let db = temp_db();
+        let id = {
+            let mut s = Session::create(cwd(), store_at(&db)).unwrap();
             // A clean assistant turn so open()'s truncation keeps the transcript.
-            s.log_from(
-                &Message {
-                    role: "assistant".into(),
-                    content: vec![ContentBlock::Text { text: "hi".into() }],
-                },
-                None,
-            )
-            .await
-            .unwrap();
+            s.log_from(&text_msg("assistant", "hi"), None).unwrap();
             s.set_name("my-label".into(), None).unwrap();
-        }
+            s.id.clone()
+        };
 
-        let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.session.name.as_deref(), Some("my-label"));
 
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
-    // The reported edge: a fresh session renamed before its first turn (no transcript
-    // yet) must still be resumable. set_name materializes the transcript, so it
-    // resolves by name and opens as an empty, named session.
+    // The reported edge: a fresh session renamed before its first turn must still
+    // be resumable — the session row exists from create, so it resolves by name
+    // and opens as an empty, named session.
     #[test]
     fn rename_before_first_turn_is_resumable() {
-        let dir = temp_dir();
+        let db = temp_db();
         let id = {
-            let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
+            let mut s = Session::create(cwd(), store_at(&db)).unwrap();
             s.set_name("early-name".into(), None).unwrap();
             s.id.clone()
         };
-        assert_eq!(resolve_reference(&dir, "early-name"), id);
-        let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+        assert_eq!(
+            store_at(&db)
+                .resolve_reference("/proj", "early-name")
+                .unwrap(),
+            id
+        );
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.session.name.as_deref(), Some("early-name"));
         assert!(resumed.entries.is_empty());
 
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
     }
 
-    // Belt-and-suspenders: a named session whose transcript was removed still opens as
-    // empty (recovery), while an unknown id with no transcript is a genuine error.
+    // A created-but-never-logged session opens as empty (its row exists from
+    // create), while an unknown id is a genuine error.
     #[test]
-    fn open_recovers_indexed_session_with_missing_transcript() {
-        let dir = temp_dir();
-        let id = {
-            let mut s = Session::create(dir.clone(), dir.clone()).unwrap();
-            s.set_name("kept".into(), None).unwrap();
-            s.id.clone()
-        };
-        std::fs::remove_file(dir.join(format!("{id}.jsonl"))).unwrap();
+    fn open_of_never_logged_session_is_empty_and_unknown_id_errors() {
+        let db = temp_db();
+        let id = Session::create(cwd(), store_at(&db)).unwrap().id;
 
-        let resumed = Session::open(&id, dir.clone(), dir.clone()).unwrap();
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert!(resumed.entries.is_empty());
-        assert_eq!(resumed.session.name.as_deref(), Some("kept"));
+        assert!(resumed.session.name.is_none());
 
-        // Unknown id, no transcript, not in index → still errors.
-        assert!(Session::open("ghost", dir.clone(), dir.clone()).is_err());
+        assert!(Session::open("ghost", cwd(), store_at(&db)).is_err());
 
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&db).ok();
+    }
+
+    // Strict truncation on open: the orphaned tail is dropped from the returned
+    // entries AND marked superseded in the store, so a second open sees a clean
+    // transcript with nothing left to drop.
+    #[test]
+    fn open_truncates_orphaned_tail_and_supersedes_it() {
+        let db = temp_db();
+        let mut s = Session::create(cwd(), store_at(&db)).unwrap();
+        let id = s.id.clone();
+        s.log_from(&text_msg("user", "hi"), None).unwrap();
+        s.log_from(&text_msg("assistant", "ok"), None).unwrap();
+        s.log_from(&text_msg("user", "no reply yet"), None).unwrap();
+
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(resumed.dropped, 1);
+        assert_eq!(resumed.entries.len(), 2);
+
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.entries.len(), 2);
+
+        std::fs::remove_file(&db).ok();
     }
 }

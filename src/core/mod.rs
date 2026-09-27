@@ -5,9 +5,6 @@ pub mod identity;
 pub mod peer;
 pub mod profile;
 pub mod session;
-// Nothing outside its own tests calls the store yet (Session is ported onto it
-// in the next step); the allow goes away with that wiring.
-#[allow(dead_code)]
 pub mod store;
 
 pub use agent::{AgentConfig, Backend};
