@@ -9,6 +9,7 @@ use crate::llm::ContentBlock;
 pub mod backend;
 pub mod context;
 pub mod file_state;
+mod import;
 pub mod mcp;
 pub mod prompt;
 pub mod skills;
@@ -115,9 +116,22 @@ fn db_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".nudge").join("nudge.db"))
 }
 
+// Every session entry point (new, resume, list) funnels through here: open the
+// shared store and, on first contact, migrate the legacy JSONL layout into it.
+// The marker is set only after a fully successful import, so a crash mid-import
+// retries on the next open (idempotently — imported ids are skipped).
+fn open_store() -> Result<SessionStore> {
+    let mut store = SessionStore::open(&db_path()?)?;
+    if !store.legacy_import_done()? {
+        import::run(&mut store)?;
+        store.mark_legacy_import_done()?;
+    }
+    Ok(store)
+}
+
 pub fn open_new() -> Result<Session> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let store = SessionStore::open(&db_path()?)?;
+    let store = open_store()?;
     Session::create(cwd, store)
 }
 
@@ -125,7 +139,7 @@ pub fn open_new() -> Result<Session> {
 // against this cwd's sessions before opening (see `store::resolve_reference`).
 pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let store = SessionStore::open(&db_path()?)?;
+    let store = open_store()?;
     let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
     Session::open(&id, cwd, store)
 }
@@ -147,7 +161,7 @@ pub struct SessionListing {
 // first. A fresh database yields an empty list (no sessions here yet).
 pub fn list_sessions() -> Result<Vec<SessionListing>> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let store = SessionStore::open(&db_path()?)?;
+    let store = open_store()?;
     store
         .list_by_cwd(&cwd.display().to_string())?
         .into_iter()

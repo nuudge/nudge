@@ -56,20 +56,13 @@ impl SessionState {
 #[derive(Debug, Clone)]
 pub struct SessionRow {
     pub id: String,
-    // The allowed fields are read only by the upcoming importer / lifecycle /
-    // InspectSession consumers; resume and --list use the rest.
-    #[allow(dead_code)]
     pub cwd: String,
     pub name: Option<String>,
     pub branch: Option<String>,
-    #[allow(dead_code)]
     pub created: String,
     pub last_activity: String,
-    #[allow(dead_code)]
     pub state: SessionState,
-    #[allow(dead_code)]
     pub spawned_by: Option<String>,
-    #[allow(dead_code)]
     pub spawn_task: Option<String>,
 }
 
@@ -90,6 +83,16 @@ pub struct MessageRow {
 pub struct SessionListing {
     pub row: SessionRow,
     pub turns: i64,
+}
+
+// One transcript entry to import: like a live append, but with the timestamp
+// recovered from the legacy envelope instead of now(). Ordinals are assigned by
+// slice position in `import_session`.
+pub struct ImportedMessage {
+    pub timestamp: String,
+    pub role: String,
+    pub content: String,
+    pub sender: Option<ClientIdentity>,
 }
 
 impl SessionStore {
@@ -186,6 +189,98 @@ impl SessionStore {
             )
             .optional()
             .with_context(|| format!("loading session {id}"))
+    }
+
+    // Import one legacy session atomically: the full row plus its transcript in
+    // ordinal order, all timestamps the caller's (recovered from the old files,
+    // not now()). Returns false — writing nothing — when the id already exists,
+    // which makes a retried import (crash before the marker was set) skip work
+    // already landed. The transaction means a session is either fully imported
+    // or absent, never half.
+    pub fn import_session(
+        &mut self,
+        row: &SessionRow,
+        messages: &[ImportedMessage],
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("starting import transaction")?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                params![row.id],
+                |_| Ok(()),
+            )
+            .optional()
+            .context("checking for an existing session")?
+            .is_some();
+        if exists {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO sessions (id, cwd, name, branch, created, last_activity, state, spawned_by, spawn_task)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                row.id,
+                row.cwd,
+                row.name,
+                row.branch,
+                row.created,
+                row.last_activity,
+                row.state.as_str(),
+                row.spawned_by,
+                row.spawn_task,
+            ],
+        )
+        .with_context(|| format!("importing session {}", row.id))?;
+        for (ordinal, m) in messages.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO messages
+                   (session_id, ordinal, timestamp, role, content,
+                    sender_kind, sender_name, sender_session_id, sender_task)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.id,
+                    ordinal as i64,
+                    m.timestamp,
+                    m.role,
+                    m.content,
+                    m.sender.as_ref().map(|s| kind_str(&s.kind)),
+                    m.sender.as_ref().map(|s| s.name.as_str()),
+                    m.sender.as_ref().and_then(|s| s.session_id.as_deref()),
+                    m.sender.as_ref().and_then(|s| s.task.as_deref()),
+                ],
+            )
+            .with_context(|| format!("importing message {ordinal} of session {}", row.id))?;
+        }
+        tx.commit().context("committing import")?;
+        Ok(true)
+    }
+
+    // The one-time legacy-JSONL import marker in `meta`. The importer sets it
+    // only after a fully successful run, so a crash mid-import retries.
+    pub fn legacy_import_done(&self) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'legacy_jsonl_import'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .context("reading legacy import marker")?
+            .is_some())
+    }
+
+    pub fn mark_legacy_import_done(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_jsonl_import', ?1)",
+                params![now()],
+            )
+            .context("recording legacy import marker")?;
+        Ok(())
     }
 
     pub fn set_name(&self, id: &str, name: &str, branch: Option<&str>) -> Result<()> {
@@ -486,6 +581,70 @@ mod tests {
         };
         assert!(err.contains("newer nudge"), "unexpected error: {err}");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn legacy_import_marker_round_trips_and_survives_reopen() {
+        let path = temp_db();
+        {
+            let s = SessionStore::open(&path).unwrap();
+            assert!(!s.legacy_import_done().unwrap());
+            s.mark_legacy_import_done().unwrap();
+            assert!(s.legacy_import_done().unwrap());
+        }
+        let s = SessionStore::open(&path).unwrap();
+        assert!(s.legacy_import_done().unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn import_session_is_atomic_and_skips_existing_ids() {
+        let mut s = store();
+        let row = SessionRow {
+            id: "imp".into(),
+            cwd: "/proj".into(),
+            name: Some("old-work".into()),
+            branch: Some("main".into()),
+            created: "2026-01-01T00:00:00+00:00".into(),
+            last_activity: "2026-01-02T00:00:00+00:00".into(),
+            state: SessionState::Ended,
+            spawned_by: None,
+            spawn_task: None,
+        };
+        let messages = vec![
+            ImportedMessage {
+                timestamp: "t1".into(),
+                role: "user".into(),
+                content: "{\"a\":1}".into(),
+                sender: None,
+            },
+            ImportedMessage {
+                timestamp: "t2".into(),
+                role: "assistant".into(),
+                content: "{\"b\":2}".into(),
+                sender: Some(ClientIdentity {
+                    kind: ClientKind::Agent,
+                    name: "child-1".into(),
+                    session_id: None,
+                    task: None,
+                }),
+            },
+        ];
+        assert!(s.import_session(&row, &messages).unwrap());
+
+        let got = s.session("imp").unwrap().unwrap();
+        assert_eq!(got.state, SessionState::Ended);
+        assert_eq!(got.created, "2026-01-01T00:00:00+00:00");
+        assert_eq!(got.last_activity, "2026-01-02T00:00:00+00:00");
+        let rows = s.load_transcript("imp").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, "t1");
+        assert_eq!(rows[0].content, "{\"a\":1}");
+        assert_eq!(rows[1].sender.as_ref().unwrap().name, "child-1");
+
+        // A second import of the same id writes nothing.
+        assert!(!s.import_session(&row, &messages).unwrap());
+        assert_eq!(s.load_transcript("imp").unwrap().len(), 2);
     }
 
     // The load-bearing property: content comes back as the exact bytes stored,
