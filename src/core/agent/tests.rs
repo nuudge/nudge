@@ -1113,7 +1113,7 @@ async fn dismissed_child_is_answerable_from_inspect_session_alone() {
 
     // The tool alone answers what the child did: identity, provenance, final
     // state, and the logged turns.
-    let out = crate::coding::tools::inspect_session::run(
+    let out = crate::coding::tools::inspect_session_run(
         &serde_json::json!({"mode": "inspect", "session": child_id}),
         &SessionStore::open(&db).unwrap(),
         &dir.display().to_string(),

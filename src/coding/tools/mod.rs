@@ -10,9 +10,16 @@ mod create_new;
 mod edit;
 mod glob;
 mod grep;
-pub(crate) mod inspect_session;
+mod inspect_session;
 mod read;
 mod todo_write;
+
+// Test-only seam: the integration test in core::agent::tests drives the tool's
+// `run` against an injected scratch store (production goes through `dispatch` →
+// `execute`, which opens the real one). Gated so the reach-in exists only in
+// test builds.
+#[cfg(test)]
+pub(crate) use inspect_session::run as inspect_session_run;
 
 pub async fn dispatch(
     name: &str,
