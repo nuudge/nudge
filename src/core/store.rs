@@ -71,11 +71,31 @@ pub struct SessionRow {
 #[derive(Debug, Clone)]
 pub struct MessageRow {
     pub ordinal: i64,
-    // Unused until transcript views (--list detail, InspectSession) land.
-    #[allow(dead_code)]
     pub timestamp: String,
     pub content: String,
     pub sender: Option<ClientIdentity>,
+}
+
+// A transcript entry as the inspection view sees it: the stored row plus the
+// denormalized role column and the superseded flag (surfaced only here — the
+// live transcript never returns superseded rows).
+#[derive(Debug, Clone)]
+pub struct InspectRow {
+    pub row: MessageRow,
+    pub role: String,
+    pub superseded: bool,
+}
+
+// One substring-search hit, joined with its session for display context.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub session_name: Option<String>,
+    pub cwd: String,
+    pub ordinal: i64,
+    pub role: String,
+    pub sender_name: Option<String>,
+    pub content: String,
 }
 
 // A session row joined with its live (non-superseded) message count, for --list.
@@ -377,6 +397,52 @@ impl SessionStore {
         Ok(rows)
     }
 
+    // The last `limit` transcript entries in append order, bounded at the SQL
+    // level so inspecting a huge transcript never loads it whole. The audit
+    // view (`include_superseded`) also returns truncated-away rows, flagged.
+    pub fn transcript_tail(
+        &self,
+        session_id: &str,
+        limit: i64,
+        include_superseded: bool,
+    ) -> Result<Vec<InspectRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ordinal, timestamp, content,
+                        sender_kind, sender_name, sender_session_id, sender_task,
+                        role, superseded
+                 FROM messages
+                 WHERE session_id = ?1 AND (?3 OR superseded = 0)
+                 ORDER BY ordinal DESC LIMIT ?2",
+            )
+            .context("preparing transcript tail query")?;
+        let mut rows = stmt
+            .query_map(params![session_id, limit, include_superseded], |r| {
+                Ok(InspectRow {
+                    row: message_row(r)?,
+                    role: r.get(7)?,
+                    superseded: r.get::<_, i64>(8)? != 0,
+                })
+            })
+            .context("querying transcript tail")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .with_context(|| format!("loading transcript tail of session {session_id}"))?;
+        rows.reverse();
+        Ok(rows)
+    }
+
+    // Live (non-superseded) entry count for one session.
+    pub fn turn_count(&self, session_id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND superseded = 0",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("counting turns of session {session_id}"))
+    }
+
     // Strict-truncation bookkeeping: mark every live entry past `last_kept_ordinal`
     // superseded (pass -1 to supersede the whole transcript). The rows stay on
     // disk — truncation narrows the model-facing view, it never unlogs.
@@ -438,6 +504,77 @@ impl SessionStore {
             .context("querying sessions by cwd")?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("listing sessions")?;
+        Ok(rows)
+    }
+
+    // Sessions across every project, most recently active first — the
+    // cross-directory discovery view. Bounded at the SQL level.
+    pub fn list_all(&self, limit: i64) -> Result<Vec<SessionListing>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, s.cwd, s.name, s.branch, s.created, s.last_activity,
+                        s.state, s.spawned_by, s.spawn_task,
+                        (SELECT COUNT(*) FROM messages m
+                         WHERE m.session_id = s.id AND m.superseded = 0) AS turns
+                 FROM sessions s
+                 ORDER BY s.last_activity DESC
+                 LIMIT ?1",
+            )
+            .context("preparing all-projects list query")?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(SessionListing {
+                    row: session_row(r)?,
+                    turns: r.get(9)?,
+                })
+            })
+            .context("querying all sessions")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing all sessions")?;
+        Ok(rows)
+    }
+
+    // Naive substring search over message content (deliberately no FTS or
+    // ranking), most recently active session first. The user's query is escaped
+    // and bound as a single parameter, so `%`/`_` in it match literally.
+    // Searches every row, superseded included — this is the forensics view.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        cwd: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.session_id, s.name, s.cwd, m.ordinal, m.role, m.sender_name, m.content
+                 FROM messages m JOIN sessions s ON s.id = m.session_id
+                 WHERE (?1 IS NULL OR s.cwd = ?1) AND m.content LIKE ?2 ESCAPE '\\'
+                 ORDER BY s.last_activity DESC, m.session_id, m.ordinal
+                 LIMIT ?3",
+            )
+            .context("preparing search query")?;
+        let rows = stmt
+            .query_map(params![cwd, pattern, limit], |r| {
+                Ok(SearchHit {
+                    session_id: r.get(0)?,
+                    session_name: r.get(1)?,
+                    cwd: r.get(2)?,
+                    ordinal: r.get(3)?,
+                    role: r.get(4)?,
+                    sender_name: r.get(5)?,
+                    content: r.get(6)?,
+                })
+            })
+            .context("querying message search")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("searching messages")?;
         Ok(rows)
     }
 }

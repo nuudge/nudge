@@ -10,8 +10,16 @@ mod create_new;
 mod edit;
 mod glob;
 mod grep;
+mod inspect_session;
 mod read;
 mod todo_write;
+
+// Test-only seam: the integration test in core::agent::tests drives the tool's
+// `run` against an injected scratch store (production goes through `dispatch` →
+// `execute`, which opens the real one). Gated so the reach-in exists only in
+// test builds.
+#[cfg(test)]
+pub(crate) use inspect_session::run as inspect_session_run;
 
 pub async fn dispatch(
     name: &str,
@@ -26,6 +34,7 @@ pub async fn dispatch(
         "Grep" => grep::execute(input).await,
         "Glob" => glob::execute(input).await,
         "TodoWrite" => todo_write::execute(input).await,
+        "InspectSession" => inspect_session::execute(input).await,
         other => bail!("unknown tool: {other}"),
     }
 }
@@ -33,7 +42,10 @@ pub async fn dispatch(
 pub fn requires_permission(name: &str) -> bool {
     // Stateless / read-only tools auto-allow; everything that touches the
     // filesystem or runs commands gates on the per-call permission prompt.
-    !matches!(name, "Read" | "Grep" | "Glob" | "TodoWrite")
+    !matches!(
+        name,
+        "Read" | "Grep" | "Glob" | "TodoWrite" | "InspectSession"
+    )
 }
 
 pub fn schemas() -> Vec<Value> {
@@ -45,6 +57,7 @@ pub fn schemas() -> Vec<Value> {
         grep::schema(),
         glob::schema(),
         todo_write::schema(),
+        inspect_session::schema(),
     ]
 }
 
@@ -78,6 +91,10 @@ pub fn roster() -> String {
             "TodoWrite",
             "maintain a structured task list for multi-step work",
         ),
+        (
+            "InspectSession",
+            "read past sessions from the store (inspect one, list, or search history)",
+        ),
     ]
     .iter()
     .map(|(name, snippet)| format!("- {name}: {snippet}"))
@@ -94,6 +111,7 @@ pub fn summarize(name: &str, input: &Value) -> String {
         "Grep" => grep::summarize(input),
         "Glob" => glob::summarize(input),
         "TodoWrite" => todo_write::summarize(input),
+        "InspectSession" => inspect_session::summarize(input),
         _ => format!("{name}({input})"),
     }
 }
