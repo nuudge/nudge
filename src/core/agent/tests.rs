@@ -518,8 +518,10 @@ async fn supervised_check_in_is_steered_to_approval() {
     // tool_choice.
     assert!(checkin.contains("by calling RespondToPeer"), "{checkin}");
 
-    // The exchange is recorded compactly and rests on an assistant turn: the next
-    // human turn arrives after just [check-in, assistant close].
+    // The exchange is recorded as it happened and rests on an assistant turn: the next
+    // human turn arrives after [check-in, RespondToPeer call, its result, close]. The
+    // real call must be in the transcript — a check-in answered by plain text would
+    // teach the model to answer the next one with text instead of the tool.
     ui_tx
         .send((None, UiEvent::UserMessage { text: "hi".into() }))
         .await
@@ -530,9 +532,36 @@ async fn supervised_check_in_is_steered_to_approval() {
         }
     }
     let transcript = seen_messages.lock().unwrap().clone();
-    assert_eq!(transcript.len(), 3, "{transcript:?}");
-    match &transcript[1].content[0] {
-        ContentBlock::Text { text } => {
+    assert_eq!(transcript.len(), 5, "{transcript:?}");
+    let roles: Vec<&str> = transcript.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "user", "assistant", "user"]);
+    match &transcript[1].content[..] {
+        [ContentBlock::ToolUse { id, name, input }] => {
+            assert_eq!(id, "tu1");
+            assert_eq!(name, "RespondToPeer");
+            assert_eq!(input, &serde_json::json!({"verdict": "approve"}));
+        }
+        other => panic!("expected the recorded RespondToPeer call, got {other:?}"),
+    }
+    match &transcript[2].content[..] {
+        [
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            },
+        ] => {
+            assert_eq!(tool_use_id, "tu1");
+            assert!(
+                content.contains("Approved child-1's Bash call"),
+                "{content}"
+            );
+            assert!(!is_error);
+        }
+        other => panic!("expected the call's tool_result, got {other:?}"),
+    }
+    match &transcript[3].content[..] {
+        [ContentBlock::Text { text }] => {
             assert!(text.contains("Approved child-1's Bash call"), "{text}")
         }
         other => panic!("expected the assistant close, got {other:?}"),
