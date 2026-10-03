@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -27,16 +27,16 @@ impl AnthropicProvider {
     // does (true for the current lineup); a pick that turns out wrong surfaces
     // as a normal request error rather than silently misbehaving.
     pub async fn list_models(&self) -> Result<Vec<(String, String)>> {
-        let resp: ModelsResponse = self
+        let resp = self
             .client
             .get(format!("{MODELS_URL}?limit=1000"))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
-            .context("models request failed")?
-            .error_for_status()
-            .context("models endpoint returned error status")?
+            .context("models request failed")?;
+        let resp: ModelsResponse = check_status(resp, "models endpoint")
+            .await?
             .json()
             .await
             .context("failed to parse models response")?;
@@ -90,7 +90,7 @@ impl AnthropicProvider {
 impl Provider for AnthropicProvider {
     async fn complete(&self, req: &Request<'_>) -> Result<Response> {
         let (system, tools, messages) = Self::wire_parts(req);
-        let mut body = json!({
+        let body = json!({
             "model": req.model,
             "system": system,
             "max_tokens": req.max_tokens,
@@ -98,19 +98,7 @@ impl Provider for AnthropicProvider {
             "tools": tools,
             "messages": messages,
         });
-        // A forced tool call is incompatible with (adaptive) thinking — the API
-        // rejects the combination — so the `thinking` field is dropped for it. Body
-        // params sit outside the cached prefix (system/tools/messages), so neither
-        // change costs a cache miss.
-        if let Some(name) = req.tool_choice {
-            let obj = body.as_object_mut().expect("body is an object");
-            obj.insert(
-                "tool_choice".into(),
-                json!({ "type": "tool", "name": name }),
-            );
-            obj.remove("thinking");
-        }
-        let resp: MessagesResponse = self
+        let resp = self
             .client
             .post(API_URL)
             .header("x-api-key", &self.api_key)
@@ -119,9 +107,9 @@ impl Provider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .context("API request failed")?
-            .error_for_status()
-            .context("API returned error status")?
+            .context("API request failed")?;
+        let resp: MessagesResponse = check_status(resp, "API")
+            .await?
             .json()
             .await
             .context("failed to parse API response")?;
@@ -148,7 +136,7 @@ impl Provider for AnthropicProvider {
             "tools": tools,
             "messages": messages,
         });
-        let v: serde_json::Value = self
+        let resp = self
             .client
             .post(COUNT_TOKENS_URL)
             .header("x-api-key", &self.api_key)
@@ -157,9 +145,9 @@ impl Provider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .context("count_tokens request failed")?
-            .error_for_status()
-            .context("count_tokens returned error status")?
+            .context("count_tokens request failed")?;
+        let v: serde_json::Value = check_status(resp, "count_tokens")
+            .await?
             .json()
             .await
             .context("failed to parse count_tokens")?;
@@ -167,6 +155,24 @@ impl Provider for AnthropicProvider {
             .as_u64()
             .context("count_tokens response missing input_tokens")
     }
+}
+
+// Unlike `error_for_status`, keeps the API's error body: its `error.message` is the
+// only place the actual reason for a 4xx (e.g. an unsupported request field) appears.
+async fn check_status(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    bail!("{what} returned {status}: {}", error_detail(&body))
+}
+
+fn error_detail(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string())
 }
 
 #[derive(Deserialize, Debug)]
@@ -269,5 +275,22 @@ mod tests {
     fn models_response_tolerates_empty_data() {
         let resp: ModelsResponse = serde_json::from_str(r#"{"data": []}"#).unwrap();
         assert!(resp.data.is_empty());
+    }
+
+    #[test]
+    fn error_detail_surfaces_the_api_message() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool_choice: type \"tool\" and \"any\" are not supported for this model."}}"#;
+        assert_eq!(
+            error_detail(body),
+            r#"tool_choice: type "tool" and "any" are not supported for this model."#
+        );
+    }
+
+    #[test]
+    fn error_detail_falls_back_to_the_raw_body() {
+        assert_eq!(
+            error_detail("  upstream connect error \n"),
+            "upstream connect error"
+        );
     }
 }

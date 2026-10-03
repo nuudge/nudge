@@ -216,7 +216,6 @@ async fn run_loop<P: Provider, B: Backend>(
                 system,
                 tools,
                 tool_cache_boundary,
-                tool_choice: None,
                 messages: &messages,
             };
 
@@ -502,7 +501,6 @@ async fn dispatch_command<P: Provider, B: Backend>(
                                 system: Vec::new(),
                                 tools: Vec::new(),
                                 tool_cache_boundary: None,
-                                tool_choice: None,
                                 messages: &probe,
                             };
                             provider

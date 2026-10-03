@@ -11,11 +11,12 @@ use crate::llm::{ContentBlock, Message, Provider, Request};
 
 // A supervised peer's check-in, decided by one inference in this agent's OWN loop:
 // the check-in (plus the peer's capped activity digest) is appended to the real
-// `messages`, the model is forced onto `RespondToPeer` via `tool_choice`, and the
-// exchange is recorded compactly (check-in + a one-line assistant close) — which is
-// both why the verdict is informed by full context and how the agent stays aware of
-// its peer on later turns. The request is byte-identical to a normal turn up to
-// `tool_choice`, so it shares the prompt cache.
+// `messages` with an instruction to answer via `RespondToPeer`, and the exchange is
+// recorded compactly (check-in + a one-line assistant close) — which is both why the
+// verdict is informed by full context and how the agent stays aware of its peer on
+// later turns. The request is a normal turn (same tools, thinking on), so it shares
+// the prompt cache. The verdict tool is requested in the prompt rather than forced
+// via `tool_choice`: newer models reject forced tool choice outright.
 //
 // Verdicts: approve → allow; deny → block, and any `message` is delivered as the
 // peer's next instruction (the peer paused on denial, so deny→redirect is one round
@@ -51,6 +52,10 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             text.push_str(line);
         }
     }
+    text.push_str(&format!(
+        "\n\nDecide this check-in now by calling {} with your verdict; call no other tool.",
+        peer_tools::RESPOND_TO_PEER
+    ));
     messages.push(Message {
         role: "user".into(),
         content: vec![ContentBlock::Text { text }],
@@ -66,7 +71,6 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         system: backend.system_blocks(),
         tools,
         tool_cache_boundary,
-        tool_choice: Some(peer_tools::RESPOND_TO_PEER),
         messages,
     };
 
@@ -95,7 +99,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         })
         .await;
 
-    // The forced call guarantees at most one RespondToPeer block; none = malformed.
+    // No RespondToPeer block (plain text, or some other tool) = no verdict.
     let verdict = resp.content.iter().find_map(|b| match b {
         ContentBlock::ToolUse { name, input, .. } if name == peer_tools::RESPOND_TO_PEER => Some((
             input

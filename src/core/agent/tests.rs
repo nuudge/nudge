@@ -514,6 +514,9 @@ async fn supervised_check_in_is_steered_to_approval() {
         checkin.contains("requested Bash: listing files"),
         "{checkin}"
     );
+    // The verdict tool is asked for in the prompt, since newer models reject a forced
+    // tool_choice.
+    assert!(checkin.contains("by calling RespondToPeer"), "{checkin}");
 
     // The exchange is recorded compactly and rests on an assistant turn: the next
     // human turn arrives after just [check-in, assistant close].
