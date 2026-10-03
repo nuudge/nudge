@@ -10,18 +10,19 @@ use crate::core::peer::{PeerFactory, PeerSet};
 use crate::core::session::Session;
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
-// A verdict-less reply is the model not following the instruction, which a second
-// sample usually fixes; a provider error is not retried (it would fail the same way).
+// A verdict-less reply is the model not following the instruction, which a fresh
+// sample can fix; a provider error is not retried (it would fail the same way).
 const VERDICT_ATTEMPTS: usize = 2;
 
 // A supervised peer's check-in, decided by one inference in this agent's OWN loop:
 // the check-in (plus the peer's capped activity digest) is appended to the real
 // `messages` with an instruction to answer via `RespondToPeer`, and the exchange is
-// recorded compactly (check-in + a one-line assistant close) — which is both why the
-// verdict is informed by full context and how the agent stays aware of its peer on
-// later turns. The request is a normal turn (same tools, thinking on), so it shares
-// the prompt cache. The verdict tool is requested in the prompt rather than forced
-// via `tool_choice`: newer models reject forced tool choice outright.
+// recorded as it happened (check-in, the RespondToPeer call, its result, a one-line
+// close) — which is both why the verdict is informed by full context and how the
+// agent stays aware of its peer on later turns. The request is a normal turn (same
+// tools, thinking on), so it shares the prompt cache. The verdict tool is requested
+// in the prompt rather than forced via `tool_choice`: newer models reject forced
+// tool choice outright.
 //
 // Verdicts: approve → allow; deny → block, and any `message` is delivered as the
 // peer's next instruction (the peer paused on denial, so deny→redirect is one round
@@ -103,7 +104,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             }
         }
     }
-    let Some(verdict) = verdict else {
+    let Some(Decision { call, verdict }) = verdict else {
         return escalate_unjudged(
             session,
             messages,
@@ -169,20 +170,41 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             .await;
     }
 
-    // Record the exchange as TWO entries — the check-in (already pushed) and a
-    // synthetic assistant close carrying the decision — not the raw verdict
-    // tool_use/tool_result pair, which is pure API-alternation ceremony. Supervision
-    // bookkeeping is permanent context; at one check-in per gated peer call it would
-    // otherwise dominate the transcript (observed live: 20 entries of scaffolding
-    // around 1 entry of result). The close rests the transcript on an assistant turn
-    // and is session-logged for faithful resume.
-    messages.push(Message {
-        role: "assistant".into(),
-        content: vec![ContentBlock::Text {
-            text: closing.clone(),
-        }],
-    });
-    session.stage(messages.last().unwrap(), None);
+    // Record the exchange as it actually happened: the check-in (already pushed), the
+    // model's real RespondToPeer call, its tool_result, and a one-line close that rests
+    // the transcript on an assistant turn. Faithfulness is load-bearing here, not
+    // tidiness: a check-in recorded as answered by plain text teaches the model, by
+    // example, to answer the next check-in with plain text instead of the tool —
+    // measured on a live transcript, 0/10 verdicts with a few text-only closes in
+    // context vs 10/10 with the real call recorded. Session-logged for faithful resume.
+    let call_id = call.id.clone();
+    for msg in [
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: call.id,
+                name: peer_tools::RESPOND_TO_PEER.into(),
+                input: call.input,
+            }],
+        },
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call_id,
+                content: closing.clone(),
+                is_error: false,
+            }],
+        },
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: closing.clone(),
+            }],
+        },
+    ] {
+        messages.push(msg);
+        session.stage(messages.last().unwrap(), None);
+    }
     *last_good_snapshot = messages.len();
     session.commit()?;
 
@@ -196,20 +218,38 @@ enum Verdict {
     Escalate,
 }
 
+// The model's RespondToPeer call, kept so the transcript can record it verbatim.
+struct VerdictCall {
+    id: String,
+    input: Value,
+}
+
+struct Decision {
+    call: VerdictCall,
+    verdict: Verdict,
+}
+
 // An unknown verdict string counts as no verdict, same as a missing RespondToPeer.
-fn parse_verdict(content: &[ContentBlock]) -> Option<Verdict> {
+fn parse_verdict(content: &[ContentBlock]) -> Option<Decision> {
     content.iter().find_map(|b| match b {
-        ContentBlock::ToolUse { name, input, .. } if name == peer_tools::RESPOND_TO_PEER => {
+        ContentBlock::ToolUse { id, name, input } if name == peer_tools::RESPOND_TO_PEER => {
             let message = input
                 .get("message")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            match input.get("verdict").and_then(Value::as_str) {
-                Some("approve") => Some(Verdict::Approve),
-                Some("deny") => Some(Verdict::Deny(message)),
-                Some("escalate") => Some(Verdict::Escalate),
-                _ => None,
-            }
+            let verdict = match input.get("verdict").and_then(Value::as_str) {
+                Some("approve") => Verdict::Approve,
+                Some("deny") => Verdict::Deny(message),
+                Some("escalate") => Verdict::Escalate,
+                _ => return None,
+            };
+            Some(Decision {
+                call: VerdictCall {
+                    id: id.clone(),
+                    input: input.clone(),
+                },
+                verdict,
+            })
         }
         _ => None,
     })
