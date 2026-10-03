@@ -32,7 +32,9 @@ While the child works:
   picks up as its next input, and anything the parent can't judge — destructive,
   irreversible, off-task — is **escalated to your permission prompt**, named (`peer child-…
   — rm -rf …`), exactly like the parent's own gated calls. The parent cannot approve a
-  spawn's way around you: escalations and spawns always terminate at a human.
+  spawn's way around you: escalations and spawns always terminate at a human. If the
+  parent fails to reach a verdict at all (an API error, or no answer after a retry), the
+  call is escalated to you too, with the reason — never silently denied.
 - **They converse** — either side can message the other (`MessagePeer`); a message arrives
   as the peer's next instruction, so you can have the parent redirect the child mid-task,
   or the child ask its parent a clarifying question.

@@ -105,7 +105,9 @@ pub(super) async fn dispatch_tools<B: Backend>(
             }
         } else {
             denied = true;
-            ("User denied permission to run this tool.".into(), true)
+            // Neutral on purpose: the answer may come from a human or, for a
+            // subagent, from its supervising agent — the loop can't tell which.
+            ("Permission to run this tool was denied.".into(), true)
         };
 
         let _ = agent_tx
