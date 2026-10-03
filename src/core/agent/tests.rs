@@ -514,6 +514,9 @@ async fn supervised_check_in_is_steered_to_approval() {
         checkin.contains("requested Bash: listing files"),
         "{checkin}"
     );
+    // The verdict tool is asked for in the prompt, since newer models reject a forced
+    // tool_choice.
+    assert!(checkin.contains("by calling RespondToPeer"), "{checkin}");
 
     // The exchange is recorded compactly and rests on an assistant turn: the next
     // human turn arrives after just [check-in, assistant close].
@@ -663,16 +666,40 @@ async fn steering_escalates_to_the_human() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A steering call that yields no verdict (here: a plain text response) must deny
-// safely and roll the dangling check-in back — the next human turn starts clean.
+// Answers the escalated PermissionRequest that surfaces on this agent's own stream,
+// returning its summary and the Notices emitted before it.
+async fn answer_escalation(
+    agent_rx: &mut mpsc::Receiver<AgentEvent>,
+    allow: bool,
+) -> (String, Vec<String>) {
+    let mut notices = Vec::new();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest {
+                summary, respond, ..
+            }) => {
+                respond.send(allow).unwrap();
+                return (summary, notices);
+            }
+            Some(AgentEvent::Notice { text }) => notices.push(text),
+            Some(_) => {}
+            None => panic!("loop ended before escalation"),
+        }
+    }
+}
+
+// No verdict on either attempt (plain text both times) is not a silent deny: the call
+// escalates to the human, whose answer reaches the peer, and the dangling check-in is
+// rolled back so the next human turn starts clean.
 #[tokio::test]
-async fn steering_failure_denies_safely_and_rolls_back() {
+async fn steering_without_verdict_retries_then_escalates() {
     let (session, dir) = mk_session();
     let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = ScriptedProvider {
         responses: std::sync::Mutex::new(vec![
             end_turn_response("hmm, tricky"),
+            end_turn_response("still thinking"),
             end_turn_response("ok"),
         ]),
         seen_messages: seen_messages.clone(),
@@ -702,13 +729,25 @@ async fn steering_failure_denies_safely_and_rolls_back() {
         })
         .unwrap();
 
+    let (summary, notices) = answer_escalation(&mut agent_rx, false).await;
+    assert!(summary.contains("peer child-1"), "{summary}");
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("steering returned no valid verdict")),
+        "{notices:?}"
+    );
     match peer_ui.recv().await {
-        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(!allow),
-        other => panic!("expected the safe deny, got {other:?}"),
+        Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
+            assert_eq!(tool_use_id, "t1");
+            assert!(!allow);
+        }
+        other => panic!("expected the human's deny routed to the peer, got {other:?}"),
     }
 
-    // The dangling check-in was rolled back: the next turn's transcript is just the
-    // human message.
+    // Both scripted no-verdict replies were consumed by the two attempts, and the
+    // dangling check-in was rolled back: the next turn's transcript is just the human
+    // message.
     ui_tx
         .send((None, UiEvent::UserMessage { text: "hi".into() }))
         .await
@@ -723,6 +762,61 @@ async fn steering_failure_denies_safely_and_rolls_back() {
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A verdict-less first reply is retried; a verdict on the second attempt decides the
+// check-in normally, without bothering the human.
+#[tokio::test]
+async fn steering_retries_a_missing_verdict() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            end_turn_response("hmm, tricky"),
+            tool_use_response("RespondToPeer", serde_json::json!({"verdict": "approve"})),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: seen_tools.clone(),
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+        })
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(allow),
+        other => panic!("expected the retried approve, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    while let Ok(ev) = agent_rx.try_recv() {
+        assert!(
+            !matches!(ev, AgentEvent::PermissionRequest { .. }),
+            "a recovered verdict must not escalate"
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1931,8 +2025,9 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A steering inference that fails (provider error) safe-denies the peer AND rolls the
-// staged check-in back: nothing about the check-in reaches the JSONL.
+// A steering inference that fails (provider error) is not retried: it escalates to the
+// human at once, whose answer reaches the peer, AND the staged check-in is rolled back
+// so nothing about it reaches the JSONL.
 #[tokio::test]
 async fn steering_failure_leaves_no_checkin_in_the_log() {
     let (session, dir) = mk_session();
@@ -1941,7 +2036,7 @@ async fn steering_failure_leaves_no_checkin_in_the_log() {
     peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
 
     let (ui_tx, ui_rx) = mpsc::channel(16);
-    let (agent_tx, _agent_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
     let task = tokio::spawn(run_agent(
         mk_cfg(),
         FailOnNthProvider {
@@ -1962,10 +2057,18 @@ async fn steering_failure_leaves_no_checkin_in_the_log() {
         })
         .unwrap();
 
-    // The steering inference errors → the peer is safe-denied.
+    // The steering inference errors → escalated (with the reason), and the human's
+    // allow is what the peer receives.
+    let (_, notices) = answer_escalation(&mut agent_rx, true).await;
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("simulated provider failure")),
+        "{notices:?}"
+    );
     match peer_ui.recv().await {
-        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(!allow),
-        other => panic!("expected the safe deny, got {other:?}"),
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(allow),
+        other => panic!("expected the human's allow routed to the peer, got {other:?}"),
     }
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();

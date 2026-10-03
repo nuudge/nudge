@@ -134,8 +134,8 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
         out.push(json!({
             "name": RESPOND_TO_PEER,
             "description": "Deliver your verdict on a subagent's pending permission \
-                check-in. Only meaningful while a check-in is being decided (the call \
-                is forced then); calling it at any other time is an error. Verdicts: \
+                check-in. Only meaningful while a check-in is being decided; calling it \
+                at any other time is an error. Verdicts: \
                 'approve' lets the subagent's tool call run; 'deny' blocks it — set \
                 'message' to explain or redirect (it arrives as the subagent's next \
                 instruction); 'escalate' hands the decision to your own user when you \

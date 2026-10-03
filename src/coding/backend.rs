@@ -322,7 +322,6 @@ pub async fn print_preamble<P: Provider>(
         ),
         tools,
         tool_cache_boundary: boundary,
-        tool_choice: None,
         messages: &probe,
     };
     let sys_only = provider.count_tokens(&req(Vec::new(), None)).await;
