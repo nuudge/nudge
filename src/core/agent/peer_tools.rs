@@ -60,9 +60,9 @@ pub(super) fn requires_permission(name: &str, auto: bool) -> bool {
 // guidance, while an error lets the model read it and delegate in the same turn.
 pub(super) fn auto_mode_refusal(name: &str) -> String {
     format!(
-        "Auto mode is on: you supervise and do not run {name} yourself. Delegate the work \
-         to a subagent with Spawn, or message an existing one with MessagePeer. Read, Grep \
-         and Glob remain available for checking its work."
+        "Auto mode is on: you supervise and do not run {name} yourself. Send the work to \
+         your subagent with MessagePeer, or Spawn one if you have none. Read, Grep and Glob \
+         remain available."
     )
 }
 
@@ -77,11 +77,17 @@ pub(super) fn auto_mode_system_block() -> SystemBlock {
 
 const AUTO_MODE_TEXT: &str = "## Auto mode is on
 
-The user has stepped away and asked you to work hands-off: delegate the work to a subagent and supervise it. Nothing reaches the user until you report — no permission prompts, no escalations.
+The user has stepped away and asked you to work hands-off. Nothing reaches the user until you report — no permission prompts, no escalations. Your own Bash, Edit and CreateNew calls are refused in auto mode; Read, Grep and Glob work.
 
-- Hand each task the user gives you to a subagent with Spawn. Make the task self-contained: the goal, the relevant context from this conversation, constraints, and what to report back. Then end your turn; the subagent's check-ins and report wake you.
-- Supervise; don't do the work yourself. Your own Bash, Edit and CreateNew calls are refused in auto mode. Read, Grep and Glob are fine for checking the subagent's work.
-- For a follow-up on the same work, message the existing subagent with MessagePeer instead of spawning a new one. If the user messages you while a subagent is working, relay what matters to it the same way.
+Deciding what to do with each user message:
+- Answer it yourself when it is conversation, or a question you can answer from what you know or with a quick look using Read, Grep and Glob.
+- Delegate it to your subagent when it changes files or needs commands (builds, tests, git, scripts), or when it is a large investigation whose details you don't need in your own context.
+
+Working with your subagent:
+- Keep one subagent for the whole session. Spawn it the first time you need to delegate, then send every later task to it with MessagePeer, even unrelated ones. Spawn another only if it was dismissed or has ended, or the user asks for parallel work.
+- Dismiss a subagent only when the user asks you to — never just because its task is done.
+- Make each task self-contained: the goal, the relevant context from this conversation, constraints, and what to report back. Then end your turn; the subagent's check-ins and report wake you.
+- If the user messages you while the subagent is working, relay what matters to it with MessagePeer.
 - When the subagent reports, check the result and tell the user what was done. End with a \"Needs you\" list of every step that was skipped for the user to handle, or say there is none.
 
 Deciding check-ins with RespondToPeer (approve or deny — there is no escalate in auto mode):

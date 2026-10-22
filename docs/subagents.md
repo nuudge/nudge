@@ -79,9 +79,11 @@ you. The child messages you when the condition is met.
 Auto mode is for stepping away for hours and coming back to finished work — not to an agent
 stalled on a permission prompt. Other agents ship a global "auto-accept" or "YOLO" mode
 that approves every tool call. nudge's `/auto` keeps judgment switched on instead, by making
-delegation the default: the agent hands each task you give it to a subagent and supervises
-it. The supervisor knows your intent, the conversation, the child's activity and
-`AGENTS.md`, and it decides every check-in itself:
+delegation the default. The agent still answers conversation and questions itself (it can
+read and search the code), but anything that changes files or runs commands goes to a
+subagent it supervises. It keeps that one subagent for the whole session, sending each new
+task to it, and dismisses it only when you ask. The supervisor knows your intent, the
+conversation, the child's activity and `AGENTS.md`, and it decides every check-in itself:
 
 - **approve** — calls that serve the task within the working directory: edits, builds,
   tests, local git operations;
