@@ -21,7 +21,8 @@ subagent spends tokens autonomously). The child it creates is not a stripped-dow
 runner; it is **a full nudge agent**: same tools, its own conversation and session log (it
 shows up in `nudge --list` and can be `--resume`d later), running in the same directory
 under a role prompt that tells it who spawned it and that its one obligation is to deliver
-its result back.
+its result back. It follows the project's `AGENTS.md`, with one adjustment: wherever those
+instructions say to ask the user, it asks its parent instead.
 
 While the child works:
 
