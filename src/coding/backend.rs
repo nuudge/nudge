@@ -51,13 +51,12 @@ impl CodingBackend {
     }
 
     // Reconfigure this backend as a spawned subagent's: `role_preamble` (see
-    // `prompt::subagent_role`) becomes a system block right after the prompt body,
-    // and AGENTS.md is dropped — a subagent runs under its spawner's contract, and
-    // anything project-specific it needs belongs in the authored task. Role by
-    // prompt, not by type: the loop and everything below stay role-free.
+    // `prompt::subagent_role`) becomes a system block right after the prompt body.
+    // AGENTS.md stays: a subagent does real work in the repo, so the repo's
+    // conventions apply to it. Role by prompt, not by type: the loop and everything
+    // below stay role-free.
     pub fn into_subagent(mut self, role_preamble: String) -> Self {
         self.role_preamble = Some(role_preamble);
-        self.agents_md = None;
         self
     }
 }
@@ -344,10 +343,8 @@ pub async fn print_preamble<P: Provider>(
 mod tests {
     use super::*;
 
-    // `into_subagent` installs the role block directly after the prompt body and drops
-    // AGENTS.md — the two halves of the subagent-contract decision.
     #[tokio::test]
-    async fn into_subagent_swaps_agents_md_for_the_role_block() {
+    async fn into_subagent_puts_the_role_block_before_agents_md() {
         let dir = std::env::temp_dir().join(format!("nudge-backend-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("AGENTS.md"), "PROJECT CONVENTIONS").unwrap();
@@ -377,10 +374,8 @@ mod tests {
             "the role block sits directly after the prompt body"
         );
         assert!(
-            !blocks
-                .iter()
-                .any(|b| b.text.contains("PROJECT CONVENTIONS")),
-            "a subagent backend drops AGENTS.md"
+            blocks[2].text.contains("PROJECT CONVENTIONS"),
+            "a subagent backend keeps AGENTS.md, after its role block"
         );
 
         std::fs::remove_dir_all(&dir).ok();
