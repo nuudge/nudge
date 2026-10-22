@@ -14,6 +14,8 @@ pub(super) enum Command {
     Peers,
     // Dial a remote peer over the relay using a pasted pairing code (human-only).
     ConnectPeer(String),
+    // Toggle auto mode: delegate work to a supervised subagent, Spawn ungated.
+    Auto,
     // `/model` with no argument: not an error, but the pickerless path needs a hint.
     ModelUsage,
     // Anything unrecognized, echoed back so the client sees why nothing happened.
@@ -51,8 +53,15 @@ pub(super) fn parse(line: &str) -> Command {
             let arg = line["/connect-peer".len()..].trim();
             Command::ConnectPeer(arg.to_string())
         }
+        Some("/auto") => Command::Auto,
         _ => Command::Unknown(line.to_string()),
     }
+}
+
+// Turning auto mode on pre-approves future Spawn prompts, so only a client that may
+// answer permission prompts may issue it (the broker enforces this).
+pub(crate) fn pre_approves_permissions(line: &str) -> bool {
+    matches!(parse(line), Command::Auto)
 }
 
 // The daemon's command list, advertised in Capabilities so clients render menus
@@ -79,6 +88,10 @@ pub fn command_catalog() -> Vec<CommandInfo> {
             name: "/connect-peer".into(),
             usage: "/connect-peer <pairing-code> — dial a remote peer agent over the relay".into(),
         },
+        CommandInfo {
+            name: "/auto".into(),
+            usage: "/auto — toggle auto mode (delegate work to a supervised subagent)".into(),
+        },
     ]
 }
 
@@ -104,5 +117,14 @@ mod tests {
     #[test]
     fn catalog_advertises_connect_peer() {
         assert!(command_catalog().iter().any(|c| c.name == "/connect-peer"));
+    }
+
+    #[test]
+    fn only_auto_pre_approves_permissions() {
+        assert!(matches!(parse("/auto"), Command::Auto));
+        assert!(pre_approves_permissions(" /auto "));
+        assert!(!pre_approves_permissions("/peers"));
+        assert!(!pre_approves_permissions("/automate"));
+        assert!(command_catalog().iter().any(|c| c.name == "/auto"));
     }
 }

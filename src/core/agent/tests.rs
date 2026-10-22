@@ -72,6 +72,25 @@ impl Provider for ScriptedProvider {
     }
 }
 
+// Plays a fixed sequence of responses, recording every request's system-block texts —
+// for asserting what a mode adds to (or drops from) the system prompt per request.
+struct SystemLogProvider {
+    responses: std::sync::Mutex<Vec<Response>>,
+    seen_system: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+}
+impl Provider for SystemLogProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.seen_system
+            .lock()
+            .unwrap()
+            .push(req.system.iter().map(|b| b.text.clone()).collect());
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
 fn tool_use_response(name: &str, input: Value) -> Response {
     Response {
         content: vec![ContentBlock::ToolUse {
@@ -113,7 +132,7 @@ impl Provider for FailOnNthProvider {
 }
 
 // A no-tool backend: the loop needs a Backend, but these tests exercise input
-// routing (peers, drive edges), not tool dispatch.
+// routing (peers, drive edges), not tool dispatch. Only "GatedTool" needs permission.
 struct FakeBackend;
 impl Backend for FakeBackend {
     fn system_blocks(&self) -> Vec<SystemBlock> {
@@ -125,8 +144,8 @@ impl Backend for FakeBackend {
     fn tool_summary(&self, _name: &str, _input: &Value) -> String {
         String::new()
     }
-    fn requires_permission(&self, _name: &str) -> bool {
-        false
+    fn requires_permission(&self, name: &str) -> bool {
+        name == "GatedTool"
     }
     fn permission_summary(&self, _name: &str, _input: &Value) -> String {
         String::new()
@@ -2633,4 +2652,395 @@ async fn maxed_out_turn_reports_up_the_spawner_edge() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+async fn send_command(ui_tx: &mpsc::Sender<LoopInput>, line: &str) {
+    ui_tx
+        .send((None, UiEvent::Command { line: line.into() }))
+        .await
+        .unwrap();
+}
+
+async fn expect_notice(agent_rx: &mut mpsc::Receiver<AgentEvent>, needle: &str) {
+    match agent_rx.recv().await {
+        Some(AgentEvent::Notice { text }) => assert!(text.contains(needle), "{text}"),
+        other => panic!("expected a Notice containing {needle:?}, got {other:?}"),
+    }
+}
+
+// With /auto on, Spawn runs without a permission prompt, and the auto-mode block rides
+// both the main turn and the steering turn that decides the child's check-in (that is
+// where the check-in policy is applied). Toggling off removes the block again.
+#[tokio::test]
+async fn auto_mode_spawns_unprompted_and_steers_under_the_policy() {
+    let (session, dir) = mk_session();
+    let seen_system = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = SystemLogProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("Spawn", serde_json::json!({"task": "fix the bug"})),
+            end_turn_response("delegated"),
+            tool_use_response("RespondToPeer", serde_json::json!({"verdict": "approve"})),
+            end_turn_response("ok"),
+        ]),
+        seen_system: seen_system.clone(),
+    };
+
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(peer_ctrl)));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            ui_rx,
+            agent_tx,
+            peers: PeerSet::default(),
+            peer_register_rx: None,
+            peer_factory: Some(stub_factory(slot.clone())),
+            peer_dialer: None,
+            self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
+            multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "auto mode on").await;
+
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "fix the bug".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { tool_name, .. }) => {
+                panic!("auto mode must not prompt for {tool_name}")
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+    assert!(slot.lock().unwrap().is_none(), "the factory ran");
+
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "cargo test".into(),
+        })
+        .unwrap();
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(allow),
+        other => panic!("expected the approve routed to the child, got {other:?}"),
+    }
+
+    let requests = seen_system.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "spawn turn, its close, the steering turn"
+    );
+    for system in &requests {
+        assert!(
+            system.iter().any(|t| t.contains("Auto mode is on")),
+            "every request carries the auto block: {system:?}"
+        );
+    }
+
+    // The steering turn's closing Notice may still be queued ahead of the toggle's.
+    send_command(&ui_tx, "/auto").await;
+    drain_until(
+        &mut agent_rx,
+        |ev| matches!(ev, AgentEvent::Notice { text } if text == "auto mode off"),
+    )
+    .await;
+    ui_tx
+        .send((
+            None,
+            UiEvent::UserMessage {
+                text: "thanks".into(),
+            },
+        ))
+        .await
+        .unwrap();
+    drain_until(&mut agent_rx, |ev| matches!(ev, AgentEvent::TurnComplete)).await;
+    let last = seen_system.lock().unwrap().last().unwrap().clone();
+    assert!(
+        !last.iter().any(|t| t.contains("Auto mode is on")),
+        "toggling off drops the block: {last:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A session that cannot spawn (a subagent) has no way to delegate, so /auto is refused
+// rather than silently doing nothing.
+#[tokio::test]
+async fn auto_mode_is_unavailable_without_a_spawn_factory() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "not available").await;
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// AgentIo for an auto-mode test: /auto needs a spawn factory. This one is never called
+// (its slot is empty, so a call would panic).
+fn auto_io(
+    ui_rx: mpsc::Receiver<LoopInput>,
+    agent_tx: mpsc::Sender<AgentEvent>,
+    peers: PeerSet,
+) -> AgentIo {
+    AgentIo {
+        peer_factory: Some(stub_factory(std::sync::Arc::new(std::sync::Mutex::new(
+            None,
+        )))),
+        ..mk_io(ui_rx, agent_tx, peers, None)
+    }
+}
+
+// In auto mode nothing prompts the human: the agent's own gated tool comes back as an
+// error result telling it to delegate (an error, not a denial — so the loop carries on
+// instead of parking for guidance), and DismissPeer runs ungated.
+#[tokio::test]
+async fn auto_mode_never_prompts_the_human() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("GatedTool", serde_json::json!({})),
+            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
+            end_turn_response("delegating instead"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools,
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, peers),
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "auto mode on").await;
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { tool_name, .. }) => {
+                panic!("auto mode must not prompt for {tool_name}")
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    let results: Vec<(String, bool)> = seen_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m.content.clone())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((content, is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(
+        results[0].1 && results[0].0.contains("Auto mode is on"),
+        "the gated tool is refused with a delegate reminder: {results:?}"
+    );
+    assert!(
+        !results[1].1 && results[1].0.contains("dismissed child-1"),
+        "DismissPeer ran ungated: {results:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// In auto mode a deny without a message still tells the child what to do — skip the
+// step and report it — since a denied child otherwise waits for guidance forever.
+#[tokio::test]
+async fn auto_mode_deny_without_message_tells_the_child_to_skip_and_report() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![tool_use_response(
+            "RespondToPeer",
+            serde_json::json!({"verdict": "deny"}),
+        )]),
+        seen_messages,
+        seen_tools,
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, peers),
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "auto mode on").await;
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "$ git push --force".into(),
+        })
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { allow, .. }) => assert!(!allow),
+        other => panic!("expected the deny routed to the child, got {other:?}"),
+    }
+    match peer_ui.recv().await {
+        Some(UiEvent::UserMessage { text }) => assert!(text.contains("Needs you"), "{text}"),
+        other => panic!("expected the skip-and-report message, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// In auto mode escalate is not a verdict: two escalates leave the check-in unjudged,
+// which becomes a deny with the skip-and-report message — never a human prompt.
+#[tokio::test]
+async fn auto_mode_unjudged_check_in_is_skipped_not_escalated() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let escalate =
+        || tool_use_response("RespondToPeer", serde_json::json!({"verdict": "escalate"}));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![escalate(), escalate()]),
+        seen_messages,
+        seen_tools,
+    };
+
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, peer_ev, mut peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, peers),
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "auto mode on").await;
+    peer_ev
+        .send(ControllerEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "$ rm -rf build".into(),
+        })
+        .unwrap();
+
+    match peer_ui.recv().await {
+        Some(UiEvent::PermissionResponse { tool_use_id, allow }) => {
+            assert_eq!(tool_use_id, "t1");
+            assert!(!allow);
+        }
+        other => panic!("expected the deny routed to the child, got {other:?}"),
+    }
+    match peer_ui.recv().await {
+        Some(UiEvent::UserMessage { text }) => {
+            assert!(
+                text.contains("could not judge") && text.contains("Needs you"),
+                "{text}"
+            )
+        }
+        other => panic!("expected the skip-and-report message, got {other:?}"),
+    }
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { .. }) => panic!("auto mode must not escalate"),
+            Some(AgentEvent::Notice { text }) if text.contains("told it to skip") => break,
+            Some(_) => {}
+            None => panic!("expected the skip Notice"),
+        }
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn auto_mode_respond_to_peer_offers_no_escalate() {
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+    let verdicts = |auto| {
+        super::peer_tools::schemas(&peers, &None, auto)
+            .into_iter()
+            .find(|s| s["name"] == "RespondToPeer")
+            .unwrap()["input_schema"]["properties"]["verdict"]["enum"]
+            .clone()
+    };
+    assert_eq!(verdicts(true), serde_json::json!(["approve", "deny"]));
+    assert_eq!(
+        verdicts(false),
+        serde_json::json!(["approve", "deny", "escalate"])
+    );
 }

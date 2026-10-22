@@ -35,7 +35,8 @@ While the child works:
   — rm -rf …`), exactly like the parent's own gated calls. The parent cannot approve a
   spawn's way around you: escalations and spawns always terminate at a human. If the
   parent fails to reach a verdict at all (an API error, or no answer after a retry), the
-  call is escalated to you too, with the reason — never silently denied.
+  call is escalated to you too, with the reason — never silently denied. (In
+  [auto mode](#auto-mode) these become skip-and-report instead, so nothing waits on you.)
 - **They converse** — either side can message the other (`MessagePeer`); a message arrives
   as the peer's next instruction, so you can have the parent redirect the child mid-task,
   or the child ask its parent a clarifying question.
@@ -73,18 +74,33 @@ request — you get the autonomous experience you wanted — while a call that *
 (the child suddenly wanting to `rm` something, or hit a different host) still escalates to
 you. The child messages you when the condition is met.
 
-### A supervised stand-in for "auto mode"
+### Auto mode
 
-Other agents ship a global "auto-accept" or "YOLO" mode that approves every tool call for a
-whole session. nudge has no such toggle, and doesn't need one — a subagent gives the same
-hands-off feel with judgment left switched on. Instead of blanket-approving *everything you
-do*, you delegate a scoped task and let the parent supervise it: routine calls are approved
-automatically, wrong turns get **denied with a correction** the child picks up as its next
-instruction, and only the calls that warrant a human reach you.
+Auto mode is for stepping away for hours and coming back to finished work — not to an agent
+stalled on a permission prompt. Other agents ship a global "auto-accept" or "YOLO" mode
+that approves every tool call. nudge's `/auto` keeps judgment switched on instead, by making
+delegation the default: the agent hands each task you give it to a subagent and supervises
+it. The supervisor knows your intent, the conversation, the child's activity and
+`AGENTS.md`, and it decides every check-in itself:
 
-The difference from a blanket auto mode is the point: it's *supervised* autonomy, not an
-unconditional yes. The rail that routes destructive or off-task calls to a human is still
-there — a subagent can never approve its own way around you.
+- **approve** — calls that serve the task within the working directory: edits, builds,
+  tests, local git operations;
+- **deny with a correction** — wrong turns; the correction is the child's next instruction;
+- **deny with "skip it and report it"** — risky steps such as deletions, `git push` and
+  history rewrites, writes outside the directory, package installs, and network access the
+  task doesn't call for. The child carries on with the rest, and the final report ends with
+  a **Needs you** list of everything skipped.
+
+Nothing waits on you while auto mode is on. There is no escalation to your prompt; a
+check-in the supervisor fails to decide is skipped and reported the same way; spawning and
+dismissing subagents need no approval; and the main agent's own shell and file-writing
+tools are refused with a reminder to delegate. The guarantee is that nothing irreversible
+happens without you — you read about it in the report and do it yourself.
+
+`/auto` toggles; it stays on until you turn it off, and with it off everything behaves as
+described above. Only a client that may answer permission prompts can turn it on — a peer
+agent connected with `/connect-peer` cannot. Subagents follow the project's `AGENTS.md` just
+as the main agent does.
 
 ## The design: an agent is just another client
 
