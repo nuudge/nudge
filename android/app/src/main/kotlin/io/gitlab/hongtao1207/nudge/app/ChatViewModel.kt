@@ -52,6 +52,7 @@ data class SessionContext(
     val gitBranch: String?,
     val sessionId: String,
     val sessionName: String?,
+    val auto: Boolean,
 )
 
 data class ChatUiState(
@@ -324,6 +325,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             event.gitBranch,
                             event.sessionId,
                             event.sessionName,
+                            event.auto,
                         ),
                     )
                 }

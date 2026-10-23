@@ -4,11 +4,12 @@ use super::types::AgentConfig;
 use crate::core::events::AgentEvent;
 use crate::core::session::Session;
 
-// Emit SessionInfo only when the (model, branch, name) tuple changed, so headers track
-// the daemon without an identical event flooding the replay buffer each turn. `branch`
-// — and the session fields — are read by the caller *before* the await: holding
+// Emit SessionInfo only when the (model, branch, name, auto) tuple changed, so headers
+// track the daemon without an identical event flooding the replay buffer each turn.
+// `branch` — and the session fields — are read by the caller *before* the await: holding
 // `&Backend` across it would force a `B: Sync` bound on the whole loop, and holding
 // `&Session` would demand `Sync` of the store connection.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn emit_session_info_if_changed(
     tx: &mpsc::Sender<AgentEvent>,
     model: &str,
@@ -16,9 +17,10 @@ pub(super) async fn emit_session_info_if_changed(
     session_id: String,
     cwd: String,
     session_name: Option<String>,
-    last: &mut (String, Option<String>, Option<String>),
+    auto: bool,
+    last: &mut (String, Option<String>, Option<String>, bool),
 ) {
-    let current = (model.to_string(), branch, session_name);
+    let current = (model.to_string(), branch, session_name, auto);
     if current == *last {
         return;
     }
@@ -30,6 +32,7 @@ pub(super) async fn emit_session_info_if_changed(
             git_branch: current.1,
             session_id,
             session_name: current.2,
+            auto: current.3,
         })
         .await;
 }
@@ -43,7 +46,7 @@ pub(super) async fn finalize_rename(
     cfg: &AgentConfig,
     session: &mut Session,
     tx: &mpsc::Sender<AgentEvent>,
-    last_ctx: &mut (String, Option<String>, Option<String>),
+    last_ctx: &mut (String, Option<String>, Option<String>, bool),
 ) {
     match session.set_name(name.clone(), branch.clone()) {
         Ok(()) => {
@@ -59,6 +62,7 @@ pub(super) async fn finalize_rename(
                 session.id.clone(),
                 session.cwd_display(),
                 session.name.clone(),
+                session.auto,
                 last_ctx,
             )
             .await;

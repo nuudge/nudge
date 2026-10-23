@@ -444,6 +444,7 @@ mod tests {
         App::new(UiConfig {
             session_id: "s".into(),
             session_name: None,
+            auto: false,
             model: "m".into(),
             thinking_display: "".into(),
             pairing_qr: None,
@@ -646,5 +647,31 @@ mod tests {
         app.handle_key(ctrl('w'), &tx);
         assert_eq!(app.input, "hello ");
         assert_eq!(app.cursor, 6);
+    }
+
+    fn header_after_session_info(auto: bool) -> String {
+        let mut app = test_app();
+        app.handle_agent_event(crate::core::ControllerEvent::SessionInfo {
+            model: "m".into(),
+            cwd: "~/p".into(),
+            git_branch: None,
+            session_id: "s".into(),
+            session_name: None,
+            auto,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 10)).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..buf.area.width).map(|x| buf[(x, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn header_shows_auto_badge_only_while_auto_is_on() {
+        let on = header_after_session_info(true);
+        assert!(on.contains(" owner  AUTO  nudge · s"), "{on}");
+        let off = header_after_session_info(false);
+        assert!(!off.contains("AUTO"), "{off}");
+        assert!(off.contains(" owner  nudge · s"), "{off}");
     }
 }

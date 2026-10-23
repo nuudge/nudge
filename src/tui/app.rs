@@ -62,6 +62,7 @@ pub(super) struct App {
     pub(super) status: String,
     pub(super) session_id: String,
     pub(super) session_name: Option<String>,
+    pub(super) auto: bool,
     pub(super) thinking_display: String,
     pub(super) model: String,
     pub(super) cwd_display: String,
@@ -107,6 +108,7 @@ pub(super) struct App {
 pub struct UiConfig {
     pub session_id: String,
     pub session_name: Option<String>,
+    pub auto: bool,
     pub model: String,
     pub thinking_display: String,
     pub pairing_qr: Option<String>,
@@ -152,6 +154,7 @@ impl App {
             status: String::new(),
             session_id: cfg.session_id,
             session_name: cfg.session_name,
+            auto: cfg.auto,
             thinking_display: cfg.thinking_display,
             model: cfg.model,
             cwd_display: String::new(),

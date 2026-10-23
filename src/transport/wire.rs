@@ -461,4 +461,33 @@ mod tests {
             r#"{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}],"peers":[{"name":"child-ab12cd34","kind":"Agent","supervised":true,"session_id":"s1","task":null}]}}"#
         );
     }
+
+    // Pinned for the Kotlin mirror (FramesTest). A frame from a daemon that predates
+    // `auto` has no such key and must still decode, as auto off.
+    #[test]
+    fn session_info_wire_bytes() {
+        use crate::core::ControllerEvent;
+
+        let info = ControllerEvent::SessionInfo {
+            model: "m".into(),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            session_id: "id".into(),
+            session_name: None,
+            auto: true,
+        };
+        assert_eq!(
+            serde_json::to_string(&info).unwrap(),
+            r#"{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id","session_name":null,"auto":true}}"#
+        );
+
+        let legacy: ControllerEvent = serde_json::from_str(
+            r#"{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id","session_name":null}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            ControllerEvent::SessionInfo { auto: false, .. }
+        ));
+    }
 }

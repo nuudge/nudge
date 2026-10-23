@@ -123,12 +123,14 @@ impl App {
                 git_branch,
                 session_id,
                 session_name,
+                auto,
             } => {
                 self.model = model;
                 self.cwd_display = cwd;
                 self.git_branch = git_branch;
                 self.session_id = session_id;
                 self.session_name = session_name;
+                self.auto = auto;
             }
             // The daemon's capability surface — the /model picker renders from this
             // (replayed first on attach), not a compiled-in list. commands/mcp aren't

@@ -355,13 +355,21 @@ impl App {
             )
         };
         let session_label = self.session_name.as_deref().unwrap_or(&self.session_id);
-        let title = Line::from(vec![
-            Span::styled(badge, badge_style),
-            Span::raw(format!(
-                " nudge · {} · {} · {git_tag} · {} · {}",
-                session_label, self.cwd_display, self.model, self.platform
-            )),
-        ]);
+        let mut title_spans = vec![Span::styled(badge, badge_style)];
+        if self.auto {
+            title_spans.push(Span::styled(
+                " AUTO ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        title_spans.push(Span::raw(format!(
+            " nudge · {} · {} · {git_tag} · {} · {}",
+            session_label, self.cwd_display, self.model, self.platform
+        )));
+        let title = Line::from(title_spans);
         let log = log_paragraph
             .block(Block::default().borders(Borders::ALL).title(title))
             .scroll((self.scroll, 0));

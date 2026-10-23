@@ -53,6 +53,7 @@ pub enum AgentEvent {
         // The human label set via /session-rename, or None if the session is
         // still nameless. Controllers prefer it over `session_id` in the header.
         session_name: Option<String>,
+        auto: bool,
     },
     // The daemon's capability surface (commands, models, MCP catalog, peer roster).
     // Seeded into the replay buffer next to SessionInfo and re-emitted when the
@@ -136,6 +137,9 @@ pub enum ControllerEvent {
         // Human label set via /session-rename (None when nameless). Rendered in
         // place of the uuid in the header so a resumed session is recognizable.
         session_name: Option<String>,
+        // Defaulted so a newer client still decodes frames from an older daemon.
+        #[serde(default)]
+        auto: bool,
     },
     // The daemon's capability surface — see AgentEvent::Capabilities. Seeded into
     // the replay buffer next to SessionInfo and re-emitted on surface change.
