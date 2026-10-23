@@ -4,9 +4,13 @@ use std::path::Path;
 
 use crate::core::identity::{ClientIdentity, ClientKind};
 
-// Bump when the schema changes; `open` refuses a database from a NEWER version
-// (an older binary must not scribble on a schema it doesn't understand) and will
-// host forward migrations for older ones once any exist.
+// Bump when the schema changes in a way an older binary can't safely ignore; `open`
+// refuses a database from a NEWER version (an older binary must not scribble on a
+// schema it doesn't understand) and will host forward migrations for older ones once
+// any exist. A new column with a default is NOT such a change: every query names its
+// columns, so older binaries never see it. Those are added in place by
+// `add_missing_columns` without a bump, which keeps older binaries working against
+// the shared database.
 const SCHEMA_VERSION: i64 = 1;
 
 // The relational session store (issue #26): one SQLite database owning every
@@ -172,6 +176,7 @@ impl SessionStore {
             }
             Some(v) => bail!("no migration path from session store schema version {v}"),
         }
+        add_missing_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -314,6 +319,31 @@ impl SessionStore {
             .with_context(|| format!("renaming session {id}"))?;
         if n == 0 {
             bail!("cannot rename: no session {id} in the store");
+        }
+        Ok(())
+    }
+
+    // Whether auto mode was on when the session last toggled it, so a resume restores it.
+    pub fn auto(&self, id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT auto FROM sessions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("reading auto mode of session {id}"))
+    }
+
+    pub fn set_auto(&self, id: &str, on: bool) -> Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE sessions SET auto = ?2 WHERE id = ?1",
+                params![id, on],
+            )
+            .with_context(|| format!("saving auto mode of session {id}"))?;
+        if n == 0 {
+            bail!("cannot save auto mode: no session {id} in the store");
         }
         Ok(())
     }
@@ -716,6 +746,27 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     })
 }
 
+// Columns added after a database may already exist (see SCHEMA_VERSION). Each is
+// added in place when missing; SCHEMA carries them too, for fresh databases.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    const ADDED: &[(&str, &str)] = &[("auto", "INTEGER NOT NULL DEFAULT 0")];
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")
+        .context("reading sessions columns")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .context("reading sessions columns")?
+        .collect::<rusqlite::Result<_>>()
+        .context("reading sessions columns")?;
+    for (name, decl) in ADDED {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {name} {decl}"))
+                .with_context(|| format!("adding sessions.{name}"))?;
+        }
+    }
+    Ok(())
+}
+
 const SCHEMA: &str = "
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
@@ -731,7 +782,8 @@ CREATE TABLE sessions (
     last_activity TEXT NOT NULL,
     state         TEXT NOT NULL DEFAULT 'running',
     spawned_by    TEXT REFERENCES sessions(id),
-    spawn_task    TEXT
+    spawn_task    TEXT,
+    auto          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX sessions_cwd ON sessions(cwd, last_activity DESC);
 CREATE INDEX sessions_name ON sessions(name) WHERE name IS NOT NULL;
@@ -795,6 +847,58 @@ mod tests {
             Ok(_) => panic!("open of a newer-schema store must fail"),
         };
         assert!(err.contains("newer nudge"), "unexpected error: {err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn auto_defaults_off_and_round_trips() {
+        let s = store();
+        s.insert_session("a", "/proj", None, None).unwrap();
+        assert!(!s.auto("a").unwrap());
+        s.set_auto("a", true).unwrap();
+        assert!(s.auto("a").unwrap());
+        assert!(s.set_auto("missing", true).is_err());
+    }
+
+    // A database created before the auto column existed gets it on open, keeps its
+    // schema version (so older binaries can still open it), and its rows read as off.
+    #[test]
+    fn open_adds_the_auto_column_to_an_older_database() {
+        let path = temp_db();
+        {
+            let conn = Connection::open(&path).unwrap();
+            let without_auto = SCHEMA.replace(
+                "spawn_task    TEXT,\n    auto          INTEGER NOT NULL DEFAULT 0",
+                "spawn_task    TEXT",
+            );
+            assert_ne!(without_auto, SCHEMA, "the replace must strip the column");
+            conn.execute_batch(&without_auto).unwrap();
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, created, last_activity) VALUES ('old', '/p', 't', 't')",
+                [],
+            )
+            .unwrap();
+        }
+        let s = SessionStore::open(&path).unwrap();
+        assert!(!s.auto("old").unwrap());
+        s.set_auto("old", true).unwrap();
+        assert!(s.auto("old").unwrap());
+        let version: String = s
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+        drop(s);
+        SessionStore::open(&path).expect("reopening after the column exists is a no-op");
         std::fs::remove_file(&path).ok();
     }
 

@@ -20,6 +20,7 @@ pub(super) async fn dispatch_tools<B: Backend>(
     peers: &mut PeerSet,
     factory: &Option<PeerFactory>,
     self_handle: &BrokerHandle,
+    auto: bool,
 ) -> (Vec<ContentBlock>, bool) {
     let mut tool_results: Vec<ContentBlock> = Vec::new();
     let mut denied = false;
@@ -65,49 +66,53 @@ pub(super) async fn dispatch_tools<B: Backend>(
         // Spawn gates (autonomous token-spend), MessagePeer auto-allows (conversation;
         // the peer's own gates apply). Backend tools keep their own classification.
         let needs_permission = if is_peer_tool {
-            peer_tools::requires_permission(name)
+            peer_tools::requires_permission(name, auto)
         } else {
             backend.requires_permission(name)
         };
-        let allowed = if needs_permission {
-            let summary = if is_peer_tool {
-                peer_tools::permission_summary(name, input)
-            } else {
-                backend.permission_summary(name, input)
-            };
-            let (tx, rx) = oneshot::channel();
-            if agent_tx
-                .send(AgentEvent::PermissionRequest {
-                    tool_use_id: id.clone(),
-                    tool_name: name.clone(),
-                    summary,
-                    respond: tx,
-                })
-                .await
-                .is_err()
-            {
-                return (tool_results, true);
-            }
-            rx.await.unwrap_or(false)
+        let (content, is_error) = if auto && needs_permission {
+            (peer_tools::auto_mode_refusal(name), true)
         } else {
-            true
-        };
+            let allowed = if needs_permission {
+                let summary = if is_peer_tool {
+                    peer_tools::permission_summary(name, input)
+                } else {
+                    backend.permission_summary(name, input)
+                };
+                let (tx, rx) = oneshot::channel();
+                if agent_tx
+                    .send(AgentEvent::PermissionRequest {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        summary,
+                        respond: tx,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return (tool_results, true);
+                }
+                rx.await.unwrap_or(false)
+            } else {
+                true
+            };
 
-        let (content, is_error) = if allowed {
-            let outcome = if is_peer_tool {
-                peer_tools::execute(name, input, peers, factory, self_handle).await
+            if allowed {
+                let outcome = if is_peer_tool {
+                    peer_tools::execute(name, input, peers, factory, self_handle).await
+                } else {
+                    backend.execute(name, input, agent_tx).await
+                };
+                match outcome {
+                    Ok(c) => (c, false),
+                    Err(e) => (format!("Tool execution error: {e:#}"), true),
+                }
             } else {
-                backend.execute(name, input, agent_tx).await
-            };
-            match outcome {
-                Ok(c) => (c, false),
-                Err(e) => (format!("Tool execution error: {e:#}"), true),
+                denied = true;
+                // Neutral on purpose: the answer may come from a human or, for a
+                // subagent, from its supervising agent — the loop can't tell which.
+                ("Permission to run this tool was denied.".into(), true)
             }
-        } else {
-            denied = true;
-            // Neutral on purpose: the answer may come from a human or, for a
-            // subagent, from its supervising agent — the loop can't tell which.
-            ("Permission to run this tool was denied.".into(), true)
         };
 
         let _ = agent_tx

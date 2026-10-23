@@ -14,6 +14,13 @@ use crate::llm::{ContentBlock, Message, Provider, Request};
 // sample can fix; a provider error is not retried (it would fail the same way).
 const VERDICT_ATTEMPTS: usize = 2;
 
+const SKIP_AND_REPORT: &str = "Your supervisor did not approve that call. Skip that step, \
+    continue with the rest of the task, and list the skipped step under \"Needs you\" in \
+    your final report.";
+const UNJUDGED_SKIP_AND_REPORT: &str = "Your supervisor could not judge that call. Skip \
+    that step, continue with the rest of the task, and list the skipped step under \"Needs \
+    you\" in your final report.";
+
 // A supervised peer's check-in, decided by one inference in this agent's OWN loop:
 // the check-in (plus the peer's capped activity digest) is appended to the real
 // `messages` with an instruction to answer via `RespondToPeer`, and the exchange is
@@ -29,6 +36,11 @@ const VERDICT_ATTEMPTS: usize = 2;
 // trip); escalate → the request surfaces on this agent's own broker, named, and the
 // human's answer is routed down. No verdict (provider failure, or none after
 // VERDICT_ATTEMPTS) → escalate as well, with the check-in rolled back.
+//
+// In auto mode nothing waits on the absent human: there is no escalate verdict, a deny
+// always carries a message (a denied peer otherwise waits for guidance that never
+// comes), and an unjudged check-in becomes a deny telling the peer to skip the step
+// and report it.
 #[allow(clippy::too_many_arguments)] // internal seam; mirrors the loop's own state
 pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     cfg: &AgentConfig,
@@ -40,6 +52,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     peers: &mut PeerSet,
     agent_tx: &mpsc::Sender<AgentEvent>,
     factory: &Option<PeerFactory>,
+    auto: bool,
     checkin: CheckIn,
 ) -> Result<()> {
     let name = peers.display_name(checkin.pid);
@@ -69,12 +82,16 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     session.stage(messages.last().unwrap(), None);
 
     let (mut tools, tool_cache_boundary) = backend.tool_schemas();
-    tools.extend(peer_tools::schemas(peers, factory));
+    tools.extend(peer_tools::schemas(peers, factory, auto));
+    let mut system = backend.system_blocks();
+    if auto {
+        system.push(peer_tools::auto_mode_system_block());
+    }
     let req = Request {
         model: &cfg.model,
         max_tokens: cfg.max_tokens,
         thinking_display: &cfg.thinking_display,
-        system: backend.system_blocks(),
+        system,
         tools,
         tool_cache_boundary,
         messages,
@@ -93,7 +110,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
                         cache_read: resp.usage.cache_read_input_tokens,
                     })
                     .await;
-                verdict = parse_verdict(&resp.content);
+                verdict = parse_verdict(&resp.content, auto);
                 if verdict.is_some() {
                     break;
                 }
@@ -105,7 +122,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         }
     }
     let Some(Decision { call, verdict }) = verdict else {
-        return escalate_unjudged(
+        return settle_unjudged(
             session,
             messages,
             *last_good_snapshot,
@@ -114,6 +131,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             &checkin,
             &name,
             &failure,
+            auto,
         )
         .await;
     };
@@ -125,6 +143,9 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             format!("Approved {name}'s {} call.", checkin.tool_name),
         ),
         Verdict::Deny(message) => {
+            let message = message
+                .filter(|m| !m.is_empty())
+                .or_else(|| auto.then(|| SKIP_AND_REPORT.to_string()));
             let closing = match &message {
                 Some(m) => format!(
                     "Denied {name}'s {} call and redirected it: {m}",
@@ -229,8 +250,9 @@ struct Decision {
     verdict: Verdict,
 }
 
-// An unknown verdict string counts as no verdict, same as a missing RespondToPeer.
-fn parse_verdict(content: &[ContentBlock]) -> Option<Decision> {
+// An unknown verdict string counts as no verdict, same as a missing RespondToPeer. So
+// does escalate in auto mode, where it is not offered.
+fn parse_verdict(content: &[ContentBlock], auto: bool) -> Option<Decision> {
     content.iter().find_map(|b| match b {
         ContentBlock::ToolUse { id, name, input } if name == peer_tools::RESPOND_TO_PEER => {
             let message = input
@@ -240,7 +262,7 @@ fn parse_verdict(content: &[ContentBlock]) -> Option<Decision> {
             let verdict = match input.get("verdict").and_then(Value::as_str) {
                 Some("approve") => Verdict::Approve,
                 Some("deny") => Verdict::Deny(message),
-                Some("escalate") => Verdict::Escalate,
+                Some("escalate") if !auto => Verdict::Escalate,
                 _ => return None,
             };
             Some(Decision {
@@ -271,10 +293,12 @@ async fn ask_human(agent_tx: &mpsc::Sender<AgentEvent>, checkin: &CheckIn, name:
 
 // Steering could not produce a verdict. Failing to decide is not a "no": denying here
 // would hand the peer an unexplained refusal while this agent's transcript keeps no
-// trace of it, so the call goes to the human exactly like an explicit escalate. The
-// check-in is rolled back so the next real turn lands on a valid boundary.
+// trace of it, so the call goes to the human exactly like an explicit escalate. In auto
+// mode there is no human to ask, so the peer is denied with an explicit skip-and-report
+// instruction instead and the human's session gets a Notice. Either way the check-in is
+// rolled back so the next real turn lands on a valid boundary.
 #[allow(clippy::too_many_arguments)] // internal seam; mirrors run_steering_turn's state
-async fn escalate_unjudged(
+async fn settle_unjudged(
     session: &mut Session,
     messages: &mut Vec<Message>,
     last_good_snapshot: usize,
@@ -283,9 +307,38 @@ async fn escalate_unjudged(
     checkin: &CheckIn,
     name: &str,
     reason: &str,
+    auto: bool,
 ) -> Result<()> {
     messages.truncate(last_good_snapshot);
     session.rollback();
+    if auto {
+        let _ = agent_tx
+            .send(AgentEvent::Notice {
+                text: format!(
+                    "couldn't decide peer {name}'s {} call ({reason}) — told it to skip the step and report it",
+                    checkin.tool_name
+                ),
+            })
+            .await;
+        peers
+            .drive(
+                checkin.pid,
+                UiEvent::PermissionResponse {
+                    tool_use_id: checkin.tool_use_id.clone(),
+                    allow: false,
+                },
+            )
+            .await;
+        peers
+            .drive(
+                checkin.pid,
+                UiEvent::UserMessage {
+                    text: UNJUDGED_SKIP_AND_REPORT.into(),
+                },
+            )
+            .await;
+        return Ok(());
+    }
     let _ = agent_tx
         .send(AgentEvent::Notice {
             text: format!(

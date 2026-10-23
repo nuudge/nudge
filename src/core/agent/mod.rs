@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::events::{AgentEvent, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerDialer, PeerSet};
+use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{ContentBlock, Message, Provider, Request};
 
@@ -18,6 +18,7 @@ mod supervision;
 mod tests;
 mod types;
 
+pub(crate) use command::pre_approves_permissions;
 pub use command::{McpCommand, command_catalog};
 pub use types::{AgentConfig, AgentIo, Backend, LoopInput};
 
@@ -79,6 +80,14 @@ async fn run_loop<P: Provider, B: Backend>(
     // OUTER loop: one iteration per user turn.
     // A coalesce over-read stashes one input here; the next turn consumes it first.
     let mut pending_input: Option<LoopInput> = None;
+    let mut auto = session.auto;
+    if auto {
+        let _ = agent_tx
+            .send(AgentEvent::Notice {
+                text: "auto mode is on (restored from the last run) — /auto turns it off".into(),
+            })
+            .await;
+    }
     loop {
         let (who, mut user_text) = loop {
             let input = match pending_input.take() {
@@ -127,6 +136,7 @@ async fn run_loop<P: Provider, B: Backend>(
                                 &mut peers,
                                 &agent_tx,
                                 &peer_factory,
+                                auto,
                                 checkin,
                             )
                             .await?;
@@ -156,6 +166,8 @@ async fn run_loop<P: Provider, B: Backend>(
                         &mut last_session_ctx,
                         &self_handle,
                         &peer_dialer,
+                        &peer_factory,
+                        &mut auto,
                     )
                     .await;
                 }
@@ -201,13 +213,16 @@ async fn run_loop<P: Provider, B: Backend>(
             let (mut tools, tool_cache_boundary) = backend.tool_schemas();
             // Loop-level peer tools ride after the backend's array (never inside the
             // cached stable prefix); offered per capability (factory / held peers).
-            tools.extend(peer_tools::schemas(&peers, &peer_factory));
+            tools.extend(peer_tools::schemas(&peers, &peer_factory, auto));
             // The peer roster rides as a trailing, uncached system block after the
             // backend's volatile env breakpoint, so the model knows whom it can address
             // and a peer joining/leaving never busts the cached stable prefix.
             let mut system = backend.system_blocks();
             if let Some(text) = peer_tools::roster_system_text(&peers) {
                 system.push(crate::llm::SystemBlock { text, cache: false });
+            }
+            if auto {
+                system.push(peer_tools::auto_mode_system_block());
             }
             let req = Request {
                 model: &cfg.model,
@@ -292,6 +307,7 @@ async fn run_loop<P: Provider, B: Backend>(
                 &mut peers,
                 &peer_factory,
                 &self_handle,
+                auto,
             )
             .await;
             // A Spawn/DismissPeer in the batch changed the roster — re-advertise it.
@@ -344,6 +360,8 @@ async fn run_loop<P: Provider, B: Backend>(
                                 &mut last_session_ctx,
                                 &self_handle,
                                 &peer_dialer,
+                                &peer_factory,
+                                &mut auto,
                             )
                             .await;
                         }
@@ -462,8 +480,34 @@ async fn dispatch_command<P: Provider, B: Backend>(
     last_session_ctx: &mut (String, Option<String>, Option<String>),
     self_handle: &BrokerHandle,
     peer_dialer: &Option<PeerDialer>,
+    peer_factory: &Option<PeerFactory>,
+    auto: &mut bool,
 ) {
     match command::parse(line) {
+        // Auto mode delegates through Spawn, so an agent that cannot spawn (a subagent)
+        // has nothing to turn on.
+        Command::Auto => {
+            let text = if peer_factory.is_none() {
+                "auto mode is not available in this session (it cannot spawn subagents)"
+            } else {
+                *auto = !*auto;
+                if let Err(e) = session.set_auto(*auto) {
+                    let _ = agent_tx
+                        .send(AgentEvent::Error {
+                            message: format!("couldn't save auto mode for resume: {e:#}"),
+                        })
+                        .await;
+                }
+                if *auto {
+                    "auto mode on — work is delegated to a supervised subagent and nothing waits on you; skipped steps are listed in the report"
+                } else {
+                    "auto mode off"
+                }
+            };
+            let _ = agent_tx
+                .send(AgentEvent::Notice { text: text.into() })
+                .await;
+        }
         Command::SetModel(model) => {
             cfg.model = model;
             emit_session_info_if_changed(

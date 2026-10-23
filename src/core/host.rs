@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
+use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, run_agent};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::{ClientIdentity, ClientKind};
 use super::peer::PeerWiring;
@@ -468,7 +468,10 @@ fn verb_allowed(profile: &ClientProfile, ev: &UiEvent) -> bool {
     match ev {
         UiEvent::Quit => profile.may_quit,
         UiEvent::UserMessage { .. } => profile.may_drive,
-        UiEvent::Command { .. } => matches!(profile.commands, CommandScope::All),
+        UiEvent::Command { line } => {
+            matches!(profile.commands, CommandScope::All)
+                && (profile.may_answer_permissions || !pre_approves_permissions(line))
+        }
         _ => true,
     }
 }
@@ -1142,6 +1145,57 @@ mod tests {
         match loop_ui_rx.recv().await {
             Some((_, UiEvent::Command { line })) => assert_eq!(line, "/mcp"),
             other => panic!("loop expected human Command, got {other:?}"),
+        }
+
+        ctl_tx.send(HostCommand::Quit).unwrap();
+        broker_task.await.unwrap();
+    }
+
+    // /auto pre-approves Spawn prompts, so a client with command rights but no right to
+    // answer prompts (a remote peer agent) is refused it, while its other commands pass.
+    #[tokio::test]
+    async fn auto_needs_the_right_to_answer_permissions() {
+        let (loop_ui_tx, mut loop_ui_rx) = mpsc::channel::<LoopInput>(8);
+        let (_loop_agent_tx, loop_agent_rx) = mpsc::channel::<AgentEvent>(8);
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel::<HostCommand>();
+        let broker_task = tokio::spawn(broker(
+            loop_ui_tx,
+            loop_agent_rx,
+            ctl_rx,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+        ));
+
+        let (mut peer, p_ui) = try_attach_with(&ctl_tx, ClientProfile::agent()).await;
+        let (_human, h_ui) = try_attach(&ctl_tx).await;
+
+        p_ui.send(UiEvent::Command {
+            line: "/auto".into(),
+        })
+        .await
+        .unwrap();
+        match peer.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("peer expected refusal Notice, got {other:?}"),
+        }
+        p_ui.send(UiEvent::Command {
+            line: "/peers".into(),
+        })
+        .await
+        .unwrap();
+        match loop_ui_rx.recv().await {
+            Some((_, UiEvent::Command { line })) => assert_eq!(line, "/peers"),
+            other => panic!("loop expected the peer's /peers, got {other:?}"),
+        }
+
+        h_ui.send(UiEvent::Command {
+            line: "/auto".into(),
+        })
+        .await
+        .unwrap();
+        match loop_ui_rx.recv().await {
+            Some((_, UiEvent::Command { line })) => assert_eq!(line, "/auto"),
+            other => panic!("loop expected human /auto, got {other:?}"),
         }
 
         ctl_tx.send(HostCommand::Quit).unwrap();

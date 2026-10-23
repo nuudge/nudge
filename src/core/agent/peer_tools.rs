@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use super::super::events::UiEvent;
 use super::super::host::BrokerHandle;
 use super::super::peer::{PeerFactory, PeerSet};
+use crate::llm::SystemBlock;
 
 // The loop-level peer tools. They live here — not on the `Backend` — because the
 // `PeerSet` is the loop's own state: the backend stays peer-ignorant, and the loop
@@ -45,12 +46,54 @@ pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
 }
 
 // Spawning is autonomous token-spending and dismissal destroys a child's in-memory
-// context (in-flight work stops) — the human gates both lifecycle actions. Messaging
-// is conversation (the addressee's own gates apply to whatever it causes), and a
-// RespondToPeer verdict IS the supervision decision — gating it would just re-ask.
-pub(super) fn requires_permission(name: &str) -> bool {
-    name == SPAWN || name == DISMISS_PEER
+// context (in-flight work stops) — the human gates both lifecycle actions. In auto
+// mode nothing waits on the human: turning it on is their consent to delegation, and
+// finished children must be dismissable unattended. Messaging is conversation (the
+// addressee's own gates apply to whatever it causes), and a RespondToPeer verdict IS
+// the supervision decision — gating it would just re-ask.
+pub(super) fn requires_permission(name: &str, auto: bool) -> bool {
+    !auto && (name == SPAWN || name == DISMISS_PEER)
 }
+
+// In auto mode the agent's own gated tools are refused instead of prompting the human.
+// This is an error result, not a denial: a denial parks the loop waiting for human
+// guidance, while an error lets the model read it and delegate in the same turn.
+pub(super) fn auto_mode_refusal(name: &str) -> String {
+    format!(
+        "Auto mode is on: you supervise and do not run {name} yourself. Send the work to \
+         your subagent with MessagePeer, or Spawn one if you have none. Read, Grep and Glob \
+         remain available."
+    )
+}
+
+// Trailing and uncached like the roster block, so toggling auto mode never busts the
+// cached stable prefix.
+pub(super) fn auto_mode_system_block() -> SystemBlock {
+    SystemBlock {
+        text: AUTO_MODE_TEXT.into(),
+        cache: false,
+    }
+}
+
+const AUTO_MODE_TEXT: &str = "## Auto mode is on
+
+The user has stepped away and asked you to work hands-off. Nothing reaches the user until you report — no permission prompts, no escalations. Your own Bash, Edit and CreateNew calls are refused in auto mode; Read, Grep and Glob work.
+
+Deciding what to do with each user message:
+- Answer it yourself when it is conversation, or a question you can answer from what you know or with a quick look using Read, Grep and Glob.
+- Delegate it to your subagent when it changes files or needs commands (builds, tests, git, scripts), or when it is a large investigation whose details you don't need in your own context.
+
+Working with your subagent:
+- Keep one subagent for the whole session. Spawn it the first time you need to delegate, then send every later task to it with MessagePeer, even unrelated ones. Spawn another only if it was dismissed or has ended, or the user asks for parallel work.
+- Dismiss a subagent only when the user asks you to — never just because its task is done.
+- Make each task self-contained: the goal, the relevant context from this conversation, constraints, and what to report back. Then end your turn; the subagent's check-ins and report wake you.
+- If the user messages you while the subagent is working, relay what matters to it with MessagePeer.
+- When the subagent reports, check the result and tell the user what was done. End with a \"Needs you\" list of every step that was skipped for the user to handle, or say there is none.
+
+Deciding check-ins with RespondToPeer (approve or deny — there is no escalate in auto mode):
+- approve: calls that serve the assigned task and stay within the working directory — edits, builds, tests, read-only commands, local git operations such as add, commit, and diff.
+- deny, with a message saying what to do instead: off-task work, retrying an approach that already failed, anything against the project instructions.
+- deny, with a message to skip the step, continue with the rest, and list it under \"Needs you\" in its report: deleting anything the task did not create, git push or history rewrites (reset --hard, rebase, force), writes outside the working directory, installing or upgrading packages, network access to hosts the task doesn't call for, and anything irreversible or that you are unsure about.";
 
 pub(super) fn permission_summary(name: &str, input: &Value) -> String {
     match name {
@@ -70,7 +113,7 @@ pub(super) fn permission_summary(name: &str, input: &Value) -> String {
 // when a factory was injected (a top-level agent); `MessagePeer` whenever a peer is
 // held or could be spawned. A factory-less, peerless agent advertises nothing.
 // Placed after the backend's tools, so the stable cached prefix is never invalidated.
-pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Value> {
+pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool) -> Vec<Value> {
     let mut out = Vec::new();
     if factory.is_some() {
         out.push(json!({
@@ -131,22 +174,31 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>) -> Vec<Val
         }));
     }
     if peers.has_supervised() {
+        // Auto mode drops escalate: nothing may wait on the absent human, so a risky
+        // call is denied with a skip-and-report message instead.
+        let (verdicts, escalate_text) = if auto {
+            (json!(["approve", "deny"]), "")
+        } else {
+            (
+                json!(["approve", "deny", "escalate"]),
+                " 'escalate' hands the decision to your own user when you cannot judge \
+                 it (irreversible actions, unclear intent, anything destructive).",
+            )
+        };
         out.push(json!({
             "name": RESPOND_TO_PEER,
-            "description": "Deliver your verdict on a subagent's pending permission \
+            "description": format!("Deliver your verdict on a subagent's pending permission \
                 check-in. Only meaningful while a check-in is being decided; calling it \
                 at any other time is an error. Verdicts: \
                 'approve' lets the subagent's tool call run; 'deny' blocks it — set \
                 'message' to explain or redirect (it arrives as the subagent's next \
-                instruction); 'escalate' hands the decision to your own user when you \
-                cannot judge it (irreversible actions, unclear intent, anything \
-                destructive).",
+                instruction).{escalate_text}"),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "verdict": {
                         "type": "string",
-                        "enum": ["approve", "deny", "escalate"]
+                        "enum": verdicts
                     },
                     "message": {
                         "type": "string",
