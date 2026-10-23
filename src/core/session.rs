@@ -14,6 +14,8 @@ pub struct Session {
     // is pure metadata on the session row, so renaming never touches the
     // transcript or breaks resume.
     pub name: Option<String>,
+    // Auto mode as last toggled, persisted on the row so a resume restores it.
+    pub auto: bool,
     store: SessionStore,
     // Log entries produced by the in-flight turn but not yet in the store. They mirror
     // the messages the loop pushed past its `last_good_snapshot`: `commit` flushes them
@@ -75,6 +77,7 @@ impl Session {
             id,
             cwd,
             name: None,
+            auto: false,
             store,
             staged: Vec::new(),
         })
@@ -90,6 +93,7 @@ impl Session {
         let row = store
             .session(id)?
             .with_context(|| format!("no session {id} in the store"))?;
+        let auto = store.auto(id)?;
         store.set_state(id, SessionState::Running)?;
 
         let mut ordinals = Vec::new();
@@ -124,6 +128,7 @@ impl Session {
                 id: id.to_string(),
                 cwd,
                 name: row.name,
+                auto,
                 store,
                 staged: Vec::new(),
             },
@@ -139,6 +144,13 @@ impl Session {
         self.store.set_name(&self.id, &name, branch.as_deref())?;
         self.name = Some(name);
         Ok(())
+    }
+
+    // The in-memory flag changes even if saving fails, so a toggle always takes
+    // effect for the running session; the error only means a resume won't restore it.
+    pub fn set_auto(&mut self, on: bool) -> Result<()> {
+        self.auto = on;
+        self.store.set_auto(&self.id, on)
     }
 
     // The session's cwd as a display string with $HOME collapsed to `~` — the form
@@ -306,6 +318,21 @@ mod tests {
         let row = store_at(&db).session(&id).unwrap().expect("row written");
         assert_eq!(row.name.as_deref(), Some("auth-fix"));
         assert_eq!(row.branch.as_deref(), Some("main"));
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[test]
+    fn auto_persists_and_open_restores_it() {
+        let db = temp_db();
+        let mut s = Session::create(cwd(), store_at(&db)).unwrap();
+        let id = s.id.clone();
+        assert!(!s.auto);
+        s.set_auto(true).unwrap();
+        assert!(s.auto);
+
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert!(resumed.session.auto);
 
         std::fs::remove_file(&db).ok();
     }

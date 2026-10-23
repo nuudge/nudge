@@ -80,7 +80,14 @@ async fn run_loop<P: Provider, B: Backend>(
     // OUTER loop: one iteration per user turn.
     // A coalesce over-read stashes one input here; the next turn consumes it first.
     let mut pending_input: Option<LoopInput> = None;
-    let mut auto = false;
+    let mut auto = session.auto;
+    if auto {
+        let _ = agent_tx
+            .send(AgentEvent::Notice {
+                text: "auto mode is on (restored from the last run) — /auto turns it off".into(),
+            })
+            .await;
+    }
     loop {
         let (who, mut user_text) = loop {
             let input = match pending_input.take() {
@@ -484,6 +491,13 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 "auto mode is not available in this session (it cannot spawn subagents)"
             } else {
                 *auto = !*auto;
+                if let Err(e) = session.set_auto(*auto) {
+                    let _ = agent_tx
+                        .send(AgentEvent::Error {
+                            message: format!("couldn't save auto mode for resume: {e:#}"),
+                        })
+                        .await;
+                }
                 if *auto {
                     "auto mode on — work is delegated to a supervised subagent and nothing waits on you; skipped steps are listed in the report"
                 } else {

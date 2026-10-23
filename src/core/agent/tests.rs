@@ -3044,3 +3044,76 @@ fn auto_mode_respond_to_peer_offers_no_escalate() {
         serde_json::json!(["approve", "deny", "escalate"])
     );
 }
+
+// /auto is saved on the session row, and a resumed session starts in auto mode: it
+// says so, and it behaves so (its own gated tool is refused without a prompt).
+#[tokio::test]
+async fn auto_mode_survives_resume() {
+    let (session, dir) = mk_session();
+    let id = session.id.clone();
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, PeerSet::default()),
+    ));
+    send_command(&ui_tx, "/auto").await;
+    expect_notice(&mut agent_rx, "auto mode on").await;
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+
+    let store = SessionStore::open(&dir.join("nudge.db")).unwrap();
+    assert!(store.auto(&id).unwrap(), "the toggle is saved");
+    let resumed = Session::open(&id, dir.clone(), store).unwrap();
+
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("GatedTool", serde_json::json!({})),
+            end_turn_response("delegating"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        resumed.session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, PeerSet::default()),
+    ));
+    expect_notice(&mut agent_rx, "restored").await;
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { tool_name, .. }) => {
+                panic!("a resumed auto session must not prompt for {tool_name}")
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+    let refused = seen_messages.lock().unwrap().iter().any(|m| {
+        m.content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                if content.starts_with("Auto mode is on"))
+        })
+    });
+    assert!(refused, "the restored mode is in effect");
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

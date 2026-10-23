@@ -99,10 +99,11 @@ dismissing subagents need no approval; and the main agent's own shell and file-w
 tools are refused with a reminder to delegate. The guarantee is that nothing irreversible
 happens without you — you read about it in the report and do it yourself.
 
-`/auto` toggles; it stays on until you turn it off, and with it off everything behaves as
-described above. Only a client that may answer permission prompts can turn it on — a peer
-agent connected with `/connect-peer` cannot. Subagents follow the project's `AGENTS.md` just
-as the main agent does.
+`/auto` toggles; it stays on until you turn it off — including across `--resume`, which
+restores it and says so — and with it off everything behaves as described above. Only a
+client that may answer permission prompts can turn it on — a peer agent connected with
+`/connect-peer` cannot. Subagents follow the project's `AGENTS.md` just as the main agent
+does.
 
 ## The design: an agent is just another client
 
