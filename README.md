@@ -7,8 +7,9 @@ end-to-end-encrypted link that only ever sees ciphertext — approve an edit fro
 redirect it from the couch. Your laptop, your phone, and your teammate can all attach to the
 *same* running agent at once: everyone sees the same stream, anyone can drive. And agents
 attach too — spawn a supervised subagent, or paste one code and your agent is consulting a
-colleague's agent on another machine. It's co-op mode for a coding agent — one that doesn't
-sleep, doesn't quit, and follows you home.
+colleague's agent on another machine. Switch on `/auto` and walk away: a supervising agent
+approves the routine, corrects wrong turns, and sets the risky steps aside for you. It's
+co-op mode for a coding agent — one that doesn't sleep, doesn't quit, and follows you home.
 
 *(Want to run it right now? Jump to the [Quick start](#quick-start).)*
 
@@ -18,7 +19,7 @@ sleep, doesn't quit, and follows you home.
   <em>A live session hands off to a phone: scan the QR, approve an edit from your pocket, reattach on the laptop.</em>
 </p>
 
-All of that is **one idea, not four features: agent communications are symmetric.** There is
+All of that is **one idea, not a pile of features: agent communications are symmetric.** There is
 exactly one way to reach a nudge session — attach to it, observe what it does, send it
 input — and it doesn't matter whether the thing attaching is your terminal, your phone, a
 teammate, or another agent. Every capability below is that one connection pointed in a
@@ -40,6 +41,32 @@ different direction.
 </table>
 
 <p align="center"><em>One session, two clients — your laptop and your phone see the same stream, and either can drive.</em></p>
+
+## Auto mode, with a supervisor
+
+Most agents' auto mode is a blanket yes: every tool call approved, judgment switched off.
+nudge's `/auto` keeps the judgment and moves it. Turn it on and walk away: your agent hands
+the work to a subagent and supervises it, deciding every tool call the subagent asks
+permission for with your intent, the whole conversation, the subagent's recent activity and
+your project's `AGENTS.md` in view.
+
+- **Routine calls are approved**: edits, builds, tests and local git inside the working
+  directory.
+- **Wrong turns are denied with a correction**, which the subagent picks up as its next
+  instruction.
+- **Risky steps are skipped, not stalled**: a push, a history rewrite, deleting what the
+  task didn't create, writes outside the repo, installs. The subagent carries on with the
+  rest, and the final report ends with a **Needs you** list.
+
+Nothing waits on you, so you never come back to an agent frozen on a permission prompt, and
+nothing irreversible happens without you. The agent still answers questions and quick
+look-ups itself, and it keeps one subagent for the whole session. An **AUTO** badge in the
+terminal and phone headers shows when it's on, and it survives `--resume`.
+
+Under the hood it's the same one connection again: supervision is the parent attached to its
+child, answering its permission prompts the way you would from your phone.
+→ [Auto mode](docs/subagents.md#auto-mode), and
+[the case study that started it](https://blog.nuudge.workers.dev/i-didnt-build-an-auto-mode/)
 
 ## One connection, every direction
 
@@ -77,7 +104,8 @@ graph LR
   a pairing scope that can observe but not drive.
   → [Remote & relay](docs/remote-and-relay.md)
 - **Supervised subagents** — spawn a worker; its parent reviews every tool call and escalates
-  the scary ones to you. The same connection, pointed at a child, plus one pointing back —
+  the scary ones to you (or, in [auto mode](#auto-mode-with-a-supervisor), sets them aside
+  for your report). The same connection, pointed at a child, plus one pointing back —
   supervision rides *observe*, conversation rides *drive*.
   → [Subagents](docs/subagents.md)
 - **Peer agents across machines** — paste one code; your agent consults a colleague's agent
@@ -97,7 +125,8 @@ One protocol for everyone doesn't mean everyone can do everything. Every client 
 identity when it attaches, and its capabilities come from the pairing scope you handed out —
 full-access, watch-only, or agent-peer — never from what the client claims. A peer agent
 never sees your permission prompts, let alone answers them: every tool call is gated by its
-own session's human. The whole transport is end-to-end encrypted and the relay is
+own session's human. For the same reason only you can switch on auto mode; a connected peer
+agent can't. The whole transport is end-to-end encrypted and the relay is
 ciphertext-blind. And the file tools make the dangerous thing unrepresentable: no generic
 `Write` tool (only `Edit` and `CreateNew`), read-before-edit enforced, and `Bash` declares
 its *intent* next to the raw command you approve. → [Security](docs/security.md)
@@ -173,7 +202,8 @@ nudge is built in public; the design story reads best in order:
 2. [An agent is just another client](https://blog.nuudge.workers.dev/an-agent-is-just-another-client/)
    — the symmetric-communication idea, and the bug that forced it.
 3. [I didn't build an auto mode — I used a supervisor instead](https://blog.nuudge.workers.dev/i-didnt-build-an-auto-mode/)
-   — case study: a subagent under agent supervision through a risky history-rewriting refactor.
+   — case study: a subagent under agent supervision through a risky history-rewriting
+   refactor; the experiment that became `/auto`.
 4. [My Mac taught my new Linux box my dev setup](https://blog.nuudge.workers.dev/my-mac-taught-my-new-linux-box/)
    — case study: two peer agents porting a dev environment across machines and operating systems.
 
@@ -188,7 +218,8 @@ The canonical design doc is
 - **[Remote control & relay](docs/remote-and-relay.md)** — detach, phone handoff, co-op,
   self-hosting a relay.
 - **[Mobile app](docs/mobile-app.md)** — the Android client.
-- **[Subagents](docs/subagents.md)** — spawn, supervise, converse, and the design behind them.
+- **[Subagents](docs/subagents.md)** — spawn, supervise, converse, auto mode, and the design
+  behind them.
 - **[Peer agents](docs/peers.md)** — connect two sessions' agents across machines.
 - **[MCP servers](docs/mcp.md)** — connect external Model Context Protocol servers.
 - **[Skills](docs/skills.md)** — package reusable expertise.
