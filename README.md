@@ -19,7 +19,7 @@ co-op mode for a coding agent — one that doesn't sleep, doesn't quit, and foll
   <em>A live session hands off to a phone: scan the QR, approve an edit from your pocket, reattach on the laptop.</em>
 </p>
 
-All of that is **one idea, not four features: agent communications are symmetric.** There is
+All of that is **one idea, not a pile of features: agent communications are symmetric.** There is
 exactly one way to reach a nudge session — attach to it, observe what it does, send it
 input — and it doesn't matter whether the thing attaching is your terminal, your phone, a
 teammate, or another agent. Every capability below is that one connection pointed in a
