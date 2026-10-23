@@ -2824,6 +2824,38 @@ fn auto_io(
     }
 }
 
+// Each /auto toggle re-emits SessionInfo right away, so headers flip their badge
+// without waiting for the next turn boundary.
+#[tokio::test]
+async fn auto_toggle_emits_session_info() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        auto_io(ui_rx, agent_tx, PeerSet::default()),
+    ));
+
+    send_command(&ui_tx, "/auto").await;
+    drain_until(&mut agent_rx, |ev| {
+        matches!(ev, AgentEvent::SessionInfo { auto: true, .. })
+    })
+    .await;
+    send_command(&ui_tx, "/auto").await;
+    drain_until(&mut agent_rx, |ev| {
+        matches!(ev, AgentEvent::SessionInfo { auto: false, .. })
+    })
+    .await;
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // In auto mode nothing prompts the human: the agent's own gated tool comes back as an
 // error result telling it to delegate (an error, not a denial — so the loop carries on
 // instead of parking for guidance), and DismissPeer runs ungated.

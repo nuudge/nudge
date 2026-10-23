@@ -213,6 +213,20 @@ private fun ContextBar(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                if (info.auto) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiary,
+                        shape = RoundedCornerShape(4.dp),
+                    ) {
+                        Text(
+                            text = "AUTO",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onTertiary,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
                 ModelPicker(
                     current = info.model,
                     models = capabilities?.models.orEmpty(),

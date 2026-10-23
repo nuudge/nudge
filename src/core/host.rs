@@ -373,12 +373,14 @@ fn translate(
             git_branch,
             session_id,
             session_name,
+            auto,
         } => ControllerEvent::SessionInfo {
             model,
             cwd,
             git_branch,
             session_id,
             session_name,
+            auto,
         },
         AgentEvent::Capabilities {
             commands,

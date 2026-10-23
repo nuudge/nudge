@@ -69,12 +69,13 @@ async fn run_loop<P: Provider, B: Backend>(
     // rejects consecutive user turns, or a tool_use turn missing its tool_results).
     let mut last_good_snapshot: usize = messages.len();
 
-    // Last (model, git_branch, name) emitted as SessionInfo, so we only re-emit on an
-    // actual change (a /model switch, a `git checkout`, a /session-rename).
+    // Last (model, git_branch, name, auto) emitted as SessionInfo, so we only re-emit on
+    // an actual change (a /model switch, a `git checkout`, a /session-rename, an /auto).
     let mut last_session_ctx = (
         cfg.model.clone(),
         backend.git_branch(),
         session.name.clone(),
+        session.auto,
     );
 
     // OUTER loop: one iteration per user turn.
@@ -293,6 +294,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     session.id.clone(),
                     session.cwd_display(),
                     session.name.clone(),
+                    session.auto,
                     &mut last_session_ctx,
                 )
                 .await;
@@ -330,6 +332,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     session.id.clone(),
                     session.cwd_display(),
                     session.name.clone(),
+                    session.auto,
                     &mut last_session_ctx,
                 )
                 .await;
@@ -433,6 +436,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     session.id.clone(),
                     session.cwd_display(),
                     session.name.clone(),
+                    session.auto,
                     &mut last_session_ctx,
                 )
                 .await;
@@ -477,7 +481,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
     messages: &[Message],
     peers: &PeerSet,
     agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-    last_session_ctx: &mut (String, Option<String>, Option<String>),
+    last_session_ctx: &mut (String, Option<String>, Option<String>, bool),
     self_handle: &BrokerHandle,
     peer_dialer: &Option<PeerDialer>,
     peer_factory: &Option<PeerFactory>,
@@ -507,6 +511,17 @@ async fn dispatch_command<P: Provider, B: Backend>(
             let _ = agent_tx
                 .send(AgentEvent::Notice { text: text.into() })
                 .await;
+            emit_session_info_if_changed(
+                agent_tx,
+                &cfg.model,
+                backend.git_branch(),
+                session.id.clone(),
+                session.cwd_display(),
+                session.name.clone(),
+                *auto,
+                last_session_ctx,
+            )
+            .await;
         }
         Command::SetModel(model) => {
             cfg.model = model;
@@ -517,6 +532,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 session.id.clone(),
                 session.cwd_display(),
                 session.name.clone(),
+                session.auto,
                 last_session_ctx,
             )
             .await;

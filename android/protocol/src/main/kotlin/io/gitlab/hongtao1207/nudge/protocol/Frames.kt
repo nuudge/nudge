@@ -93,6 +93,8 @@ sealed class ControllerEvent {
         // a daemon that predates the field still decodes. The header prefers it over
         // the uuid. serde emits it as null (not absent) when None, so it's normally present.
         @SerialName("session_name") val sessionName: String? = null,
+        // Defaulted so a daemon that predates auto mode still decodes.
+        val auto: Boolean = false,
     ) : ControllerEvent()
 
     // The daemon's capabilities: command grammar, model catalog, MCP catalog, peer

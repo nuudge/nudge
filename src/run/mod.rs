@@ -50,6 +50,7 @@ pub async fn host(cli: Cli) -> Result<()> {
     let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
         session_name: session.name.clone(),
+        auto: session.auto,
         model: config.model.clone(),
         thinking_display: thinking_display.clone(),
         // Filled in the local branch when --relay arms remote pairing.
@@ -134,6 +135,7 @@ pub async fn host(cli: Cli) -> Result<()> {
             git_branch: backend.git_branch(),
             session_id: session.id.clone(),
             session_name: session.name.clone(),
+            auto: session.auto,
         },
     );
     // Seed the capability surface next to SessionInfo so every attach renders menus
