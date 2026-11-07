@@ -223,6 +223,10 @@ fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Va
             let mut content: Vec<serde_json::Value> = msg
                 .content
                 .iter()
+                // The API emits empty text blocks (around citation splits) but
+                // rejects them on input, so drop them here rather than at ingest:
+                // stored sessions stay wire-faithful and still replay.
+                .filter(|b| !matches!(b, ContentBlock::Text { text } if text.is_empty()))
                 .map(|b| serde_json::to_value(b).expect("ContentBlock always serializes"))
                 .collect();
             if Some(i) == breakpoint_idx {
@@ -352,5 +356,20 @@ mod tests {
                 .all(|b| b.get("cache_control").is_none()),
             "{wire:?}"
         );
+    }
+
+    #[test]
+    fn empty_text_blocks_are_dropped_and_breakpoint_lands_on_last_real_block() {
+        let text = |t: &str| ContentBlock::Text { text: t.into() };
+        let wire = messages_with_floating_breakpoint(&[Message {
+            role: "assistant".into(),
+            content: vec![text("first"), text(""), text("second"), text("")],
+        }]);
+        let content = wire[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{wire:?}");
+        assert_eq!(content[0]["text"], "first");
+        assert!(content[0].get("cache_control").is_none());
+        assert_eq!(content[1]["text"], "second");
+        assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
     }
 }
