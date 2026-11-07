@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::core::store::{InspectRow, SessionListing, SessionStore};
-use crate::llm::{ContentBlock, Message};
+use crate::llm::{ContentBlock, Message, web_search_query, web_search_results};
 
 const DEFAULT_LAST_N: i64 = 10;
 const MAX_LAST_N: i64 = 50;
@@ -253,6 +253,15 @@ fn render_entry(entry: &InspectRow) -> String {
                             truncate(&one_line(content), RESULT_CHARS)
                         ));
                     }
+                    ContentBlock::ServerToolUse { input, .. } => {
+                        out.push_str(&format!(
+                            "  web search: {}\n",
+                            truncate(&web_search_query(input), TOOL_CHARS)
+                        ));
+                    }
+                    ContentBlock::WebSearchToolResult { content, .. } => {
+                        out.push_str(&format!("  {}\n", web_search_summary(content)));
+                    }
                 }
             }
         }
@@ -423,9 +432,20 @@ fn flat_text(msg: &Message) -> String {
                 let tag = if *is_error { " (error)" } else { "" };
                 format!("tool_result{tag}: {content}")
             }
+            ContentBlock::ServerToolUse { input, .. } => {
+                format!("web search: {}", web_search_query(input))
+            }
+            ContentBlock::WebSearchToolResult { content, .. } => web_search_summary(content),
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn web_search_summary(content: &Value) -> String {
+    match web_search_results(content) {
+        (error, true) => error,
+        (lines, false) => format!("web search: {} results", lines.lines().count()),
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

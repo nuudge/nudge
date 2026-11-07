@@ -145,6 +145,11 @@ is shown (truncated) and expandable. It speaks MCP and packages reusable experti
 skills. → [Terminal agent](docs/terminal-agent.md), [MCP servers](docs/mcp.md),
 [Skills](docs/skills.md)
 
+It can also search the web for current information (release versions, docs, advisories)
+through Anthropic's server-side web search tool. Anthropic bills it at about $10 per 1,000
+searches plus the result tokens, capped at 5 searches per request. Searches run inside the
+API call, so no permission prompt gates them. Set `NUDGE_WEB_SEARCH=off` to disable it.
+
 ## Quick start
 
 Requires an Anthropic API key.

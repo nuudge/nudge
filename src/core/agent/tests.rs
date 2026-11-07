@@ -3149,3 +3149,168 @@ async fn auto_mode_survives_resume() {
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn web_search_blocks(id: &str, content: Value) -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::ServerToolUse {
+            id: id.into(),
+            name: "web_search".into(),
+            input: serde_json::json!({"query": "latest tokio"}),
+        },
+        ContentBlock::WebSearchToolResult {
+            tool_use_id: id.into(),
+            content,
+        },
+    ]
+}
+
+fn web_search_hits() -> Value {
+    serde_json::json!([{"type": "web_search_result", "url": "https://tokio.rs",
+                        "title": "Tokio", "encrypted_content": "x"}])
+}
+
+// A server-side search that hits the API's own loop limit stops with pause_turn: the
+// loop sends the partial assistant turn straight back (no user message in between)
+// and the turn completes once, after the continuation.
+#[tokio::test]
+async fn pause_turn_resumes_without_a_new_user_message() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            Response {
+                content: web_search_blocks("srv1", web_search_hits()),
+                stop_reason: "pause_turn".into(),
+                usage: Usage::default(),
+            },
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+
+    let transcript = seen_messages.lock().unwrap().clone();
+    let roles: Vec<&str> = transcript.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant"], "{transcript:?}");
+    assert!(
+        matches!(
+            &transcript[1].content[..],
+            [
+                ContentBlock::ServerToolUse { .. },
+                ContentBlock::WebSearchToolResult { .. }
+            ]
+        ),
+        "{transcript:?}"
+    );
+
+    // A third model call would panic the scripted provider and fail the join below.
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    let mut extra_completes = 0;
+    while let Ok(ev) = agent_rx.try_recv() {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            extra_completes += 1;
+        }
+    }
+    assert_eq!(extra_completes, 0, "the paused turn completes exactly once");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Server tool blocks surface as tool cards (a search error as an error result) but are
+// never dispatched: the tool_results turn answers only the client-side tool_use.
+#[tokio::test]
+async fn server_tool_blocks_render_as_tool_events_without_dispatch() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut content = web_search_blocks("srv1", web_search_hits());
+    content.extend(web_search_blocks(
+        "srv2",
+        serde_json::json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}),
+    ));
+    content.push(ContentBlock::ToolUse {
+        id: "tu1".into(),
+        name: "Read".into(),
+        input: serde_json::json!({}),
+    });
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            Response {
+                content,
+                stop_reason: "tool_use".into(),
+                usage: Usage::default(),
+            },
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut tool_events = Vec::new();
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::ToolUseStart { id, name, summary } => {
+                tool_events.push(format!("start {id} {name} {summary}"))
+            }
+            AgentEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            } => tool_events.push(format!("result {id} {is_error} {content}")),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        tool_events,
+        [
+            "start srv1 WebSearch latest tokio",
+            "result srv1 false Tokio — https://tokio.rs",
+            "start srv2 WebSearch latest tokio",
+            "result srv2 true web search error: max_uses_exceeded",
+            "start tu1 Read ",
+            "result tu1 false ",
+        ]
+    );
+
+    let transcript = seen_messages.lock().unwrap().clone();
+    match &transcript[2].content[..] {
+        [ContentBlock::ToolResult { tool_use_id, .. }] => assert_eq!(tool_use_id, "tu1"),
+        other => panic!("expected only the client tool's result, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

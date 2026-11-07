@@ -43,6 +43,54 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    // Server-side tool call (web search) that Anthropic already ran inside the
+    // request. Never dispatched locally; round-trip unmodified.
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    // Opaque: either a list of results (with `encrypted_content` the API needs
+    // back verbatim) or an error object.
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+    },
+}
+
+pub fn web_search_query(input: &serde_json::Value) -> String {
+    input
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+// One `title — url` line per result, or the error code with `is_error` set.
+pub fn web_search_results(content: &serde_json::Value) -> (String, bool) {
+    match content.as_array() {
+        Some(results) => (
+            results
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} — {}",
+                        r["title"].as_str().unwrap_or_default(),
+                        r["url"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            false,
+        ),
+        None => (
+            format!(
+                "web search error: {}",
+                content["error_code"].as_str().unwrap_or("unknown")
+            ),
+            true,
+        ),
+    }
 }
 
 #[derive(Debug, Default, Clone)]

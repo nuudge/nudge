@@ -28,24 +28,26 @@ pub struct CodingBackend {
     cwd: PathBuf,
     mcp: McpRegistry,
     skills: SkillRegistry,
+    web_search: bool,
     // Session-scoped Read-before-Edit tracker. Resumed sessions start with an
     // empty tracker — see file_state.rs for the rationale.
     file_state: Arc<Mutex<FileState>>,
 }
 
 impl CodingBackend {
-    pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry) -> Self {
+    pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry, web_search: bool) -> Self {
         Self {
             // Built once: the roster is derived from the compile-time tool set,
             // and the env/AGENTS.md are read at session start, so these stay
             // byte-stable across the session and anchor the cached prefix.
-            system_prompt: system_prompt_body(),
+            system_prompt: system_prompt_body(web_search),
             stable_env: stable_env_block(&cwd),
             agents_md: agents_md_block(&cwd),
             role_preamble: None,
             cwd,
             mcp,
             skills,
+            web_search,
             file_state: Arc::new(Mutex::new(FileState::default())),
         }
     }
@@ -74,7 +76,7 @@ impl Backend for CodingBackend {
     }
 
     fn tool_schemas(&self) -> (Vec<serde_json::Value>, Option<usize>) {
-        build_tool_array(&self.mcp, &self.skills)
+        build_tool_array(&self.mcp, &self.skills, self.web_search)
     }
 
     fn tool_summary(&self, name: &str, input: &serde_json::Value) -> String {
@@ -239,8 +241,16 @@ fn build_system_blocks(
 fn build_tool_array(
     mcp: &McpRegistry,
     skills: &SkillRegistry,
+    web_search: bool,
 ) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tool_schemas = tools::schemas();
+    if web_search {
+        tool_schemas.push(serde_json::json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+        }));
+    }
     // The load_tool and use_skill meta-tools are foundational: their catalogs
     // are fixed at startup (the dormant MCP catalog is compile-time; the skill
     // catalog is discovered once), so they sit in the stable prefix above the
@@ -272,8 +282,9 @@ pub async fn print_preamble<P: Provider>(
     session: &Session,
     mcp: &McpRegistry,
     skills: &SkillRegistry,
+    web_search: bool,
 ) -> Result<()> {
-    let system_prompt = system_prompt_body();
+    let system_prompt = system_prompt_body(web_search);
     let stable_env = stable_env_block(&session.cwd);
     let volatile_env = volatile_env_block(&session.cwd);
     let agents_md = agents_md_block(&session.cwd);
@@ -284,7 +295,7 @@ pub async fn print_preamble<P: Provider>(
         &stable_env,
         &volatile_env,
     );
-    let (tools, boundary) = build_tool_array(mcp, skills);
+    let (tools, boundary) = build_tool_array(mcp, skills, web_search);
 
     println!("===== SYSTEM =====");
     for block in &system {
@@ -353,6 +364,7 @@ mod tests {
             dir.clone(),
             McpRegistry::bootstrap(&[]).await,
             SkillRegistry::discover(&dir, None),
+            true,
         );
         assert!(
             plain
@@ -366,6 +378,7 @@ mod tests {
             dir.clone(),
             McpRegistry::bootstrap(&[]).await,
             SkillRegistry::discover(&dir, None),
+            true,
         )
         .into_subagent("ROLE: report to parent-x".into());
         let blocks = sub.system_blocks();

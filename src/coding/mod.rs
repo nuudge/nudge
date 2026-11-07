@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
 use crate::core::store::{SessionState, SessionStore};
-use crate::llm::ContentBlock;
+use crate::llm::{ContentBlock, web_search_query, web_search_results};
 
 pub mod backend;
 pub mod context;
@@ -67,7 +67,9 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::WebSearchToolResult { .. } => {}
                     }
                 }
             }
@@ -87,6 +89,24 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                                 id: id.clone(),
                                 name: name.clone(),
                                 summary: tools::summarize(name, input),
+                            });
+                        }
+                        ContentBlock::ServerToolUse { id, input, .. } => {
+                            out.push(ControllerEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebSearch".into(),
+                                summary: web_search_query(input),
+                            });
+                        }
+                        ContentBlock::WebSearchToolResult {
+                            tool_use_id,
+                            content,
+                        } => {
+                            let (content, is_error) = web_search_results(content);
+                            out.push(ControllerEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
                             });
                         }
                         ContentBlock::Thinking { .. }

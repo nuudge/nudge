@@ -230,11 +230,15 @@ fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Va
                 // block (the API rejects it). In practice the last block of an
                 // assistant turn is always text or tool_use because thinking
                 // comes first, but be defensive — walk back to the last block
-                // whose type accepts the marker.
+                // whose type accepts the marker. Server tool blocks are skipped
+                // too: whether they accept the marker is undocumented.
                 if let Some(last_idx) = content.iter().rposition(|v| {
                     !matches!(
                         v.get("type").and_then(|t| t.as_str()),
-                        Some("thinking") | Some("redacted_thinking")
+                        Some("thinking")
+                            | Some("redacted_thinking")
+                            | Some("server_tool_use")
+                            | Some("web_search_tool_result")
                     )
                 }) && let serde_json::Value::Object(obj) = &mut content[last_idx]
                 {
@@ -291,6 +295,62 @@ mod tests {
         assert_eq!(
             error_detail("  upstream connect error \n"),
             "upstream connect error"
+        );
+    }
+
+    const WEB_SEARCH_RESPONSE: &str = r#"{
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+             "input": {"query": "latest tokio release"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [
+                {"type": "web_search_result", "url": "https://tokio.rs/blog",
+                 "title": "Tokio blog", "encrypted_content": "EqgfCioIARgBIiQ3", "page_age": "2 days ago"}
+            ]},
+            {"type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search",
+             "input": {"query": "tokio changelog"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_2",
+             "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}},
+            {"type": "text", "text": "The latest release is 1.x.",
+             "citations": [{"type": "web_search_result_location", "url": "https://tokio.rs/blog",
+                            "title": "Tokio blog", "encrypted_index": "Eo8BCioIAhgBIiQy", "cited_text": "..."}]}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }"#;
+
+    #[test]
+    fn web_search_blocks_round_trip_unchanged() {
+        let raw: serde_json::Value = serde_json::from_str(WEB_SEARCH_RESPONSE).unwrap();
+        let resp: MessagesResponse = serde_json::from_str(WEB_SEARCH_RESPONSE).unwrap();
+        assert_eq!(resp.content.len(), 5);
+        for (i, block) in resp.content.iter().take(4).enumerate() {
+            assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                raw["content"][i],
+                "block {i} must round-trip byte-faithfully"
+            );
+        }
+        assert!(
+            matches!(&resp.content[4], ContentBlock::Text { text } if text == "The latest release is 1.x.")
+        );
+    }
+
+    #[test]
+    fn floating_breakpoint_skips_server_tool_blocks() {
+        let resp: MessagesResponse = serde_json::from_str(WEB_SEARCH_RESPONSE).unwrap();
+        let mut content = resp.content;
+        content.pop();
+        let wire = messages_with_floating_breakpoint(&[Message {
+            role: "assistant".into(),
+            content,
+        }]);
+        assert!(
+            wire[0]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b.get("cache_control").is_none()),
+            "{wire:?}"
         );
     }
 }

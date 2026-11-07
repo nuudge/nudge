@@ -5,7 +5,7 @@ use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
 use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
-use crate::llm::{ContentBlock, Message, Provider, Request};
+use crate::llm::{ContentBlock, Message, Provider, Request, web_search_query, web_search_results};
 
 mod command;
 mod dispatch;
@@ -278,8 +278,37 @@ async fn run_loop<P: Provider, B: Backend>(
                             })
                             .await;
                     }
+                    ContentBlock::ServerToolUse { id, input, .. } => {
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebSearch".into(),
+                                summary: web_search_query(input),
+                            })
+                            .await;
+                    }
+                    ContentBlock::WebSearchToolResult {
+                        tool_use_id,
+                        content,
+                    } => {
+                        let (content, is_error) = web_search_results(content);
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
+                            })
+                            .await;
+                    }
                     _ => {}
                 }
+            }
+
+            // The API's own server-tool loop hit its limit mid-turn; sending the
+            // partial assistant turn back as the last message resumes it.
+            if resp.stop_reason == "pause_turn" && iteration + 1 < cfg.max_iterations {
+                messages.push(assistant_msg);
+                continue;
             }
 
             if resp.stop_reason != "tool_use" {
