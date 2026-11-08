@@ -44,8 +44,8 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
-    // Server-side tool call (web search, or the code execution that filters its
-    // results) that Anthropic already ran inside the request. Never dispatched
+    // Server-side tool call (web search or fetch, or the code execution that
+    // filters their results) that Anthropic already ran inside the request. Never dispatched
     // locally; round-trip unmodified — `extra` keeps fields like `caller`.
     ServerToolUse {
         id: String,
@@ -62,6 +62,13 @@ pub enum ContentBlock {
         #[serde(flatten)]
         extra: serde_json::Map<String, serde_json::Value>,
     },
+    // Opaque: the fetched document or an error object.
+    WebFetchToolResult {
+        tool_use_id: String,
+        content: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
+    },
     // Any other block type (code-execution results, future server tools), kept
     // verbatim so a new type never fails the whole response. Also catches a
     // malformed known block instead of erroring.
@@ -70,6 +77,7 @@ pub enum ContentBlock {
 }
 
 pub const WEB_SEARCH_TOOL: &str = "web_search";
+pub const WEB_FETCH_TOOL: &str = "web_fetch";
 pub const CODE_EXECUTION_NOTICE: &str = "ran code in Anthropic's sandbox";
 
 // The sandbox is provisioned for dynamic filtering, but the model may run any code
@@ -140,6 +148,55 @@ pub fn web_search_results(content: &serde_json::Value) -> (String, bool) {
     }
 }
 
+pub fn web_fetch_url(input: &serde_json::Value) -> String {
+    input
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+// The URL with the document's kind and size, never its body (a page can be
+// tens of thousands of tokens); or the error code with `is_error` set.
+pub fn web_fetch_result(content: &serde_json::Value) -> (String, bool) {
+    if content["type"] != "web_fetch_result" {
+        return (
+            format!(
+                "web fetch error: {}",
+                content["error_code"].as_str().unwrap_or("unknown")
+            ),
+            true,
+        );
+    }
+    let source = &content["content"]["source"];
+    let data = source["data"].as_str().unwrap_or_default();
+    let size = if source["type"] == "base64" {
+        let kind = match source["media_type"].as_str() {
+            Some("application/pdf") => "PDF",
+            Some(other) => other,
+            None => "binary",
+        };
+        format!("{kind}, {}B base64", approx(data.len()))
+    } else {
+        format!("text, {} chars", approx(data.chars().count()))
+    };
+    (
+        format!(
+            "fetched {} ({size})",
+            content["url"].as_str().unwrap_or_default()
+        ),
+        false,
+    )
+}
+
+fn approx(n: usize) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -159,7 +216,7 @@ pub struct SystemBlock {
 // A provider-neutral completion request. Caching is expressed as hints
 // (`SystemBlock.cache`, `tool_cache_boundary`) the provider may honor or
 // ignore; `thinking_display` is a reasoning-visibility hint and `web_search`
-// asks for the provider's server-side search, shaped to what the model
+// asks for the provider's server-side search and fetch, shaped to what the model
 // supports. Anything a provider can't express is its own concern, not the caller's.
 pub struct Request<'a> {
     pub model: &'a str,
@@ -186,6 +243,10 @@ pub struct Response {
     // A provider-side degradation the user should know about (e.g. unknown
     // model capabilities), surfaced once by the loop.
     pub warning: Option<String>,
+    // Old tool results the provider dropped from this request's context. It
+    // repeats on every request while they stay in history, so the loop shows
+    // it only when it changes.
+    pub context_cleared: Option<String>,
 }
 
 // The seam every model backend implements. Kept deliberately thin — with one

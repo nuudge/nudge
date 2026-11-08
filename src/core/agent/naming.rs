@@ -128,6 +128,7 @@ mod tests {
             usage: Default::default(),
             container_id: None,
             warning: None,
+            context_cleared: None,
         };
         assert_eq!(
             title_from_response(&resp).as_deref(),

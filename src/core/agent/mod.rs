@@ -6,8 +6,9 @@ use crate::core::identity::ClientIdentity;
 use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
-    CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_SEARCH_TOOL,
-    merge_text_runs, ran_code_execution, web_search_query, web_search_results,
+    CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL, merge_text_runs, ran_code_execution, web_fetch_result, web_fetch_url,
+    web_search_query, web_search_results,
 };
 
 mod command;
@@ -84,6 +85,7 @@ async fn run_loop<P: Provider, B: Backend>(
     // OUTER loop: one iteration per user turn.
     // A coalesce over-read stashes one input here; the next turn consumes it first.
     let mut pending_input: Option<LoopInput> = None;
+    let mut last_context_cleared: Option<String> = None;
     let mut auto = session.auto;
     if auto {
         let _ = agent_tx
@@ -273,6 +275,12 @@ async fn run_loop<P: Provider, B: Backend>(
             if let Some(text) = resp.warning {
                 let _ = agent_tx.send(AgentEvent::Notice { text }).await;
             }
+            if let Some(text) = resp.context_cleared
+                && last_context_cleared.as_ref() != Some(&text)
+            {
+                last_context_cleared = Some(text.clone());
+                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            }
             if resp.container_id.is_some() {
                 container = resp.container_id;
             }
@@ -314,6 +322,31 @@ async fn run_loop<P: Provider, B: Backend>(
                         ..
                     } => {
                         let (content, is_error) = web_search_results(content);
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
+                            })
+                            .await;
+                    }
+                    ContentBlock::ServerToolUse {
+                        id, name, input, ..
+                    } if name == WEB_FETCH_TOOL => {
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebFetch".into(),
+                                summary: web_fetch_url(input),
+                            })
+                            .await;
+                    }
+                    ContentBlock::WebFetchToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        let (content, is_error) = web_fetch_result(content);
                         let _ = agent_tx
                             .send(AgentEvent::ToolResult {
                                 id: tool_use_id.clone(),

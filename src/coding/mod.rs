@@ -5,8 +5,8 @@ use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
 use crate::core::store::{SessionState, SessionStore};
 use crate::llm::{
-    CODE_EXECUTION_NOTICE, ContentBlock, WEB_SEARCH_TOOL, merge_text_runs, ran_code_execution,
-    web_search_query, web_search_results,
+    CODE_EXECUTION_NOTICE, ContentBlock, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, merge_text_runs,
+    ran_code_execution, web_fetch_result, web_fetch_url, web_search_query, web_search_results,
 };
 
 pub mod backend;
@@ -73,6 +73,7 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ServerToolUse { .. }
                         | ContentBlock::WebSearchToolResult { .. }
+                        | ContentBlock::WebFetchToolResult { .. }
                         | ContentBlock::Other(_) => {}
                     }
                 }
@@ -110,6 +111,27 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                             ..
                         } => {
                             let (content, is_error) = web_search_results(content);
+                            out.push(ControllerEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
+                            });
+                        }
+                        ContentBlock::ServerToolUse {
+                            id, name, input, ..
+                        } if name == WEB_FETCH_TOOL => {
+                            out.push(ControllerEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebFetch".into(),
+                                summary: web_fetch_url(input),
+                            });
+                        }
+                        ContentBlock::WebFetchToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            let (content, is_error) = web_fetch_result(content);
                             out.push(ControllerEvent::ToolResult {
                                 id: tool_use_id.clone(),
                                 content,
@@ -312,6 +334,75 @@ mod tests {
                 "start srv1",
                 "result srv1",
                 r#"text "xy""#,
+                "TurnComplete",
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_renders_web_fetch_cards() {
+        let fetch = |id: &str, url: &str, content: serde_json::Value| {
+            [
+                ContentBlock::ServerToolUse {
+                    id: id.into(),
+                    name: "web_fetch".into(),
+                    input: serde_json::json!({"url": url}),
+                    extra: Default::default(),
+                },
+                ContentBlock::WebFetchToolResult {
+                    tool_use_id: id.into(),
+                    content,
+                    extra: Default::default(),
+                },
+            ]
+        };
+        let mut content = vec![ContentBlock::Text {
+            text: "Reading the PDF.".into(),
+        }];
+        content.extend(fetch(
+            "srvf1",
+            "https://example.com/paper.pdf",
+            serde_json::json!({"type": "web_fetch_result", "url": "https://example.com/paper.pdf",
+                               "content": {"type": "document",
+                                           "source": {"type": "base64", "media_type": "application/pdf",
+                                                      "data": "A".repeat(1_200_000)}}}),
+        ));
+        content.extend(fetch(
+            "srvf2",
+            "https://evil.example/",
+            serde_json::json!({"type": "web_fetch_tool_result_error", "error_code": "url_not_in_prior_context"}),
+        ));
+        let entries = vec![LoggedMessage {
+            message: Message {
+                role: "assistant".into(),
+                content,
+            },
+            sender: None,
+        }];
+
+        let events: Vec<String> = replay_events(&entries, 0)
+            .into_iter()
+            .map(|ev| match ev {
+                ControllerEvent::AssistantText { text } => format!("text {text}"),
+                ControllerEvent::ToolUseStart { id, name, summary } => {
+                    format!("start {id} {name} {summary}")
+                }
+                ControllerEvent::ToolResult {
+                    id,
+                    content,
+                    is_error,
+                } => format!("result {id} {is_error} {content}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "text Reading the PDF.",
+                "start srvf1 WebFetch https://example.com/paper.pdf",
+                "result srvf1 false fetched https://example.com/paper.pdf (PDF, 1.2MB base64)",
+                "start srvf2 WebFetch https://evil.example/",
+                "result srvf2 true web fetch error: url_not_in_prior_context",
                 "TurnComplete",
             ]
         );

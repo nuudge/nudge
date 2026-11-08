@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use crate::core::store::{InspectRow, SessionListing, SessionStore};
 use crate::llm::{
-    CODE_EXECUTION_NOTICE, ContentBlock, Message, WEB_SEARCH_TOOL, ran_code_execution,
-    web_search_query, web_search_results,
+    CODE_EXECUTION_NOTICE, ContentBlock, Message, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
+    ran_code_execution, web_fetch_result, web_fetch_url, web_search_query, web_search_results,
 };
 
 const DEFAULT_LAST_N: i64 = 10;
@@ -265,6 +265,15 @@ fn render_entry(entry: &InspectRow) -> String {
                     ContentBlock::WebSearchToolResult { content, .. } => {
                         out.push_str(&format!("  {}\n", web_search_summary(content)));
                     }
+                    ContentBlock::ServerToolUse { name, input, .. } if name == WEB_FETCH_TOOL => {
+                        out.push_str(&format!(
+                            "  web fetch: {}\n",
+                            truncate(&web_fetch_url(input), TOOL_CHARS)
+                        ));
+                    }
+                    ContentBlock::WebFetchToolResult { content, .. } => {
+                        out.push_str(&format!("  {}\n", web_fetch_result(content).0));
+                    }
                     ContentBlock::ServerToolUse { .. } | ContentBlock::Other(_) => {}
                 }
             }
@@ -442,8 +451,12 @@ fn flat_text(msg: &Message) -> String {
             ContentBlock::ServerToolUse { name, input, .. } if name == WEB_SEARCH_TOOL => {
                 format!("web search: {}", web_search_query(input))
             }
+            ContentBlock::ServerToolUse { name, input, .. } if name == WEB_FETCH_TOOL => {
+                format!("web fetch: {}", web_fetch_url(input))
+            }
             ContentBlock::ServerToolUse { .. } => format!("({CODE_EXECUTION_NOTICE})"),
             ContentBlock::WebSearchToolResult { content, .. } => web_search_summary(content),
+            ContentBlock::WebFetchToolResult { content, .. } => web_fetch_result(content).0,
             ContentBlock::Other(_) => String::new(),
         })
         .collect::<Vec<_>>()
