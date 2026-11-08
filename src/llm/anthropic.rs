@@ -18,14 +18,27 @@ pub struct ModelCaps {
     // Code execution can call the request's other tools — what dynamic
     // filtering of search results needs.
     pub programmatic_tools: bool,
+    // Models without it (e.g. the 4.5 family) take only manual extended thinking.
+    pub adaptive_thinking: bool,
 }
 
 // Direct-only search works on every web-search-capable model, so it is the
-// safe guess when the Models API can't say.
+// safe guess when the Models API can't say; adaptive thinking matches every
+// current model.
 const UNKNOWN_CAPS: ModelCaps = ModelCaps {
     web_search: true,
     programmatic_tools: false,
+    adaptive_thinking: true,
 };
+
+// The request pieces shaped from one capability lookup.
+struct WireParts {
+    system: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    messages: Vec<serde_json::Value>,
+    caps: ModelCaps,
+    warning: Option<String>,
+}
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -44,10 +57,7 @@ impl AnthropicProvider {
 
     // (display label, model id), newest first - whatever the API is currently
     // serving. Also pre-fills the capability cache, since every model's
-    // capabilities ride along. The thinking shape is not capability-gated yet:
-    // this trusts that every model the API still serves supports adaptive
-    // thinking (true for the current lineup); a pick that turns out wrong
-    // surfaces as a normal request error rather than silently misbehaving.
+    // capabilities ride along.
     pub async fn list_models(&self) -> Result<Vec<(String, String)>> {
         let resp = self
             .client
@@ -89,14 +99,14 @@ impl AnthropicProvider {
                 None => (
                     UNKNOWN_CAPS,
                     Some(format!(
-                        "model {model} reports no capabilities; web search runs without dynamic filtering"
+                        "model {model} reports no capabilities; assuming adaptive thinking and web search without dynamic filtering"
                     )),
                 ),
             },
             Err(e) => (
                 UNKNOWN_CAPS,
                 Some(format!(
-                    "couldn't read capabilities for model {model} ({e:#}); web search runs without dynamic filtering"
+                    "couldn't read capabilities for model {model} ({e:#}); assuming adaptive thinking and web search without dynamic filtering"
                 )),
             ),
         };
@@ -120,42 +130,13 @@ impl AnthropicProvider {
             .context("failed to parse model response")
     }
 
-    // The caller's tools plus any provider-side server tool the request asks
-    // for. The server tool goes first so the caller's stable prefix keeps its
-    // order; the cache boundary shifts with it.
-    async fn tools_for(
-        &self,
-        req: &Request<'_>,
-    ) -> (Vec<serde_json::Value>, Option<usize>, Option<String>) {
-        let mut tools = req.tools.clone();
-        let mut boundary = req.tool_cache_boundary;
-        let mut warning = None;
-        if req.web_search {
-            let (caps, w) = self.model_caps(req.model).await;
-            warning = w;
-            if let Some(tool) = web_search_tool(caps) {
-                tools.insert(0, tool);
-                boundary = boundary.map(|i| i + 1);
-            }
-        }
-        (tools, boundary, warning)
-    }
-
     // Shared wire shaping: serialize system blocks with `cache_control` on the
     // cache-flagged ones, resolve the tool array (server tools included) with
     // the tool cache marker at its boundary, and the floating history
     // breakpoint on the messages. Both `complete` and `count_tokens` build on
     // this; the per-call fields (max_tokens, thinking) differ because the
     // count_tokens endpoint rejects `max_tokens`.
-    async fn wire_parts(
-        &self,
-        req: &Request<'_>,
-    ) -> (
-        Vec<serde_json::Value>,
-        Vec<serde_json::Value>,
-        Vec<serde_json::Value>,
-        Option<String>,
-    ) {
+    async fn wire_parts(&self, req: &Request<'_>) -> WireParts {
         let system: Vec<serde_json::Value> = req
             .system
             .iter()
@@ -169,20 +150,66 @@ impl AnthropicProvider {
             })
             .collect();
 
-        let (mut tools, boundary, warning) = self.tools_for(req).await;
+        let (caps, warning) = self.model_caps(req.model).await;
+        let (mut tools, boundary) = tools_for(req, caps);
         if let Some(i) = boundary
             && let Some(serde_json::Value::Object(obj)) = tools.get_mut(i)
         {
             obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
         }
 
-        (
+        WireParts {
             system,
             tools,
-            messages_with_floating_breakpoint(req.messages),
+            messages: messages_with_floating_breakpoint(req.messages),
+            caps,
             warning,
-        )
+        }
     }
+}
+
+// The caller's tools plus any provider-side server tool the request asks for.
+// The server tool goes first so the caller's stable prefix keeps its order;
+// the cache boundary shifts with it.
+fn tools_for(req: &Request<'_>, caps: ModelCaps) -> (Vec<serde_json::Value>, Option<usize>) {
+    let mut tools = req.tools.clone();
+    let mut boundary = req.tool_cache_boundary;
+    if req.web_search
+        && let Some(tool) = web_search_tool(caps)
+    {
+        tools.insert(0, tool);
+        boundary = boundary.map(|i| i + 1);
+    }
+    (tools, boundary)
+}
+
+fn thinking(caps: ModelCaps, max_tokens: u32, display: &str) -> Option<serde_json::Value> {
+    if caps.adaptive_thinking {
+        return Some(json!({ "type": "adaptive", "display": display }));
+    }
+    // Manual thinking needs 1024 <= budget_tokens < max_tokens; half the
+    // output budget leaves the other half for the answer. Below that floor
+    // there is no valid budget, so the request goes without thinking.
+    let budget = max_tokens / 2;
+    (budget >= 1024)
+        .then(|| json!({ "type": "enabled", "budget_tokens": budget, "display": display }))
+}
+
+fn complete_body(req: &Request<'_>, parts: WireParts) -> serde_json::Value {
+    let mut body = json!({
+        "model": req.model,
+        "system": parts.system,
+        "max_tokens": req.max_tokens,
+        "tools": parts.tools,
+        "messages": parts.messages,
+    });
+    if let Some(thinking) = thinking(parts.caps, req.max_tokens, req.thinking_display) {
+        body["thinking"] = thinking;
+    }
+    if let Some(container) = req.container {
+        body["container"] = json!(container);
+    }
+    body
 }
 
 // Dynamic filtering (search results filtered by code before they reach
@@ -207,29 +234,36 @@ fn web_search_tool(caps: ModelCaps) -> Option<serde_json::Value> {
     }))
 }
 
-// None when `capabilities` is null or lacks a field we rely on.
+// None only when `capabilities` is null; a field it doesn't report keeps
+// the UNKNOWN_CAPS guess, so one missing (e.g. Preview) field doesn't
+// discard the ones that are there.
 fn parse_caps(caps: Option<&WireCapabilities>) -> Option<ModelCaps> {
     let caps = caps?;
+    let supported = |s: Option<&WireSupport>| s.and_then(|s| s.supported);
     Some(ModelCaps {
-        web_search: caps.server_tools.as_ref()?.web_search.as_ref()?.supported?,
-        programmatic_tools: caps.code_execution.as_ref()?.supported?,
+        web_search: supported(
+            caps.server_tools
+                .as_ref()
+                .and_then(|t| t.web_search.as_ref()),
+        )
+        .unwrap_or(UNKNOWN_CAPS.web_search),
+        programmatic_tools: supported(caps.code_execution.as_ref())
+            .unwrap_or(UNKNOWN_CAPS.programmatic_tools),
+        adaptive_thinking: supported(
+            caps.thinking
+                .as_ref()
+                .and_then(|t| t.types.as_ref())
+                .and_then(|t| t.adaptive.as_ref()),
+        )
+        .unwrap_or(UNKNOWN_CAPS.adaptive_thinking),
     })
 }
 
 impl Provider for AnthropicProvider {
     async fn complete(&self, req: &Request<'_>) -> Result<Response> {
-        let (system, tools, messages, warning) = self.wire_parts(req).await;
-        let mut body = json!({
-            "model": req.model,
-            "system": system,
-            "max_tokens": req.max_tokens,
-            "thinking": { "type": "adaptive", "display": req.thinking_display },
-            "tools": tools,
-            "messages": messages,
-        });
-        if let Some(container) = req.container {
-            body["container"] = json!(container);
-        }
+        let parts = self.wire_parts(req).await;
+        let warning = parts.warning.clone();
+        let body = complete_body(req, parts);
         let resp = self
             .client
             .post(API_URL)
@@ -263,12 +297,12 @@ impl Provider for AnthropicProvider {
         // The count_tokens endpoint rejects `max_tokens` and doesn't need
         // `thinking`; it accepts the same system/tools/messages shape (cache
         // markers included, which it tolerates).
-        let (system, tools, messages, _) = self.wire_parts(req).await;
+        let parts = self.wire_parts(req).await;
         let body = json!({
             "model": req.model,
-            "system": system,
-            "tools": tools,
-            "messages": messages,
+            "system": parts.system,
+            "tools": parts.tools,
+            "messages": parts.messages,
         });
         let resp = self
             .client
@@ -291,7 +325,8 @@ impl Provider for AnthropicProvider {
     }
 
     async fn wire_tools(&self, req: &Request<'_>) -> Vec<serde_json::Value> {
-        self.tools_for(req).await.0
+        let (caps, _) = self.model_caps(req.model).await;
+        tools_for(req, caps).0
     }
 }
 
@@ -344,11 +379,22 @@ struct ModelInfo {
 struct WireCapabilities {
     code_execution: Option<WireSupport>,
     server_tools: Option<WireServerTools>,
+    thinking: Option<WireThinking>,
 }
 
 #[derive(Deserialize, Debug)]
 struct WireServerTools {
     web_search: Option<WireSupport>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireThinking {
+    types: Option<WireThinkingTypes>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireThinkingTypes {
+    adaptive: Option<WireSupport>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -615,8 +661,8 @@ mod tests {
     #[test]
     fn web_search_tool_shape_follows_caps() {
         let filtering = web_search_tool(ModelCaps {
-            web_search: true,
             programmatic_tools: true,
+            ..UNKNOWN_CAPS
         })
         .unwrap();
         assert_eq!(
@@ -632,6 +678,7 @@ mod tests {
             web_search_tool(ModelCaps {
                 web_search: false,
                 programmatic_tools: true,
+                ..UNKNOWN_CAPS
             })
             .is_none()
         );
@@ -649,11 +696,14 @@ mod tests {
                 r#"{"id": "claude-opus-4-8", "display_name": "Opus", "capabilities": {
                     "code_execution": {"supported": true},
                     "server_tools": {"web_search": {"supported": true},
-                                     "code_execution": {"supported": true}}}}"#
+                                     "code_execution": {"supported": true}},
+                    "thinking": {"supported": true, "types": {
+                        "adaptive": {"supported": true}, "enabled": {"supported": false}}}}}"#
             ),
             Some(ModelCaps {
                 web_search: true,
                 programmatic_tools: true,
+                adaptive_thinking: true,
             })
         );
         assert_eq!(
@@ -661,17 +711,20 @@ mod tests {
                 r#"{"id": "claude-haiku-4-5", "display_name": "Haiku", "capabilities": {
                     "code_execution": {"supported": false},
                     "server_tools": {"web_search": {"supported": true},
-                                     "code_execution": {"supported": true}}}}"#
+                                     "code_execution": {"supported": true}},
+                    "thinking": {"supported": true, "types": {
+                        "adaptive": {"supported": false}, "enabled": {"supported": true}}}}}"#
             ),
             Some(ModelCaps {
                 web_search: true,
                 programmatic_tools: false,
+                adaptive_thinking: false,
             })
         );
     }
 
     #[test]
-    fn caps_are_unknown_when_null_or_incomplete() {
+    fn caps_are_unknown_only_when_null_and_missing_fields_keep_the_guess() {
         assert_eq!(caps_of(r#"{"id": "m", "display_name": "M"}"#), None);
         assert_eq!(
             caps_of(r#"{"id": "m", "display_name": "M", "capabilities": null}"#),
@@ -679,10 +732,35 @@ mod tests {
         );
         assert_eq!(
             caps_of(
-                r#"{"id": "m", "display_name": "M", "capabilities": {"code_execution": {"supported": true}}}"#
+                r#"{"id": "m", "display_name": "M", "capabilities": {
+                    "thinking": {"types": {"adaptive": {"supported": false}}}}}"#
             ),
-            None
+            Some(ModelCaps {
+                adaptive_thinking: false,
+                ..UNKNOWN_CAPS
+            })
         );
+    }
+
+    #[test]
+    fn thinking_shape_follows_caps_and_budget() {
+        let manual = ModelCaps {
+            adaptive_thinking: false,
+            ..UNKNOWN_CAPS
+        };
+        assert_eq!(
+            thinking(UNKNOWN_CAPS, 16384, "summarized"),
+            Some(json!({"type": "adaptive", "display": "summarized"}))
+        );
+        assert_eq!(
+            thinking(manual, 16384, "omitted"),
+            Some(json!({"type": "enabled", "budget_tokens": 8192, "display": "omitted"}))
+        );
+        assert_eq!(
+            thinking(manual, 2048, "omitted"),
+            Some(json!({"type": "enabled", "budget_tokens": 1024, "display": "omitted"}))
+        );
+        assert_eq!(thinking(manual, 1024, "omitted"), None);
     }
 
     fn request<'a>(model: &'a str, web_search: bool, messages: &'a [Message]) -> Request<'a> {
@@ -699,25 +777,43 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn cached_caps_put_the_search_tool_first_and_shift_the_boundary() {
-        let provider = AnthropicProvider::new(String::new());
-        provider.caps.lock().unwrap().insert(
-            "m".into(),
-            ModelCaps {
-                web_search: true,
-                programmatic_tools: true,
-            },
-        );
-        let (tools, boundary, warning) = provider.tools_for(&request("m", true, &[])).await;
+    #[test]
+    fn search_tool_goes_first_and_shifts_the_boundary() {
+        let caps = ModelCaps {
+            programmatic_tools: true,
+            ..UNKNOWN_CAPS
+        };
+        let (tools, boundary) = tools_for(&request("m", true, &[]), caps);
         assert_eq!(tools[0]["type"], "web_search_20260318");
         assert_eq!(tools[1]["name"], "Read");
         assert_eq!(boundary, Some(1));
-        assert!(warning.is_none());
 
-        let (tools, boundary, _) = provider.tools_for(&request("m", false, &[])).await;
+        let (tools, boundary) = tools_for(&request("m", false, &[]), caps);
         assert_eq!(tools.len(), 2);
         assert_eq!(boundary, Some(0));
+    }
+
+    #[tokio::test]
+    async fn request_body_for_a_manual_thinking_model_sends_enabled_thinking() {
+        let provider = AnthropicProvider::new(String::new());
+        provider.caps.lock().unwrap().insert(
+            "claude-haiku-4-5".into(),
+            ModelCaps {
+                web_search: true,
+                programmatic_tools: false,
+                adaptive_thinking: false,
+            },
+        );
+        let req = Request {
+            max_tokens: 16384,
+            ..request("claude-haiku-4-5", true, &[])
+        };
+        let parts = provider.wire_parts(&req).await;
+        assert!(parts.warning.is_none());
+        let body = complete_body(&req, parts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+        assert_eq!(body["tools"][0]["allowed_callers"], json!(["direct"]));
     }
 
     #[test]
@@ -733,6 +829,7 @@ mod tests {
             Some(ModelCaps {
                 web_search: false,
                 programmatic_tools: true,
+                adaptive_thinking: true,
             })
         );
     }
