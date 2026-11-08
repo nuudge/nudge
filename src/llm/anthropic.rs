@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use super::{ContentBlock, Message, Provider, Request, Response, Usage};
 
@@ -8,9 +10,27 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const COUNT_TOKENS_URL: &str = "https://api.anthropic.com/v1/messages/count_tokens";
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
+// What a model supports, from the Models API `capabilities` object. Parsed in
+// one place (`parse_caps`) so a new capability is one field plus one line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelCaps {
+    pub web_search: bool,
+    // Code execution can call the request's other tools — what dynamic
+    // filtering of search results needs.
+    pub programmatic_tools: bool,
+}
+
+// Direct-only search works on every web-search-capable model, so it is the
+// safe guess when the Models API can't say.
+const UNKNOWN_CAPS: ModelCaps = ModelCaps {
+    web_search: true,
+    programmatic_tools: false,
+};
+
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
+    caps: Mutex<HashMap<String, ModelCaps>>,
 }
 
 impl AnthropicProvider {
@@ -18,14 +38,16 @@ impl AnthropicProvider {
         Self {
             client: reqwest::Client::new(),
             api_key,
+            caps: Mutex::new(HashMap::new()),
         }
     }
 
     // (display label, model id), newest first - whatever the API is currently
-    // serving. There's no capability flag for "supports adaptive thinking" in
-    // this response, so this trusts that every model the API still serves
-    // does (true for the current lineup); a pick that turns out wrong surfaces
-    // as a normal request error rather than silently misbehaving.
+    // serving. Also pre-fills the capability cache, since every model's
+    // capabilities ride along. The thinking shape is not capability-gated yet:
+    // this trusts that every model the API still serves supports adaptive
+    // thinking (true for the current lineup); a pick that turns out wrong
+    // surfaces as a normal request error rather than silently misbehaving.
     pub async fn list_models(&self) -> Result<Vec<(String, String)>> {
         let resp = self
             .client
@@ -40,6 +62,12 @@ impl AnthropicProvider {
             .json()
             .await
             .context("failed to parse models response")?;
+        let mut cache = self.caps.lock().unwrap();
+        for m in &resp.data {
+            if let Some(caps) = parse_caps(m.capabilities.as_ref()) {
+                cache.insert(m.id.clone(), caps);
+            }
+        }
         Ok(resp
             .data
             .into_iter()
@@ -47,17 +75,86 @@ impl AnthropicProvider {
             .collect())
     }
 
+    // Fetched once per model id and cached for the process; an unknown model
+    // falls back to UNKNOWN_CAPS, and only the call that resolved it carries
+    // the warning, so the user sees it once.
+    async fn model_caps(&self, model: &str) -> (ModelCaps, Option<String>) {
+        let cached = self.caps.lock().unwrap().get(model).copied();
+        if let Some(caps) = cached {
+            return (caps, None);
+        }
+        let (caps, warning) = match self.fetch_model(model).await {
+            Ok(info) => match parse_caps(info.capabilities.as_ref()) {
+                Some(caps) => (caps, None),
+                None => (
+                    UNKNOWN_CAPS,
+                    Some(format!(
+                        "model {model} reports no capabilities; web search runs without dynamic filtering"
+                    )),
+                ),
+            },
+            Err(e) => (
+                UNKNOWN_CAPS,
+                Some(format!(
+                    "couldn't read capabilities for model {model} ({e:#}); web search runs without dynamic filtering"
+                )),
+            ),
+        };
+        self.caps.lock().unwrap().insert(model.to_string(), caps);
+        (caps, warning)
+    }
+
+    async fn fetch_model(&self, model: &str) -> Result<ModelInfo> {
+        let resp = self
+            .client
+            .get(format!("{MODELS_URL}/{model}"))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .context("model request failed")?;
+        check_status(resp, "models endpoint")
+            .await?
+            .json()
+            .await
+            .context("failed to parse model response")
+    }
+
+    // The caller's tools plus any provider-side server tool the request asks
+    // for. The server tool goes first so the caller's stable prefix keeps its
+    // order; the cache boundary shifts with it.
+    async fn tools_for(
+        &self,
+        req: &Request<'_>,
+    ) -> (Vec<serde_json::Value>, Option<usize>, Option<String>) {
+        let mut tools = req.tools.clone();
+        let mut boundary = req.tool_cache_boundary;
+        let mut warning = None;
+        if req.web_search {
+            let (caps, w) = self.model_caps(req.model).await;
+            warning = w;
+            if let Some(tool) = web_search_tool(caps) {
+                tools.insert(0, tool);
+                boundary = boundary.map(|i| i + 1);
+            }
+        }
+        (tools, boundary, warning)
+    }
+
     // Shared wire shaping: serialize system blocks with `cache_control` on the
-    // cache-flagged ones, apply the tool cache marker at `tool_cache_boundary`,
-    // and the floating history breakpoint on the messages. Both `complete` and
-    // `count_tokens` build on this; the per-call fields (max_tokens, thinking)
-    // differ because the count_tokens endpoint rejects `max_tokens`.
-    fn wire_parts(
+    // cache-flagged ones, resolve the tool array (server tools included) with
+    // the tool cache marker at its boundary, and the floating history
+    // breakpoint on the messages. Both `complete` and `count_tokens` build on
+    // this; the per-call fields (max_tokens, thinking) differ because the
+    // count_tokens endpoint rejects `max_tokens`.
+    async fn wire_parts(
+        &self,
         req: &Request<'_>,
     ) -> (
         Vec<serde_json::Value>,
         Vec<serde_json::Value>,
         Vec<serde_json::Value>,
+        Option<String>,
     ) {
         let system: Vec<serde_json::Value> = req
             .system
@@ -72,8 +169,8 @@ impl AnthropicProvider {
             })
             .collect();
 
-        let mut tools = req.tools.clone();
-        if let Some(i) = req.tool_cache_boundary
+        let (mut tools, boundary, warning) = self.tools_for(req).await;
+        if let Some(i) = boundary
             && let Some(serde_json::Value::Object(obj)) = tools.get_mut(i)
         {
             obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
@@ -83,14 +180,46 @@ impl AnthropicProvider {
             system,
             tools,
             messages_with_floating_breakpoint(req.messages),
+            warning,
         )
     }
 }
 
+// Dynamic filtering (search results filtered by code before they reach
+// context) needs programmatic tool calling; without it the API rejects any
+// caller but "direct". "direct" stays allowed either way so the model can
+// still search without writing code.
+fn web_search_tool(caps: ModelCaps) -> Option<serde_json::Value> {
+    if !caps.web_search {
+        return None;
+    }
+    let allowed_callers = if caps.programmatic_tools {
+        json!(["direct", "code_execution_20260120"])
+    } else {
+        json!(["direct"])
+    };
+    Some(json!({
+        "type": "web_search_20260318",
+        "name": "web_search",
+        "max_uses": 5,
+        "allowed_callers": allowed_callers,
+        "response_inclusion": "excluded",
+    }))
+}
+
+// None when `capabilities` is null or lacks a field we rely on.
+fn parse_caps(caps: Option<&WireCapabilities>) -> Option<ModelCaps> {
+    let caps = caps?;
+    Some(ModelCaps {
+        web_search: caps.server_tools.as_ref()?.web_search.as_ref()?.supported?,
+        programmatic_tools: caps.code_execution.as_ref()?.supported?,
+    })
+}
+
 impl Provider for AnthropicProvider {
     async fn complete(&self, req: &Request<'_>) -> Result<Response> {
-        let (system, tools, messages) = Self::wire_parts(req);
-        let body = json!({
+        let (system, tools, messages, warning) = self.wire_parts(req).await;
+        let mut body = json!({
             "model": req.model,
             "system": system,
             "max_tokens": req.max_tokens,
@@ -98,6 +227,9 @@ impl Provider for AnthropicProvider {
             "tools": tools,
             "messages": messages,
         });
+        if let Some(container) = req.container {
+            body["container"] = json!(container);
+        }
         let resp = self
             .client
             .post(API_URL)
@@ -122,6 +254,8 @@ impl Provider for AnthropicProvider {
                 cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
                 cache_read_input_tokens: resp.usage.cache_read_input_tokens,
             },
+            container_id: resp.container.map(|c| c.id),
+            warning,
         })
     }
 
@@ -129,7 +263,7 @@ impl Provider for AnthropicProvider {
         // The count_tokens endpoint rejects `max_tokens` and doesn't need
         // `thinking`; it accepts the same system/tools/messages shape (cache
         // markers included, which it tolerates).
-        let (system, tools, messages) = Self::wire_parts(req);
+        let (system, tools, messages, _) = self.wire_parts(req).await;
         let body = json!({
             "model": req.model,
             "system": system,
@@ -154,6 +288,10 @@ impl Provider for AnthropicProvider {
         v["input_tokens"]
             .as_u64()
             .context("count_tokens response missing input_tokens")
+    }
+
+    async fn wire_tools(&self, req: &Request<'_>) -> Vec<serde_json::Value> {
+        self.tools_for(req).await.0
     }
 }
 
@@ -181,6 +319,12 @@ struct MessagesResponse {
     stop_reason: String,
     #[serde(default)]
     usage: WireUsage,
+    container: Option<WireContainer>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireContainer {
+    id: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -192,6 +336,24 @@ struct ModelsResponse {
 struct ModelInfo {
     id: String,
     display_name: String,
+    capabilities: Option<WireCapabilities>,
+}
+
+// Every field optional: a missing one means "unknown", not "unsupported".
+#[derive(Deserialize, Debug)]
+struct WireCapabilities {
+    code_execution: Option<WireSupport>,
+    server_tools: Option<WireServerTools>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireServerTools {
+    web_search: Option<WireSupport>,
+}
+
+#[derive(Deserialize, Debug)]
+struct WireSupport {
+    supported: Option<bool>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -230,19 +392,14 @@ fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Va
                 .map(|b| serde_json::to_value(b).expect("ContentBlock always serializes"))
                 .collect();
             if Some(i) == breakpoint_idx {
-                // cache_control cannot be placed on a thinking/redacted_thinking
-                // block (the API rejects it). In practice the last block of an
-                // assistant turn is always text or tool_use because thinking
-                // comes first, but be defensive — walk back to the last block
-                // whose type accepts the marker. Server tool blocks are skipped
-                // too: whether they accept the marker is undocumented.
+                // cache_control is rejected on thinking/redacted_thinking
+                // blocks, and whether server tool or code-execution blocks
+                // accept it is undocumented, so walk back to the last block
+                // of a type known to take the marker.
                 if let Some(last_idx) = content.iter().rposition(|v| {
-                    !matches!(
+                    matches!(
                         v.get("type").and_then(|t| t.as_str()),
-                        Some("thinking")
-                            | Some("redacted_thinking")
-                            | Some("server_tool_use")
-                            | Some("web_search_tool_result")
+                        Some("text") | Some("tool_use") | Some("tool_result")
                     )
                 }) && let serde_json::Value::Object(obj) = &mut content[last_idx]
                 {
@@ -371,5 +528,212 @@ mod tests {
         assert!(content[0].get("cache_control").is_none());
         assert_eq!(content[1]["text"], "second");
         assert_eq!(content[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    const DYNAMIC_FILTERING_RESPONSE: &str = r#"{
+        "content": [
+            {"type": "text", "text": "Let me search and filter the results."},
+            {"type": "server_tool_use", "id": "srvtoolu_exec", "name": "code_execution",
+             "input": {"code": "r = await web_search({\"query\": \"tokio 1.50 release\"})\nprint([x['title'] for x in r])"}},
+            {"type": "server_tool_use", "id": "srvtoolu_nested", "name": "web_search",
+             "input": {"query": "tokio 1.50 release"},
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_nested",
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"},
+             "content": [{"type": "web_search_result", "url": "https://tokio.rs/blog",
+                          "title": "Tokio blog", "encrypted_content": "EqgfCioIARgBIiQ3", "page_age": null}]},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_exec",
+             "content": {"type": "code_execution_result", "stdout": "['Tokio blog']",
+                         "stderr": "", "return_code": 0, "content": []}},
+            {"type": "server_tool_use", "id": "srvtoolu_bash", "name": "bash_code_execution",
+             "input": {"command": "ls"}},
+            {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_bash",
+             "content": {"type": "bash_code_execution_result", "stdout": "", "stderr": "",
+                         "return_code": 0, "content": []}},
+            {"type": "server_tool_use", "id": "srvtoolu_direct", "name": "web_search",
+             "input": {"query": "tokio changelog"}, "caller": {"type": "direct"}},
+            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_direct",
+             "caller": {"type": "direct"},
+             "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}},
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "Tokio 1.50 is out.",
+             "citations": [{"type": "web_search_result_location", "url": "https://tokio.rs/blog",
+                            "title": "Tokio blog", "encrypted_index": "Eo8BCioIAhgBIiQy", "cited_text": "..."}]}
+        ],
+        "container": {"id": "container_011CZ", "expires_at": "2026-11-08T12:00:00Z"},
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }"#;
+
+    #[test]
+    fn dynamic_filtering_blocks_round_trip_and_container_is_parsed() {
+        let raw: serde_json::Value = serde_json::from_str(DYNAMIC_FILTERING_RESPONSE).unwrap();
+        let resp: MessagesResponse = serde_json::from_str(DYNAMIC_FILTERING_RESPONSE).unwrap();
+        assert_eq!(resp.container.unwrap().id, "container_011CZ");
+        assert_eq!(resp.content.len(), 11);
+        // The last text block drops its citations (Text keeps only `text`).
+        for (i, block) in resp.content.iter().take(10).enumerate() {
+            assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                raw["content"][i],
+                "block {i} must round-trip"
+            );
+        }
+        assert!(matches!(&resp.content[4], ContentBlock::Other(_)));
+        assert!(matches!(&resp.content[6], ContentBlock::Other(_)));
+        assert!(
+            matches!(&resp.content[2], ContentBlock::ServerToolUse { extra, .. } if extra.contains_key("caller"))
+        );
+        assert!(crate::llm::ran_code_execution(&resp.content));
+    }
+
+    #[test]
+    fn floating_breakpoint_skips_code_execution_blocks() {
+        let resp: MessagesResponse = serde_json::from_str(DYNAMIC_FILTERING_RESPONSE).unwrap();
+        let content: Vec<ContentBlock> = resp.content.into_iter().take(7).collect();
+        let wire = messages_with_floating_breakpoint(&[Message {
+            role: "assistant".into(),
+            content,
+        }]);
+        let marked: Vec<usize> = wire[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.get("cache_control").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(marked, [0], "{wire:?}");
+    }
+
+    #[test]
+    fn missing_container_parses_as_none() {
+        let resp: MessagesResponse = serde_json::from_str(WEB_SEARCH_RESPONSE).unwrap();
+        assert!(resp.container.is_none());
+    }
+
+    #[test]
+    fn web_search_tool_shape_follows_caps() {
+        let filtering = web_search_tool(ModelCaps {
+            web_search: true,
+            programmatic_tools: true,
+        })
+        .unwrap();
+        assert_eq!(
+            filtering,
+            json!({"type": "web_search_20260318", "name": "web_search", "max_uses": 5,
+                   "allowed_callers": ["direct", "code_execution_20260120"],
+                   "response_inclusion": "excluded"})
+        );
+        let direct = web_search_tool(UNKNOWN_CAPS).unwrap();
+        assert_eq!(direct["type"], "web_search_20260318");
+        assert_eq!(direct["allowed_callers"], json!(["direct"]));
+        assert!(
+            web_search_tool(ModelCaps {
+                web_search: false,
+                programmatic_tools: true,
+            })
+            .is_none()
+        );
+    }
+
+    fn caps_of(model_json: &str) -> Option<ModelCaps> {
+        let info: ModelInfo = serde_json::from_str(model_json).unwrap();
+        parse_caps(info.capabilities.as_ref())
+    }
+
+    #[test]
+    fn caps_parse_from_the_models_api() {
+        assert_eq!(
+            caps_of(
+                r#"{"id": "claude-opus-4-8", "display_name": "Opus", "capabilities": {
+                    "code_execution": {"supported": true},
+                    "server_tools": {"web_search": {"supported": true},
+                                     "code_execution": {"supported": true}}}}"#
+            ),
+            Some(ModelCaps {
+                web_search: true,
+                programmatic_tools: true,
+            })
+        );
+        assert_eq!(
+            caps_of(
+                r#"{"id": "claude-haiku-4-5", "display_name": "Haiku", "capabilities": {
+                    "code_execution": {"supported": false},
+                    "server_tools": {"web_search": {"supported": true},
+                                     "code_execution": {"supported": true}}}}"#
+            ),
+            Some(ModelCaps {
+                web_search: true,
+                programmatic_tools: false,
+            })
+        );
+    }
+
+    #[test]
+    fn caps_are_unknown_when_null_or_incomplete() {
+        assert_eq!(caps_of(r#"{"id": "m", "display_name": "M"}"#), None);
+        assert_eq!(
+            caps_of(r#"{"id": "m", "display_name": "M", "capabilities": null}"#),
+            None
+        );
+        assert_eq!(
+            caps_of(
+                r#"{"id": "m", "display_name": "M", "capabilities": {"code_execution": {"supported": true}}}"#
+            ),
+            None
+        );
+    }
+
+    fn request<'a>(model: &'a str, web_search: bool, messages: &'a [Message]) -> Request<'a> {
+        Request {
+            model,
+            max_tokens: 1,
+            thinking_display: "omitted",
+            system: Vec::new(),
+            tools: vec![json!({"name": "Read"}), json!({"name": "Dormant"})],
+            tool_cache_boundary: Some(0),
+            web_search,
+            container: None,
+            messages,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_caps_put_the_search_tool_first_and_shift_the_boundary() {
+        let provider = AnthropicProvider::new(String::new());
+        provider.caps.lock().unwrap().insert(
+            "m".into(),
+            ModelCaps {
+                web_search: true,
+                programmatic_tools: true,
+            },
+        );
+        let (tools, boundary, warning) = provider.tools_for(&request("m", true, &[])).await;
+        assert_eq!(tools[0]["type"], "web_search_20260318");
+        assert_eq!(tools[1]["name"], "Read");
+        assert_eq!(boundary, Some(1));
+        assert!(warning.is_none());
+
+        let (tools, boundary, _) = provider.tools_for(&request("m", false, &[])).await;
+        assert_eq!(tools.len(), 2);
+        assert_eq!(boundary, Some(0));
+    }
+
+    #[test]
+    fn list_models_response_carries_caps() {
+        let resp: ModelsResponse = serde_json::from_str(
+            r#"{"data": [{"id": "a", "display_name": "A", "capabilities": {
+                "code_execution": {"supported": true},
+                "server_tools": {"web_search": {"supported": false}}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_caps(resp.data[0].capabilities.as_ref()),
+            Some(ModelCaps {
+                web_search: false,
+                programmatic_tools: true,
+            })
+        );
     }
 }

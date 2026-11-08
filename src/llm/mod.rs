@@ -43,19 +43,40 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
-    // Server-side tool call (web search) that Anthropic already ran inside the
-    // request. Never dispatched locally; round-trip unmodified.
+    // Server-side tool call (web search, or the code execution that filters its
+    // results) that Anthropic already ran inside the request. Never dispatched
+    // locally; round-trip unmodified — `extra` keeps fields like `caller`.
     ServerToolUse {
         id: String,
         name: String,
         input: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
     // Opaque: either a list of results (with `encrypted_content` the API needs
     // back verbatim) or an error object.
     WebSearchToolResult {
         tool_use_id: String,
         content: serde_json::Value,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, serde_json::Value>,
     },
+    // Any other block type (code-execution results, future server tools), kept
+    // verbatim so a new type never fails the whole response. Also catches a
+    // malformed known block instead of erroring.
+    #[serde(untagged)]
+    Other(serde_json::Value),
+}
+
+pub const WEB_SEARCH_TOOL: &str = "web_search";
+pub const CODE_EXECUTION_NOTICE: &str = "filtered search results with code";
+
+// Code execution runs server-side only to filter web search results (dynamic
+// filtering); its tool names are `code_execution`, `bash_code_execution`, etc.
+pub fn ran_code_execution(content: &[ContentBlock]) -> bool {
+    content.iter().any(
+        |b| matches!(b, ContentBlock::ServerToolUse { name, .. } if name.ends_with("code_execution")),
+    )
 }
 
 pub fn web_search_query(input: &serde_json::Value) -> String {
@@ -111,8 +132,9 @@ pub struct SystemBlock {
 
 // A provider-neutral completion request. Caching is expressed as hints
 // (`SystemBlock.cache`, `tool_cache_boundary`) the provider may honor or
-// ignore; `thinking_display` is a reasoning-visibility hint. Anything a
-// provider can't express is its own concern, not the caller's.
+// ignore; `thinking_display` is a reasoning-visibility hint and `web_search`
+// asks for the provider's server-side search, shaped to what the model
+// supports. Anything a provider can't express is its own concern, not the caller's.
 pub struct Request<'a> {
     pub model: &'a str,
     pub max_tokens: u32,
@@ -122,6 +144,11 @@ pub struct Request<'a> {
     // Index of the last tool belonging to the stable prefix; the provider may
     // place a cache breakpoint there. None disables tool-level caching.
     pub tool_cache_boundary: Option<usize>,
+    pub web_search: bool,
+    // The server-side execution container to resume; set only on a
+    // pause_turn continuation (the API rejects it on a request without
+    // pending code execution).
+    pub container: Option<&'a str>,
     pub messages: &'a [Message],
 }
 
@@ -129,6 +156,10 @@ pub struct Response {
     pub content: Vec<ContentBlock>,
     pub stop_reason: String,
     pub usage: Usage,
+    pub container_id: Option<String>,
+    // A provider-side degradation the user should know about (e.g. unknown
+    // model capabilities), surfaced once by the loop.
+    pub warning: Option<String>,
 }
 
 // The seam every model backend implements. Kept deliberately thin — with one
@@ -146,4 +177,12 @@ pub trait Provider {
         &self,
         req: &Request<'_>,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
+    // The tool array as it would go on the wire (provider-added tools
+    // included), for `--print-prompt`.
+    fn wire_tools(
+        &self,
+        req: &Request<'_>,
+    ) -> impl std::future::Future<Output = Vec<serde_json::Value>> + Send {
+        std::future::ready(req.tools.clone())
+    }
 }

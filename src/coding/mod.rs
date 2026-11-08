@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
 use crate::core::store::{SessionState, SessionStore};
-use crate::llm::{ContentBlock, web_search_query, web_search_results};
+use crate::llm::{
+    CODE_EXECUTION_NOTICE, ContentBlock, WEB_SEARCH_TOOL, ran_code_execution, web_search_query,
+    web_search_results,
+};
 
 pub mod backend;
 pub mod context;
@@ -69,7 +72,8 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::ServerToolUse { .. }
-                        | ContentBlock::WebSearchToolResult { .. } => {}
+                        | ContentBlock::WebSearchToolResult { .. }
+                        | ContentBlock::Other(_) => {}
                     }
                 }
             }
@@ -91,7 +95,9 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                                 summary: tools::summarize(name, input),
                             });
                         }
-                        ContentBlock::ServerToolUse { id, input, .. } => {
+                        ContentBlock::ServerToolUse {
+                            id, name, input, ..
+                        } if name == WEB_SEARCH_TOOL => {
                             out.push(ControllerEvent::ToolUseStart {
                                 id: id.clone(),
                                 name: "WebSearch".into(),
@@ -101,6 +107,7 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         ContentBlock::WebSearchToolResult {
                             tool_use_id,
                             content,
+                            ..
                         } => {
                             let (content, is_error) = web_search_results(content);
                             out.push(ControllerEvent::ToolResult {
@@ -111,8 +118,15 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         }
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::ToolResult { .. } => {}
+                        | ContentBlock::ToolResult { .. }
+                        | ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::Other(_) => {}
                     }
+                }
+                if ran_code_execution(&msg.content) {
+                    out.push(ControllerEvent::Notice {
+                        text: CODE_EXECUTION_NOTICE.into(),
+                    });
                 }
             }
             _ => {}

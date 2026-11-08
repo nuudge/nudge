@@ -76,7 +76,11 @@ impl Backend for CodingBackend {
     }
 
     fn tool_schemas(&self) -> (Vec<serde_json::Value>, Option<usize>) {
-        build_tool_array(&self.mcp, &self.skills, self.web_search)
+        build_tool_array(&self.mcp, &self.skills)
+    }
+
+    fn web_search(&self) -> bool {
+        self.web_search
     }
 
     fn tool_summary(&self, name: &str, input: &serde_json::Value) -> String {
@@ -241,16 +245,8 @@ fn build_system_blocks(
 fn build_tool_array(
     mcp: &McpRegistry,
     skills: &SkillRegistry,
-    web_search: bool,
 ) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tool_schemas = tools::schemas();
-    if web_search {
-        tool_schemas.push(serde_json::json!({
-            "type": "web_search_20250305",
-            "name": "web_search",
-            "max_uses": 5,
-        }));
-    }
     // The load_tool and use_skill meta-tools are foundational: their catalogs
     // are fixed at startup (the dormant MCP catalog is compile-time; the skill
     // catalog is discovered once), so they sit in the stable prefix above the
@@ -295,23 +291,7 @@ pub async fn print_preamble<P: Provider>(
         &stable_env,
         &volatile_env,
     );
-    let (tools, boundary) = build_tool_array(mcp, skills, web_search);
-
-    println!("===== SYSTEM =====");
-    for block in &system {
-        println!("{}", block.text);
-        println!("\n----------");
-    }
-    println!("\n===== TOOLS ({}) =====", tools.len());
-    for t in &tools {
-        println!(
-            "- {}: {}",
-            t["name"].as_str().unwrap_or("?"),
-            t["description"].as_str().unwrap_or("")
-        );
-    }
-    println!("\n===== TOOL SCHEMAS (JSON) =====");
-    println!("{}", serde_json::to_string_pretty(&tools)?);
+    let (tools, boundary) = build_tool_array(mcp, skills);
 
     // count_tokens needs a non-empty trailing user message; a 1-char probe
     // adds a negligible, constant offset that cancels in the system/tools delta.
@@ -319,7 +299,7 @@ pub async fn print_preamble<P: Provider>(
         role: "user".into(),
         content: vec![ContentBlock::Text { text: ".".into() }],
     }];
-    let req = |tools: Vec<serde_json::Value>, boundary: Option<usize>| Request {
+    let req = |tools: Vec<serde_json::Value>, boundary: Option<usize>, web_search: bool| Request {
         model: &cfg.model,
         max_tokens: cfg.max_tokens,
         thinking_display: &cfg.thinking_display,
@@ -332,10 +312,31 @@ pub async fn print_preamble<P: Provider>(
         ),
         tools,
         tool_cache_boundary: boundary,
+        web_search,
+        container: None,
         messages: &probe,
     };
-    let sys_only = provider.count_tokens(&req(Vec::new(), None)).await;
-    let with_tools = provider.count_tokens(&req(tools, boundary)).await;
+    let full = req(tools, boundary, web_search);
+    let wire_tools = provider.wire_tools(&full).await;
+
+    println!("===== SYSTEM =====");
+    for block in &system {
+        println!("{}", block.text);
+        println!("\n----------");
+    }
+    println!("\n===== TOOLS ({}) =====", wire_tools.len());
+    for t in &wire_tools {
+        println!(
+            "- {}: {}",
+            t["name"].as_str().unwrap_or("?"),
+            t["description"].as_str().unwrap_or("")
+        );
+    }
+    println!("\n===== TOOL SCHEMAS (JSON) =====");
+    println!("{}", serde_json::to_string_pretty(&wire_tools)?);
+
+    let sys_only = provider.count_tokens(&req(Vec::new(), None, false)).await;
+    let with_tools = provider.count_tokens(&full).await;
     println!("\n===== TOKENS (count_tokens; includes a 1-char probe message) =====");
     match (sys_only, with_tools) {
         (Ok(s), Ok(a)) => {

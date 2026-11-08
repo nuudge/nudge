@@ -3,7 +3,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::core::store::{InspectRow, SessionListing, SessionStore};
-use crate::llm::{ContentBlock, Message, web_search_query, web_search_results};
+use crate::llm::{
+    CODE_EXECUTION_NOTICE, ContentBlock, Message, WEB_SEARCH_TOOL, ran_code_execution,
+    web_search_query, web_search_results,
+};
 
 const DEFAULT_LAST_N: i64 = 10;
 const MAX_LAST_N: i64 = 50;
@@ -253,7 +256,7 @@ fn render_entry(entry: &InspectRow) -> String {
                             truncate(&one_line(content), RESULT_CHARS)
                         ));
                     }
-                    ContentBlock::ServerToolUse { input, .. } => {
+                    ContentBlock::ServerToolUse { name, input, .. } if name == WEB_SEARCH_TOOL => {
                         out.push_str(&format!(
                             "  web search: {}\n",
                             truncate(&web_search_query(input), TOOL_CHARS)
@@ -262,7 +265,11 @@ fn render_entry(entry: &InspectRow) -> String {
                     ContentBlock::WebSearchToolResult { content, .. } => {
                         out.push_str(&format!("  {}\n", web_search_summary(content)));
                     }
+                    ContentBlock::ServerToolUse { .. } | ContentBlock::Other(_) => {}
                 }
+            }
+            if ran_code_execution(&msg.content) {
+                out.push_str(&format!("  ({CODE_EXECUTION_NOTICE})\n"));
             }
         }
         // A row that doesn't parse as a typed message still shows, raw.
@@ -432,10 +439,12 @@ fn flat_text(msg: &Message) -> String {
                 let tag = if *is_error { " (error)" } else { "" };
                 format!("tool_result{tag}: {content}")
             }
-            ContentBlock::ServerToolUse { input, .. } => {
+            ContentBlock::ServerToolUse { name, input, .. } if name == WEB_SEARCH_TOOL => {
                 format!("web search: {}", web_search_query(input))
             }
+            ContentBlock::ServerToolUse { .. } => format!("({CODE_EXECUTION_NOTICE})"),
             ContentBlock::WebSearchToolResult { content, .. } => web_search_summary(content),
+            ContentBlock::Other(_) => String::new(),
         })
         .collect::<Vec<_>>()
         .join(" ")

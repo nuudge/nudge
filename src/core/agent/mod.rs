@@ -5,7 +5,10 @@ use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
 use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
-use crate::llm::{ContentBlock, Message, Provider, Request, web_search_query, web_search_results};
+use crate::llm::{
+    CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_SEARCH_TOOL,
+    ran_code_execution, web_search_query, web_search_results,
+};
 
 mod command;
 mod dispatch;
@@ -210,6 +213,10 @@ async fn run_loop<P: Provider, B: Backend>(
         );
 
         // INNER loop: model + tool turns until non-tool-use stop.
+        // A pause_turn during server-side code execution must resume in the same
+        // container; a paused response may not repeat its id, so keep the latest.
+        let mut container: Option<String> = None;
+        let mut resuming_pause = false;
         for iteration in 0..cfg.max_iterations {
             let (mut tools, tool_cache_boundary) = backend.tool_schemas();
             // Loop-level peer tools ride after the backend's array (never inside the
@@ -232,6 +239,12 @@ async fn run_loop<P: Provider, B: Backend>(
                 system,
                 tools,
                 tool_cache_boundary,
+                web_search: backend.web_search(),
+                container: if resuming_pause {
+                    container.as_deref()
+                } else {
+                    None
+                },
                 messages: &messages,
             };
 
@@ -257,6 +270,12 @@ async fn run_loop<P: Provider, B: Backend>(
                     cache_read: resp.usage.cache_read_input_tokens,
                 })
                 .await;
+            if let Some(text) = resp.warning {
+                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            }
+            if resp.container_id.is_some() {
+                container = resp.container_id;
+            }
 
             let assistant_msg = Message {
                 role: "assistant".into(),
@@ -278,7 +297,9 @@ async fn run_loop<P: Provider, B: Backend>(
                             })
                             .await;
                     }
-                    ContentBlock::ServerToolUse { id, input, .. } => {
+                    ContentBlock::ServerToolUse {
+                        id, name, input, ..
+                    } if name == WEB_SEARCH_TOOL => {
                         let _ = agent_tx
                             .send(AgentEvent::ToolUseStart {
                                 id: id.clone(),
@@ -290,6 +311,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     ContentBlock::WebSearchToolResult {
                         tool_use_id,
                         content,
+                        ..
                     } => {
                         let (content, is_error) = web_search_results(content);
                         let _ = agent_tx
@@ -303,10 +325,18 @@ async fn run_loop<P: Provider, B: Backend>(
                     _ => {}
                 }
             }
+            if ran_code_execution(&assistant_msg.content) {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: CODE_EXECUTION_NOTICE.into(),
+                    })
+                    .await;
+            }
 
             // The API's own server-tool loop hit its limit mid-turn; sending the
             // partial assistant turn back as the last message resumes it.
-            if resp.stop_reason == "pause_turn" && iteration + 1 < cfg.max_iterations {
+            resuming_pause = resp.stop_reason == "pause_turn";
+            if resuming_pause && iteration + 1 < cfg.max_iterations {
                 messages.push(assistant_msg);
                 continue;
             }
@@ -590,6 +620,8 @@ async fn dispatch_command<P: Provider, B: Backend>(
                                 system: Vec::new(),
                                 tools: Vec::new(),
                                 tool_cache_boundary: None,
+                                web_search: false,
+                                container: None,
                                 messages: &probe,
                             };
                             provider

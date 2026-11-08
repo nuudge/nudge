@@ -146,9 +146,19 @@ skills. → [Terminal agent](docs/terminal-agent.md), [MCP servers](docs/mcp.md)
 [Skills](docs/skills.md)
 
 It can also search the web for current information (release versions, docs, advisories)
-through Anthropic's server-side web search tool. Anthropic bills it at about $10 per 1,000
-searches plus the result tokens, capped at 5 searches per request. Searches run inside the
-API call, so no permission prompt gates them. Set `NUDGE_WEB_SEARCH=off` to disable it.
+through Anthropic's server-side web search tool (`web_search_20260318`). Anthropic bills it
+at about $10 per 1,000 searches plus the result tokens, capped at 5 searches per request.
+Searches run inside the API call, so no permission prompt gates them. Set
+`NUDGE_WEB_SEARCH=off` to disable it.
+
+On models that support it, search uses dynamic filtering: Claude writes and runs code in an
+Anthropic-hosted sandbox to filter results before they reach its context, which cuts input
+tokens and improves accuracy (that code execution is free when used with web search).
+nudge reads each model's capabilities from the Models API. Models without programmatic tool
+calling (e.g. Haiku 4.5) get plain direct search, and models without web search get none.
+If a model's capabilities can't be read, nudge falls back to direct search and shows a
+notice once. Dynamic filtering is not eligible for Zero Data Retention or HIPAA; turn web
+search off if your organization relies on those.
 
 ## Quick start
 

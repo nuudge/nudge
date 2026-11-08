@@ -126,6 +126,8 @@ mod tests {
             ],
             stop_reason: "end_turn".into(),
             usage: Default::default(),
+            container_id: None,
+            warning: None,
         };
         assert_eq!(
             title_from_response(&resp).as_deref(),
