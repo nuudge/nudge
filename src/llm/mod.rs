@@ -70,10 +70,10 @@ pub enum ContentBlock {
 }
 
 pub const WEB_SEARCH_TOOL: &str = "web_search";
-pub const CODE_EXECUTION_NOTICE: &str = "filtered search results with code";
+pub const CODE_EXECUTION_NOTICE: &str = "ran code in Anthropic's sandbox";
 
-// Code execution runs server-side only to filter web search results (dynamic
-// filtering); its tool names are `code_execution`, `bash_code_execution`, etc.
+// The sandbox is provisioned for dynamic filtering, but the model may run any code
+// there; the tools are `code_execution`, `bash_code_execution`, `text_editor_code_execution`.
 pub fn ran_code_execution(content: &[ContentBlock]) -> bool {
     content.iter().any(
         |b| matches!(b, ContentBlock::ServerToolUse { name, .. } if name.ends_with("code_execution")),

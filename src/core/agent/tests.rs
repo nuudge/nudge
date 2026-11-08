@@ -3469,10 +3469,10 @@ async fn code_execution_blocks_render_as_one_notice_without_cards() {
     assert_eq!(
         events,
         [
-            "notice caps unknown",
-            "start srv1 WebSearch",
-            "result srv1",
-            "notice filtered search results with code",
+            "notice caps unknown".to_string(),
+            "start srv1 WebSearch".to_string(),
+            "result srv1".to_string(),
+            format!("notice {}", crate::llm::CODE_EXECUTION_NOTICE),
         ]
     );
 
