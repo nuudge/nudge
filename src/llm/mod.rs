@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 pub mod anthropic;
 
@@ -77,6 +78,31 @@ pub fn ran_code_execution(content: &[ContentBlock]) -> bool {
     content.iter().any(
         |b| matches!(b, ContentBlock::ServerToolUse { name, .. } if name.ends_with("code_execution")),
     )
+}
+
+// For display only: a cited answer arrives split into many text blocks (some
+// empty, some mid-sentence or mid-table), so each run of consecutive text
+// blocks is joined back into one; empty runs are dropped. The fragments carry
+// their own whitespace, hence no separator.
+pub fn merge_text_runs(content: &[ContentBlock]) -> Vec<Cow<'_, ContentBlock>> {
+    let mut out = Vec::new();
+    let mut run = String::new();
+    for block in content {
+        if let ContentBlock::Text { text } = block {
+            run.push_str(text);
+            continue;
+        }
+        if !run.is_empty() {
+            out.push(Cow::Owned(ContentBlock::Text {
+                text: std::mem::take(&mut run),
+            }));
+        }
+        out.push(Cow::Borrowed(block));
+    }
+    if !run.is_empty() {
+        out.push(Cow::Owned(ContentBlock::Text { text: run }));
+    }
+    out
 }
 
 pub fn web_search_query(input: &serde_json::Value) -> String {

@@ -3480,3 +3480,61 @@ async fn code_execution_blocks_render_as_one_notice_without_cards() {
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// A cited answer arrives as many text fragments (some empty); each run between
+// non-text blocks surfaces as one AssistantText so it renders as one message.
+#[tokio::test]
+async fn consecutive_text_blocks_emit_one_assistant_text_per_run() {
+    let (session, dir) = mk_session();
+    let text = |t: &str| ContentBlock::Text { text: t.into() };
+    let mut content = vec![text("| a |\n"), text(""), text("| b |")];
+    content.extend(web_search_blocks("srv1", web_search_hits()));
+    content.extend([text("x"), text("y")]);
+    let provider = ContainerLogProvider {
+        responses: std::sync::Mutex::new(vec![Response {
+            content,
+            stop_reason: "end_turn".into(),
+            usage: Usage::default(),
+            container_id: None,
+            warning: None,
+        }]),
+        seen_containers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::AssistantText { text } => events.push(format!("text {text:?}")),
+            AgentEvent::ToolUseStart { id, .. } => events.push(format!("start {id}")),
+            AgentEvent::ToolResult { id, .. } => events.push(format!("result {id}")),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            r#"text "| a |\n| b |""#,
+            "start srv1",
+            "result srv1",
+            r#"text "xy""#,
+        ]
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

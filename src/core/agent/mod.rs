@@ -7,7 +7,7 @@ use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_SEARCH_TOOL,
-    ran_code_execution, web_search_query, web_search_results,
+    merge_text_runs, ran_code_execution, web_search_query, web_search_results,
 };
 
 mod command;
@@ -283,8 +283,8 @@ async fn run_loop<P: Provider, B: Backend>(
             };
             session.stage(&assistant_msg, None);
 
-            for block in &assistant_msg.content {
-                match block {
+            for block in merge_text_runs(&assistant_msg.content) {
+                match block.as_ref() {
                     ContentBlock::Text { text } => {
                         let _ = agent_tx
                             .send(AgentEvent::AssistantText { text: text.clone() })
