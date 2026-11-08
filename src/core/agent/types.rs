@@ -32,7 +32,7 @@ pub trait Backend {
     fn system_blocks(&self) -> Vec<SystemBlock>;
     // Tool schemas, plus the stable/dynamic cache-boundary index (None = no caching).
     fn tool_schemas(&self) -> (Vec<Value>, Option<usize>);
-    // Whether to ask the provider for its server-side web search.
+    // Whether to ask the provider for its server-side web search and fetch.
     fn web_search(&self) -> bool {
         false
     }

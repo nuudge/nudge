@@ -149,7 +149,16 @@ It can also search the web for current information (release versions, docs, advi
 through Anthropic's server-side web search tool (`web_search_20260318`). Anthropic bills it
 at about $10 per 1,000 searches plus the result tokens, capped at 5 searches per request.
 Searches run inside the API call, so no permission prompt gates them. Set
-`NUDGE_WEB_SEARCH=off` to disable it.
+`NUDGE_WEB_SEARCH=off` to disable it (this also disables web fetch).
+
+It can then read a whole page or PDF with Anthropic's server-side web fetch tool
+(`web_fetch_20260318`). Fetch costs nothing beyond the tokens of the fetched content, and
+nudge caps each page at about 25,000 tokens (longer content is truncated). Fetch only works
+on URLs you typed or that came from a web search or fetch result. nudge refuses URLs that
+appear only in a file or command output: otherwise a prompt injection in your repo could
+make a tool print a URL carrying your secrets and have Anthropic's servers fetch it, past
+any local firewall. Paste such a link into the chat instead. Fetch doesn't run JavaScript,
+can't reach localhost or private pages, and Anthropic caches results, so they can be stale.
 
 On models that support it, search uses dynamic filtering: Claude writes and runs code in an
 Anthropic-hosted sandbox to filter results before they reach its context, which cuts input

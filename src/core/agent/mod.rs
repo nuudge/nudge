@@ -6,8 +6,9 @@ use crate::core::identity::ClientIdentity;
 use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
-    CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_SEARCH_TOOL,
-    merge_text_runs, ran_code_execution, web_search_query, web_search_results,
+    CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL, merge_text_runs, ran_code_execution, web_fetch_result, web_fetch_url,
+    web_search_query, web_search_results,
 };
 
 mod command;
@@ -314,6 +315,31 @@ async fn run_loop<P: Provider, B: Backend>(
                         ..
                     } => {
                         let (content, is_error) = web_search_results(content);
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
+                            })
+                            .await;
+                    }
+                    ContentBlock::ServerToolUse {
+                        id, name, input, ..
+                    } if name == WEB_FETCH_TOOL => {
+                        let _ = agent_tx
+                            .send(AgentEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebFetch".into(),
+                                summary: web_fetch_url(input),
+                            })
+                            .await;
+                    }
+                    ContentBlock::WebFetchToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
+                        let (content, is_error) = web_fetch_result(content);
                         let _ = agent_tx
                             .send(AgentEvent::ToolResult {
                                 id: tool_use_id.clone(),

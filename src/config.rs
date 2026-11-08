@@ -75,7 +75,7 @@ pub struct Config {
     /// pauses for guidance; falls back to the built-in default.
     pub max_iterations: usize,
     /// `NUDGE_WEB_SEARCH` — `off` withholds Anthropic's server-side web search
-    /// tool (billed per search); on by default.
+    /// (billed per search) and web fetch tools; on by default.
     pub web_search: bool,
 }
 
