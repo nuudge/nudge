@@ -240,9 +240,13 @@ pub struct Response {
     pub stop_reason: String,
     pub usage: Usage,
     pub container_id: Option<String>,
-    // Something provider-side the user should know about (e.g. unknown model
-    // capabilities, or old tool results cleared), surfaced once by the loop.
+    // A provider-side degradation the user should know about (e.g. unknown
+    // model capabilities), surfaced once by the loop.
     pub warning: Option<String>,
+    // Old tool results the provider dropped from this request's context. It
+    // repeats on every request while they stay in history, so the loop shows
+    // it only when it changes.
+    pub context_cleared: Option<String>,
 }
 
 // The seam every model backend implements. Kept deliberately thin — with one

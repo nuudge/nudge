@@ -85,6 +85,7 @@ async fn run_loop<P: Provider, B: Backend>(
     // OUTER loop: one iteration per user turn.
     // A coalesce over-read stashes one input here; the next turn consumes it first.
     let mut pending_input: Option<LoopInput> = None;
+    let mut last_context_cleared: Option<String> = None;
     let mut auto = session.auto;
     if auto {
         let _ = agent_tx
@@ -272,6 +273,12 @@ async fn run_loop<P: Provider, B: Backend>(
                 })
                 .await;
             if let Some(text) = resp.warning {
+                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            }
+            if let Some(text) = resp.context_cleared
+                && last_context_cleared.as_ref() != Some(&text)
+            {
+                last_context_cleared = Some(text.clone());
                 let _ = agent_tx.send(AgentEvent::Notice { text }).await;
             }
             if resp.container_id.is_some() {

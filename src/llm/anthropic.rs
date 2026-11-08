@@ -250,13 +250,15 @@ fn beta_header(body: &serde_json::Value) -> Option<&'static str> {
         .map(|_| CONTEXT_MANAGEMENT_BETA)
 }
 
+// Attributed to the API: its `cleared_input_tokens` counts a fetched PDF's
+// raw base64, far more than the PDF costs in the prompt.
 fn cleared_notice(cm: Option<&WireContextManagement>) -> Option<String> {
     let edits = &cm?.applied_edits;
     let tokens: u64 = edits.iter().map(|e| e.cleared_input_tokens).sum();
     let uses: u64 = edits.iter().map(|e| e.cleared_tool_uses).sum();
     (tokens > 0).then(|| {
         format!(
-            "cleared {uses} old web fetch result{} (~{} tokens)",
+            "cleared {uses} old web fetch result{} (API reports ~{} tokens)",
             if uses == 1 { "" } else { "s" },
             super::approx(tokens as usize)
         )
@@ -362,7 +364,6 @@ impl Provider for AnthropicProvider {
             .json()
             .await
             .context("failed to parse API response")?;
-        let cleared = cleared_notice(resp.context_management.as_ref());
         Ok(Response {
             content: resp.content,
             stop_reason: resp.stop_reason,
@@ -373,10 +374,8 @@ impl Provider for AnthropicProvider {
                 cache_read_input_tokens: resp.usage.cache_read_input_tokens,
             },
             container_id: resp.container.map(|c| c.id),
-            warning: [warning, cleared]
-                .into_iter()
-                .flatten()
-                .reduce(|a, b| format!("{a}; {b}")),
+            warning,
+            context_cleared: cleared_notice(resp.context_management.as_ref()),
         })
     }
 
@@ -1100,7 +1099,7 @@ mod tests {
                     {"type": "clear_tool_uses_20250919", "cleared_tool_uses": 2,
                      "cleared_input_tokens": 125300}]}"#
             ),
-            Some("cleared 2 old web fetch results (~125.3k tokens)".into())
+            Some("cleared 2 old web fetch results (API reports ~125.3k tokens)".into())
         );
         assert_eq!(
             parse(
@@ -1108,7 +1107,7 @@ mod tests {
                     {"type": "clear_tool_uses_20250919", "cleared_tool_uses": 1,
                      "cleared_input_tokens": 900}]}"#
             ),
-            Some("cleared 1 old web fetch result (~900 tokens)".into())
+            Some("cleared 1 old web fetch result (API reports ~900 tokens)".into())
         );
         assert_eq!(
             parse(r#", "context_management": {"applied_edits": []}"#),

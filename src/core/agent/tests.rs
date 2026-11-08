@@ -25,6 +25,7 @@ impl Provider for FakeProvider {
             usage: Usage::default(),
             container_id: None,
             warning: None,
+            context_cleared: None,
         })
     }
     async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
@@ -46,6 +47,7 @@ impl Provider for RecordingProvider {
             usage: Usage::default(),
             container_id: None,
             warning: None,
+            context_cleared: None,
         })
     }
     async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
@@ -106,6 +108,7 @@ fn tool_use_response(name: &str, input: Value) -> Response {
         usage: Usage::default(),
         container_id: None,
         warning: None,
+        context_cleared: None,
     }
 }
 
@@ -116,6 +119,7 @@ fn end_turn_response(text: &str) -> Response {
         usage: Usage::default(),
         container_id: None,
         warning: None,
+        context_cleared: None,
     }
 }
 
@@ -3194,6 +3198,7 @@ async fn pause_turn_resumes_without_a_new_user_message() {
                 usage: Usage::default(),
                 container_id: None,
                 warning: None,
+                context_cleared: None,
             },
             end_turn_response("done"),
         ]),
@@ -3271,6 +3276,7 @@ async fn server_tool_blocks_render_as_tool_events_without_dispatch() {
                 usage: Usage::default(),
                 container_id: None,
                 warning: None,
+                context_cleared: None,
             },
             end_turn_response("done"),
         ]),
@@ -3383,6 +3389,7 @@ async fn web_fetch_blocks_render_as_tool_events_without_dispatch() {
                 usage: Usage::default(),
                 container_id: None,
                 warning: None,
+                context_cleared: None,
             },
             end_turn_response("done"),
         ]),
@@ -3445,6 +3452,57 @@ async fn web_fetch_blocks_render_as_tool_events_without_dispatch() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// The API reports the same clearing on every request while the old results stay in
+// history, so an identical notice shows once; a changed one shows again. Warnings
+// are unaffected.
+#[tokio::test]
+async fn context_cleared_notice_shows_only_when_it_changes() {
+    let (session, dir) = mk_session();
+    let cleared = |text: &str, warning: Option<&str>| Response {
+        warning: warning.map(String::from),
+        context_cleared: Some(text.into()),
+        ..end_turn_response("ok")
+    };
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            cleared("cleared 1", None),
+            cleared("cleared 1", Some("caps unknown")),
+            cleared("cleared 2", None),
+        ]),
+        seen_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    let mut notices = Vec::new();
+    for _ in 0..3 {
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            match ev {
+                AgentEvent::Notice { text } => notices.push(text),
+                AgentEvent::TurnComplete => break,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(notices, ["cleared 1", "caps unknown", "cleared 2"]);
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // Plays a fixed sequence of responses, recording the `container` of every request.
 struct ContainerLogProvider {
     responses: std::sync::Mutex<Vec<Response>>,
@@ -3486,6 +3544,7 @@ fn paused(content: Vec<ContentBlock>, container_id: Option<&str>) -> Response {
         usage: Usage::default(),
         container_id: container_id.map(String::from),
         warning: None,
+        context_cleared: None,
     }
 }
 
@@ -3555,6 +3614,7 @@ async fn code_execution_blocks_render_as_one_notice_without_cards() {
             usage: Usage::default(),
             container_id: Some("container_1".into()),
             warning: Some("caps unknown".into()),
+            context_cleared: None,
         }]),
         seen_containers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
@@ -3613,6 +3673,7 @@ async fn consecutive_text_blocks_emit_one_assistant_text_per_run() {
             usage: Usage::default(),
             container_id: None,
             warning: None,
+            context_cleared: None,
         }]),
         seen_containers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     };
