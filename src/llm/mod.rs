@@ -240,8 +240,8 @@ pub struct Response {
     pub stop_reason: String,
     pub usage: Usage,
     pub container_id: Option<String>,
-    // A provider-side degradation the user should know about (e.g. unknown
-    // model capabilities), surfaced once by the loop.
+    // Something provider-side the user should know about (e.g. unknown model
+    // capabilities, or old tool results cleared), surfaced once by the loop.
     pub warning: Option<String>,
 }
 

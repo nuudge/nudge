@@ -153,7 +153,12 @@ Searches run inside the API call, so no permission prompt gates them. Set
 
 It can then read a whole page or PDF with Anthropic's server-side web fetch tool
 (`web_fetch_20260318`). Fetch costs nothing beyond the tokens of the fetched content, and
-nudge caps each page at about 25,000 tokens (longer content is truncated). Fetch only works
+nudge caps each web page at about 25,000 tokens (longer pages are cut off without a marker).
+That cap doesn't apply to PDFs: they come back whole, up to Anthropic's PDF page and size
+limits (`content_too_large` beyond them), and can cost 100k+ tokens, so nudge steers Claude
+toward HTML pages (e.g. an arXiv abstract page). On models that support context editing,
+Anthropic clears old fetch results server-side once a request passes ~100k input tokens,
+and nudge shows a notice when it does; your stored session keeps them. Fetch only works
 on URLs you typed or that came from a web search or fetch result. nudge refuses URLs that
 appear only in a file or command output: otherwise a prompt injection in your repo could
 make a tool print a URL carrying your secrets and have Anthropic's servers fetch it, past
