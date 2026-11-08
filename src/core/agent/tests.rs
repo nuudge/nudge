@@ -23,6 +23,8 @@ impl Provider for FakeProvider {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: "end_turn".into(),
             usage: Usage::default(),
+            container_id: None,
+            warning: None,
         })
     }
     async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
@@ -42,6 +44,8 @@ impl Provider for RecordingProvider {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: "end_turn".into(),
             usage: Usage::default(),
+            container_id: None,
+            warning: None,
         })
     }
     async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
@@ -100,6 +104,8 @@ fn tool_use_response(name: &str, input: Value) -> Response {
         }],
         stop_reason: "tool_use".into(),
         usage: Usage::default(),
+        container_id: None,
+        warning: None,
     }
 }
 
@@ -108,6 +114,8 @@ fn end_turn_response(text: &str) -> Response {
         content: vec![ContentBlock::Text { text: text.into() }],
         stop_reason: "end_turn".into(),
         usage: Usage::default(),
+        container_id: None,
+        warning: None,
     }
 }
 
@@ -3144,6 +3152,387 @@ async fn auto_mode_survives_resume() {
         })
     });
     assert!(refused, "the restored mode is in effect");
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn web_search_blocks(id: &str, content: Value) -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::ServerToolUse {
+            id: id.into(),
+            name: "web_search".into(),
+            input: serde_json::json!({"query": "latest tokio"}),
+            extra: Default::default(),
+        },
+        ContentBlock::WebSearchToolResult {
+            tool_use_id: id.into(),
+            content,
+            extra: Default::default(),
+        },
+    ]
+}
+
+fn web_search_hits() -> Value {
+    serde_json::json!([{"type": "web_search_result", "url": "https://tokio.rs",
+                        "title": "Tokio", "encrypted_content": "x"}])
+}
+
+// A server-side search that hits the API's own loop limit stops with pause_turn: the
+// loop sends the partial assistant turn straight back (no user message in between)
+// and the turn completes once, after the continuation.
+#[tokio::test]
+async fn pause_turn_resumes_without_a_new_user_message() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            Response {
+                content: web_search_blocks("srv1", web_search_hits()),
+                stop_reason: "pause_turn".into(),
+                usage: Usage::default(),
+                container_id: None,
+                warning: None,
+            },
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    while let Some(ev) = agent_rx.recv().await {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            break;
+        }
+    }
+
+    let transcript = seen_messages.lock().unwrap().clone();
+    let roles: Vec<&str> = transcript.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant"], "{transcript:?}");
+    assert!(
+        matches!(
+            &transcript[1].content[..],
+            [
+                ContentBlock::ServerToolUse { .. },
+                ContentBlock::WebSearchToolResult { .. }
+            ]
+        ),
+        "{transcript:?}"
+    );
+
+    // A third model call would panic the scripted provider and fail the join below.
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    let mut extra_completes = 0;
+    while let Ok(ev) = agent_rx.try_recv() {
+        if matches!(ev, AgentEvent::TurnComplete) {
+            extra_completes += 1;
+        }
+    }
+    assert_eq!(extra_completes, 0, "the paused turn completes exactly once");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Server tool blocks surface as tool cards (a search error as an error result) but are
+// never dispatched: the tool_results turn answers only the client-side tool_use.
+#[tokio::test]
+async fn server_tool_blocks_render_as_tool_events_without_dispatch() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut content = web_search_blocks("srv1", web_search_hits());
+    content.extend(web_search_blocks(
+        "srv2",
+        serde_json::json!({"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}),
+    ));
+    content.push(ContentBlock::ToolUse {
+        id: "tu1".into(),
+        name: "Read".into(),
+        input: serde_json::json!({}),
+    });
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            Response {
+                content,
+                stop_reason: "tool_use".into(),
+                usage: Usage::default(),
+                container_id: None,
+                warning: None,
+            },
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut tool_events = Vec::new();
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::ToolUseStart { id, name, summary } => {
+                tool_events.push(format!("start {id} {name} {summary}"))
+            }
+            AgentEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            } => tool_events.push(format!("result {id} {is_error} {content}")),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        tool_events,
+        [
+            "start srv1 WebSearch latest tokio",
+            "result srv1 false Tokio — https://tokio.rs",
+            "start srv2 WebSearch latest tokio",
+            "result srv2 true web search error: max_uses_exceeded",
+            "start tu1 Read ",
+            "result tu1 false ",
+        ]
+    );
+
+    let transcript = seen_messages.lock().unwrap().clone();
+    match &transcript[2].content[..] {
+        [ContentBlock::ToolResult { tool_use_id, .. }] => assert_eq!(tool_use_id, "tu1"),
+        other => panic!("expected only the client tool's result, got {other:?}"),
+    }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Plays a fixed sequence of responses, recording the `container` of every request.
+struct ContainerLogProvider {
+    responses: std::sync::Mutex<Vec<Response>>,
+    seen_containers: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+}
+impl Provider for ContainerLogProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.seen_containers
+            .lock()
+            .unwrap()
+            .push(req.container.map(String::from));
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+fn code_execution_blocks() -> Vec<ContentBlock> {
+    vec![
+        ContentBlock::ServerToolUse {
+            id: "srvexec".into(),
+            name: "code_execution".into(),
+            input: serde_json::json!({"code": "print(await web_search({'query': 'q'}))"}),
+            extra: Default::default(),
+        },
+        ContentBlock::Other(serde_json::json!({
+            "type": "code_execution_tool_result", "tool_use_id": "srvexec",
+            "content": {"type": "code_execution_result", "stdout": "", "stderr": "",
+                        "return_code": 0, "content": []}
+        })),
+    ]
+}
+
+fn paused(content: Vec<ContentBlock>, container_id: Option<&str>) -> Response {
+    Response {
+        content,
+        stop_reason: "pause_turn".into(),
+        usage: Usage::default(),
+        container_id: container_id.map(String::from),
+        warning: None,
+    }
+}
+
+// The container rides only on pause_turn continuations within the same turn: the
+// latest id is kept across a pause whose response doesn't repeat it, and it never
+// leaks into the next turn's first request or a later turn's continuation.
+#[tokio::test]
+async fn pause_turn_continuations_carry_the_turns_container() {
+    let (session, dir) = mk_session();
+    let seen_containers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ContainerLogProvider {
+        responses: std::sync::Mutex::new(vec![
+            paused(code_execution_blocks(), Some("container_1")),
+            paused(Vec::new(), None),
+            end_turn_response("done"),
+            end_turn_response("second turn"),
+            paused(web_search_blocks("srv1", web_search_hits()), None),
+            end_turn_response("third turn"),
+        ]),
+        seen_containers: seen_containers.clone(),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    for _ in 0..3 {
+        ui_tx
+            .send((None, UiEvent::UserMessage { text: "go".into() }))
+            .await
+            .unwrap();
+        while let Some(ev) = agent_rx.recv().await {
+            if matches!(ev, AgentEvent::TurnComplete) {
+                break;
+            }
+        }
+    }
+
+    let container_1 = Some("container_1".to_string());
+    assert_eq!(
+        *seen_containers.lock().unwrap(),
+        [None, container_1.clone(), container_1, None, None, None]
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Code execution (dynamic filtering) gets no tool card, only one notice per response,
+// so no card is ever left running without a result.
+#[tokio::test]
+async fn code_execution_blocks_render_as_one_notice_without_cards() {
+    let (session, dir) = mk_session();
+    let mut content = code_execution_blocks();
+    content.extend(code_execution_blocks());
+    content.extend(web_search_blocks("srv1", web_search_hits()));
+    let provider = ContainerLogProvider {
+        responses: std::sync::Mutex::new(vec![Response {
+            content,
+            stop_reason: "end_turn".into(),
+            usage: Usage::default(),
+            container_id: Some("container_1".into()),
+            warning: Some("caps unknown".into()),
+        }]),
+        seen_containers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::ToolUseStart { id, name, .. } => events.push(format!("start {id} {name}")),
+            AgentEvent::ToolResult { id, .. } => events.push(format!("result {id}")),
+            AgentEvent::Notice { text } => events.push(format!("notice {text}")),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            "notice caps unknown".to_string(),
+            "start srv1 WebSearch".to_string(),
+            "result srv1".to_string(),
+            format!("notice {}", crate::llm::CODE_EXECUTION_NOTICE),
+        ]
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// A cited answer arrives as many text fragments (some empty); each run between
+// non-text blocks surfaces as one AssistantText so it renders as one message.
+#[tokio::test]
+async fn consecutive_text_blocks_emit_one_assistant_text_per_run() {
+    let (session, dir) = mk_session();
+    let text = |t: &str| ContentBlock::Text { text: t.into() };
+    let mut content = vec![text("| a |\n"), text(""), text("| b |")];
+    content.extend(web_search_blocks("srv1", web_search_hits()));
+    content.extend([text("x"), text("y")]);
+    let provider = ContainerLogProvider {
+        responses: std::sync::Mutex::new(vec![Response {
+            content,
+            stop_reason: "end_turn".into(),
+            usage: Usage::default(),
+            container_id: None,
+            warning: None,
+        }]),
+        seen_containers: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::AssistantText { text } => events.push(format!("text {text:?}")),
+            AgentEvent::ToolUseStart { id, .. } => events.push(format!("start {id}")),
+            AgentEvent::ToolResult { id, .. } => events.push(format!("result {id}")),
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        events,
+        [
+            r#"text "| a |\n| b |""#,
+            "start srv1",
+            "result srv1",
+            r#"text "xy""#,
+        ]
+    );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();

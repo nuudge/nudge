@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
 use crate::core::store::{SessionState, SessionStore};
-use crate::llm::ContentBlock;
+use crate::llm::{
+    CODE_EXECUTION_NOTICE, ContentBlock, WEB_SEARCH_TOOL, merge_text_runs, ran_code_execution,
+    web_search_query, web_search_results,
+};
 
 pub mod backend;
 pub mod context;
@@ -67,13 +70,16 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::WebSearchToolResult { .. }
+                        | ContentBlock::Other(_) => {}
                     }
                 }
             }
             "assistant" => {
-                for block in &msg.content {
-                    match block {
+                for block in merge_text_runs(&msg.content) {
+                    match block.as_ref() {
                         ContentBlock::Text { text } => {
                             out.push(ControllerEvent::AssistantText { text: text.clone() });
                         }
@@ -89,10 +95,38 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
                                 summary: tools::summarize(name, input),
                             });
                         }
+                        ContentBlock::ServerToolUse {
+                            id, name, input, ..
+                        } if name == WEB_SEARCH_TOOL => {
+                            out.push(ControllerEvent::ToolUseStart {
+                                id: id.clone(),
+                                name: "WebSearch".into(),
+                                summary: web_search_query(input),
+                            });
+                        }
+                        ContentBlock::WebSearchToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            let (content, is_error) = web_search_results(content);
+                            out.push(ControllerEvent::ToolResult {
+                                id: tool_use_id.clone(),
+                                content,
+                                is_error,
+                            });
+                        }
                         ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
-                        | ContentBlock::ToolResult { .. } => {}
+                        | ContentBlock::ToolResult { .. }
+                        | ContentBlock::ServerToolUse { .. }
+                        | ContentBlock::Other(_) => {}
                     }
+                }
+                if ran_code_execution(&msg.content) {
+                    out.push(ControllerEvent::Notice {
+                        text: CODE_EXECUTION_NOTICE.into(),
+                    });
                 }
             }
             _ => {}
@@ -232,5 +266,54 @@ mod tests {
             other => panic!("expected unattributed UserMessage, got {other:?}"),
         }
         assert!(matches!(events.last(), Some(ControllerEvent::TurnComplete)));
+    }
+
+    #[test]
+    fn replay_merges_cited_text_fragments_around_search_cards() {
+        let text = |t: &str| ContentBlock::Text { text: t.into() };
+        let entries = vec![LoggedMessage {
+            message: Message {
+                role: "assistant".into(),
+                content: vec![
+                    text("| a |\n"),
+                    text(""),
+                    text("| b |"),
+                    ContentBlock::ServerToolUse {
+                        id: "srv1".into(),
+                        name: "web_search".into(),
+                        input: serde_json::json!({"query": "q"}),
+                        extra: Default::default(),
+                    },
+                    ContentBlock::WebSearchToolResult {
+                        tool_use_id: "srv1".into(),
+                        content: serde_json::json!([]),
+                        extra: Default::default(),
+                    },
+                    text("x"),
+                    text("y"),
+                ],
+            },
+            sender: None,
+        }];
+
+        let events: Vec<String> = replay_events(&entries, 0)
+            .into_iter()
+            .map(|ev| match ev {
+                ControllerEvent::AssistantText { text } => format!("text {text:?}"),
+                ControllerEvent::ToolUseStart { id, .. } => format!("start {id}"),
+                ControllerEvent::ToolResult { id, .. } => format!("result {id}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                r#"text "| a |\n| b |""#,
+                "start srv1",
+                "result srv1",
+                r#"text "xy""#,
+                "TurnComplete",
+            ]
+        );
     }
 }

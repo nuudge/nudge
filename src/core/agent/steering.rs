@@ -94,6 +94,8 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         system,
         tools,
         tool_cache_boundary,
+        web_search: backend.web_search(),
+        container: None,
         messages,
     };
 

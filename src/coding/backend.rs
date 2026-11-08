@@ -28,24 +28,26 @@ pub struct CodingBackend {
     cwd: PathBuf,
     mcp: McpRegistry,
     skills: SkillRegistry,
+    web_search: bool,
     // Session-scoped Read-before-Edit tracker. Resumed sessions start with an
     // empty tracker — see file_state.rs for the rationale.
     file_state: Arc<Mutex<FileState>>,
 }
 
 impl CodingBackend {
-    pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry) -> Self {
+    pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry, web_search: bool) -> Self {
         Self {
             // Built once: the roster is derived from the compile-time tool set,
             // and the env/AGENTS.md are read at session start, so these stay
             // byte-stable across the session and anchor the cached prefix.
-            system_prompt: system_prompt_body(),
+            system_prompt: system_prompt_body(web_search),
             stable_env: stable_env_block(&cwd),
             agents_md: agents_md_block(&cwd),
             role_preamble: None,
             cwd,
             mcp,
             skills,
+            web_search,
             file_state: Arc::new(Mutex::new(FileState::default())),
         }
     }
@@ -75,6 +77,10 @@ impl Backend for CodingBackend {
 
     fn tool_schemas(&self) -> (Vec<serde_json::Value>, Option<usize>) {
         build_tool_array(&self.mcp, &self.skills)
+    }
+
+    fn web_search(&self) -> bool {
+        self.web_search
     }
 
     fn tool_summary(&self, name: &str, input: &serde_json::Value) -> String {
@@ -272,8 +278,9 @@ pub async fn print_preamble<P: Provider>(
     session: &Session,
     mcp: &McpRegistry,
     skills: &SkillRegistry,
+    web_search: bool,
 ) -> Result<()> {
-    let system_prompt = system_prompt_body();
+    let system_prompt = system_prompt_body(web_search);
     let stable_env = stable_env_block(&session.cwd);
     let volatile_env = volatile_env_block(&session.cwd);
     let agents_md = agents_md_block(&session.cwd);
@@ -286,29 +293,13 @@ pub async fn print_preamble<P: Provider>(
     );
     let (tools, boundary) = build_tool_array(mcp, skills);
 
-    println!("===== SYSTEM =====");
-    for block in &system {
-        println!("{}", block.text);
-        println!("\n----------");
-    }
-    println!("\n===== TOOLS ({}) =====", tools.len());
-    for t in &tools {
-        println!(
-            "- {}: {}",
-            t["name"].as_str().unwrap_or("?"),
-            t["description"].as_str().unwrap_or("")
-        );
-    }
-    println!("\n===== TOOL SCHEMAS (JSON) =====");
-    println!("{}", serde_json::to_string_pretty(&tools)?);
-
     // count_tokens needs a non-empty trailing user message; a 1-char probe
     // adds a negligible, constant offset that cancels in the system/tools delta.
     let probe = [Message {
         role: "user".into(),
         content: vec![ContentBlock::Text { text: ".".into() }],
     }];
-    let req = |tools: Vec<serde_json::Value>, boundary: Option<usize>| Request {
+    let req = |tools: Vec<serde_json::Value>, boundary: Option<usize>, web_search: bool| Request {
         model: &cfg.model,
         max_tokens: cfg.max_tokens,
         thinking_display: &cfg.thinking_display,
@@ -321,10 +312,31 @@ pub async fn print_preamble<P: Provider>(
         ),
         tools,
         tool_cache_boundary: boundary,
+        web_search,
+        container: None,
         messages: &probe,
     };
-    let sys_only = provider.count_tokens(&req(Vec::new(), None)).await;
-    let with_tools = provider.count_tokens(&req(tools, boundary)).await;
+    let full = req(tools, boundary, web_search);
+    let wire_tools = provider.wire_tools(&full).await;
+
+    println!("===== SYSTEM =====");
+    for block in &system {
+        println!("{}", block.text);
+        println!("\n----------");
+    }
+    println!("\n===== TOOLS ({}) =====", wire_tools.len());
+    for t in &wire_tools {
+        println!(
+            "- {}: {}",
+            t["name"].as_str().unwrap_or("?"),
+            t["description"].as_str().unwrap_or("")
+        );
+    }
+    println!("\n===== TOOL SCHEMAS (JSON) =====");
+    println!("{}", serde_json::to_string_pretty(&wire_tools)?);
+
+    let sys_only = provider.count_tokens(&req(Vec::new(), None, false)).await;
+    let with_tools = provider.count_tokens(&full).await;
     println!("\n===== TOKENS (count_tokens; includes a 1-char probe message) =====");
     match (sys_only, with_tools) {
         (Ok(s), Ok(a)) => {
@@ -353,6 +365,7 @@ mod tests {
             dir.clone(),
             McpRegistry::bootstrap(&[]).await,
             SkillRegistry::discover(&dir, None),
+            true,
         );
         assert!(
             plain
@@ -366,6 +379,7 @@ mod tests {
             dir.clone(),
             McpRegistry::bootstrap(&[]).await,
             SkillRegistry::discover(&dir, None),
+            true,
         )
         .into_subagent("ROLE: report to parent-x".into());
         let blocks = sub.system_blocks();

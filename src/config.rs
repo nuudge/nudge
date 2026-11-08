@@ -74,6 +74,9 @@ pub struct Config {
     /// `NUDGE_MAX_ITERATIONS` — model calls allowed per turn before the agent
     /// pauses for guidance; falls back to the built-in default.
     pub max_iterations: usize,
+    /// `NUDGE_WEB_SEARCH` — `off` withholds Anthropic's server-side web search
+    /// tool (billed per search); on by default.
+    pub web_search: bool,
 }
 
 impl Config {
@@ -85,6 +88,7 @@ impl Config {
             relay: env::var("NUDGE_RELAY").ok(),
             model: default_model(),
             max_iterations: parse_max_iterations(nonempty_var("NUDGE_MAX_ITERATIONS").as_deref())?,
+            web_search: parse_web_search(nonempty_var("NUDGE_WEB_SEARCH").as_deref())?,
         })
     }
 }
@@ -123,6 +127,14 @@ fn parse_max_iterations(raw: Option<&str>) -> Result<usize> {
             Ok(n) if n >= 1 => Ok(n),
             _ => bail!("NUDGE_MAX_ITERATIONS must be a positive integer, got '{s}'"),
         },
+    }
+}
+
+fn parse_web_search(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        None | Some("on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(other) => bail!("NUDGE_WEB_SEARCH must be 'on' or 'off', got '{other}'"),
     }
 }
 
@@ -203,5 +215,13 @@ mod tests {
         assert_eq!(parse_max_iterations(Some("100")).unwrap(), 100);
         assert!(parse_max_iterations(Some("0")).is_err());
         assert!(parse_max_iterations(Some("many")).is_err());
+    }
+
+    #[test]
+    fn web_search_defaults_on_and_rejects_garbage() {
+        assert!(parse_web_search(None).unwrap());
+        assert!(parse_web_search(Some("on")).unwrap());
+        assert!(!parse_web_search(Some("off")).unwrap());
+        assert!(parse_web_search(Some("no")).is_err());
     }
 }

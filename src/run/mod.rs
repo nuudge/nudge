@@ -112,10 +112,11 @@ pub async fn host(cli: Cli) -> Result<()> {
     }
 
     if cli.print_prompt {
-        return coding::print_preamble(&cfg, &provider, &session, &mcp, &skills).await;
+        return coding::print_preamble(&cfg, &provider, &session, &mcp, &skills, config.web_search)
+            .await;
     }
 
-    let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills);
+    let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
 
     // Pre-translate the resumed transcript to controller events and seed the
     // host's replay buffer with it, so the TUI (and later a remote client)
@@ -158,6 +159,7 @@ pub async fn host(cli: Cli) -> Result<()> {
         session.id.clone(),
         config.model.clone(),
         config.max_iterations,
+        config.web_search,
     );
 
     // This session's peer identity, announced on every peer edge: the renamed name if

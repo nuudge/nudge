@@ -40,8 +40,8 @@ Conventions
 - File paths are absolute; resolve any relative reference against the working directory shown below.
 - When several tool calls are independent (reading several files, parallel searches), emit them in one response so they run together rather than serially.";
 
-pub fn system_prompt_body() -> String {
-    SYSTEM_PROMPT_TEMPLATE.replace("{{TOOLS}}", &tools::roster())
+pub fn system_prompt_body(web_search: bool) -> String {
+    SYSTEM_PROMPT_TEMPLATE.replace("{{TOOLS}}", &tools::roster(web_search))
 }
 
 // The role preamble a spawned subagent runs under (see `CodingBackend::into_subagent`).

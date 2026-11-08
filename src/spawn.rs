@@ -32,6 +32,7 @@ pub fn peer_factory(
     parent_session_id: String,
     model: String,
     max_iterations: usize,
+    web_search: bool,
 ) -> core::PeerFactory {
     Box::new(move |task: String, parent: core::BrokerHandle| {
         let api_key = api_key.clone();
@@ -57,7 +58,7 @@ pub fn peer_factory(
             // to the spawner via MessagePeer).
             let mcp = coding::mcp::McpRegistry::bootstrap(&[]).await;
             let skills = coding::skills::SkillRegistry::discover(&cwd, None);
-            let backend = coding::CodingBackend::new(cwd, mcp, skills)
+            let backend = coding::CodingBackend::new(cwd, mcp, skills, web_search)
                 .into_subagent(coding::prompt::subagent_role(&parent_who.name));
             let cfg = AgentConfig {
                 model,
