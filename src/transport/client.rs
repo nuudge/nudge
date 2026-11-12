@@ -30,6 +30,10 @@ const CHANNEL_CAPACITY: usize = 64;
 // instead of a hang.
 const REVERSE_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Several relay pair timeouts' worth of failed redials: past a sleep's network
+// recovery, so the likelier cause is a restarted daemon (see `redial`).
+const RESTART_HINT_AFTER: Duration = Duration::from_secs(120);
+
 // The remote counterpart of `SessionHost`: it owns no loop, only the path to a
 // daemon's Unix socket. Each `attach` opens a fresh connection, performs the
 // handshake, and spawns two bridge tasks that translate between socket frames and
@@ -336,19 +340,23 @@ async fn stay_attached(
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
     mut ui_rx: mpsc::Receiver<UiEvent>,
 ) {
+    let mut unsent = None;
     while pump_relay(
         &mut reader,
         &mut writer,
         &event_tx,
         &mut ui_rx,
         &mut last_seq,
+        &mut unsent,
     )
     .await
     {
+        // TUI input typed from here on queues in `ui_rx` (nothing drains it until the
+        // next `pump_relay`), so it flushes in order after the re-attach.
         let _ = event_tx.send(ControllerEvent::Notice {
             text: "relay connection lost — reconnecting…".into(),
         });
-        match redial(&client, &who, last_seq, &event_tx).await {
+        match redial(&client, &who, last_seq, &event_tx, RESTART_HINT_AFTER).await {
             Some(conn) => (reader, writer) = conn,
             None => return,
         }
@@ -359,23 +367,33 @@ async fn stay_attached(
 }
 
 // Bridge the TUI's channels to one live connection. `true` = the connection dropped
-// under the TUI (worth a redial); `false` = the TUI let go (detach / quit).
+// under the TUI (worth a redial); `false` = the TUI let go (detach / quit). A command
+// whose send failed as the socket died is kept in `unsent` and goes out first on the
+// next connection.
 async fn pump_relay(
     reader: &mut RelayReader,
     writer: &mut RelayWriter,
     event_tx: &mpsc::UnboundedSender<ControllerEvent>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
     last_seq: &mut Option<u64>,
+    unsent: &mut Option<ClientFrame>,
 ) -> bool {
+    if let Some(frame) = unsent.take()
+        && writer.send(&frame).await.is_err()
+    {
+        *unsent = Some(frame);
+        return true;
+    }
     let mut ping = keepalive_timer();
     loop {
         tokio::select! {
             frame = reader.recv() => match frame {
                 Ok(Some(ServerFrame::Event { seq, event })) => {
-                    *last_seq = Some(seq);
+                    // The resume cursor only advances past what the TUI actually got.
                     if event_tx.send(event).is_err() {
                         break;
                     }
+                    *last_seq = Some(seq);
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => return true,
@@ -384,11 +402,13 @@ async fn pump_relay(
                 Some(ui) => {
                     // The daemon answers a Quit by closing; that close is no drop.
                     let quitting = matches!(ui, UiEvent::Quit);
-                    let sent = writer.send(&ClientFrame::Command(ui)).await.is_ok();
+                    let frame = ClientFrame::Command(ui);
+                    let sent = writer.send(&frame).await.is_ok();
                     if quitting {
                         return false;
                     }
                     if !sent {
+                        *unsent = Some(frame);
                         return true;
                     }
                 }
@@ -409,12 +429,20 @@ async fn pump_relay(
 // as the TUI stays attached: with no Reattach button to fall back on, giving up would
 // strand a TUI whose network is slow to return after a wake. `None` = stop: the TUI
 // let go, or the session is gone.
+//
+// A restarted daemon minted a new room, so the old code's room has no host: every
+// attempt then parks as a lonely client until the relay's pair timeout closes it, and
+// the retries would go on silently. Once failures have lasted `restart_hint_after`,
+// say so once — the user is the only one who can fetch the new code.
 async fn redial(
     client: &RelayClient,
     who: &ClientIdentity,
     last_seq: Option<u64>,
     event_tx: &mpsc::UnboundedSender<ControllerEvent>,
+    restart_hint_after: Duration,
 ) -> Option<(RelayReader, RelayWriter)> {
+    let started = tokio::time::Instant::now();
+    let mut hinted = false;
     let mut attempt: u32 = 0;
     loop {
         let backoff = Duration::from_secs(1 << attempt.min(3));
@@ -430,6 +458,14 @@ async fn redial(
             Ok(Some(conn)) => return Some(conn),
             Ok(None) => return None,
             Err(_) => {}
+        }
+        if !hinted && started.elapsed() >= restart_hint_after {
+            hinted = true;
+            let _ = event_tx.send(ControllerEvent::Notice {
+                text: "still reconnecting — if the session was restarted, its pairing code \
+                       changed; quit and reconnect with the new code"
+                    .into(),
+            });
         }
     }
 }
@@ -484,5 +520,51 @@ async fn dial_pump<R, W>(
                 Ok(None) | Err(_) => break,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A pairing whose room never answers again (the daemon restarted) keeps retrying,
+    // but says once — and only once — that the code may be stale.
+    #[tokio::test]
+    async fn redial_hints_once_at_a_stale_code() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let client = RelayClient::new(
+            format!("ws://127.0.0.1:{port}/r/client"),
+            Cipher::generate(),
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+        let redialing = tokio::spawn(async move {
+            redial(
+                &client,
+                &ClientIdentity::human("a"),
+                None,
+                &event_tx,
+                Duration::ZERO,
+            )
+            .await;
+        });
+
+        match timeout(Duration::from_secs(3), event_rx.recv()).await {
+            Ok(Some(ControllerEvent::Notice { text })) => assert!(text.contains("pairing code")),
+            other => panic!("expected the stale-code hint, got {other:?}"),
+        }
+        assert!(
+            timeout(Duration::from_secs(3), event_rx.recv())
+                .await
+                .is_err(),
+            "the hint repeated on a later failed attempt"
+        );
+        assert!(
+            !redialing.is_finished(),
+            "redial gave up instead of retrying"
+        );
+        redialing.abort();
     }
 }

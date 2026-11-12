@@ -628,6 +628,37 @@ mod tests {
         assert_eq!(recv(&mut b).await, b"still-piped");
     }
 
+    // A client that never pings but keeps reading (nudge 0.5.0 and older) answers the
+    // relay's own pings, so it outlives the idle deadline many times over — both as a
+    // parked spare and as a quiet pair.
+    #[tokio::test]
+    async fn reading_client_that_never_pings_stays_connected() {
+        let idle = Duration::from_millis(300);
+        let port = start_relay_idle(DEFAULT_PAIR_TIMEOUT, idle).await;
+        let mut h = dial(port, "room/host").await;
+        assert!(
+            timeout(idle * 4, next_data(&mut h)).await.is_err(),
+            "a parked reader was closed despite answering pings"
+        );
+
+        let mut c = dial(port, "room/client").await;
+        c.send(bin(b"paired")).await.unwrap();
+        assert_eq!(recv(&mut h).await, b"paired");
+        let (h_quiet, c_quiet) = tokio::join!(
+            timeout(idle * 4, next_data(&mut h)),
+            timeout(idle * 4, next_data(&mut c)),
+        );
+        assert!(
+            h_quiet.is_err() && c_quiet.is_err(),
+            "a quiet pair of readers was closed despite answering pings"
+        );
+
+        h.send(bin(b"h2c")).await.unwrap();
+        assert_eq!(recv(&mut c).await, b"h2c");
+        c.send(bin(b"c2h")).await.unwrap();
+        assert_eq!(recv(&mut h).await, b"c2h");
+    }
+
     // When one leg of a live pair goes silent past the idle deadline, the relay closes
     // the pair and the surviving end gets a Close (its reap cascade's trigger).
     #[tokio::test]

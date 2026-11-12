@@ -509,13 +509,36 @@ async fn expect_notice(ctrl: &mut Controller, want: &str) {
 
 // A `--connect` TUI's relay connection is killed mid-session (a laptop sleep): the
 // client says so, redials the same pairing on its own, and resumes after the last
-// event it saw — the missed event arrives once, and nothing already seen replays.
+// event it saw — the missed event arrives once, and nothing already seen replays (no
+// second SessionInfo/Capabilities, no re-prompt). A permission prompt seen before the
+// drop and answered during the outage still resolves through the new connection: the
+// broker matches answers by tool_use_id, from whichever controller sends them.
 #[tokio::test]
 async fn relay_client_reconnects_and_resumes_after_a_drop() {
+    use crate::core::ModelInfo;
+
     let (port, kill) = spawn_role_relay().await;
     let base = format!("ws://127.0.0.1:{port}/room1");
     let cipher = Cipher::generate();
-    let bb = spawn_bare_broker(Vec::new());
+    let bb = spawn_bare_broker(vec![
+        ControllerEvent::SessionInfo {
+            model: "m".into(),
+            cwd: "/tmp".into(),
+            git_branch: None,
+            session_id: "s".into(),
+            session_name: None,
+            auto: false,
+        },
+        ControllerEvent::Capabilities {
+            commands: Vec::new(),
+            models: vec![ModelInfo {
+                id: "id1".into(),
+                label: "L1".into(),
+            }],
+            mcp: Vec::new(),
+            peers: Vec::new(),
+        },
+    ]);
     let daemon = tokio::spawn(run_relay_daemon(
         vec![RelayLeg {
             dial_url: format!("{base}/host"),
@@ -534,6 +557,14 @@ async fn relay_client_reconnects_and_resumes_after_a_drop() {
     .await
     .expect("attach timed out")
     .expect("attach failed");
+    assert!(matches!(
+        next_event(&mut a).await,
+        Some(ControllerEvent::SessionInfo { .. })
+    ));
+    assert!(matches!(
+        next_event(&mut a).await,
+        Some(ControllerEvent::Capabilities { .. })
+    ));
     for text in ["one", "two"] {
         bb.agent_tx
             .send(AgentEvent::AssistantText { text: text.into() })
@@ -541,9 +572,30 @@ async fn relay_client_reconnects_and_resumes_after_a_drop() {
             .unwrap();
         expect_text(&mut a, text).await;
     }
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<bool>();
+    bb.agent_tx
+        .send(AgentEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+            respond: resp_tx,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut a).await,
+        Some(ControllerEvent::PermissionRequest { .. })
+    ));
 
     kill.send(()).unwrap();
     expect_notice(&mut a, "reconnecting").await;
+    a.ui_tx
+        .send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
     bb.agent_tx
         .send(AgentEvent::AssistantText {
             text: "three".into(),
@@ -552,6 +604,15 @@ async fn relay_client_reconnects_and_resumes_after_a_drop() {
         .unwrap();
     expect_notice(&mut a, "reconnected").await;
     expect_text(&mut a, "three").await;
+    match next_event(&mut a).await {
+        Some(ControllerEvent::PermissionResolved { allow: true, .. }) => {}
+        other => panic!("expected the prompt resolved after reconnect, got {other:?}"),
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(5), resp_rx).await,
+        Ok(Ok(true)),
+        "the loop never got the answer sent during the outage"
+    );
     assert!(
         timeout(Duration::from_millis(300), a.events.recv())
             .await
