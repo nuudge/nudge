@@ -352,12 +352,13 @@ async fn relay_sees_only_ciphertext() {
 // room id (path `<room>/<role>`), like the real relay binary. `spawn_test_relay` above
 // is fixed at two connections, so it can't exercise the daemon's spare-dial pool
 // serving *concurrent* clients — this can. A host spare parks with no timeout; a client
-// waits for a host; the party that parked owns the pump.
+// waits for a host; the party that parked owns the pump. Sending on the returned kill
+// switch drops every live pair at once (a forced network drop); parked spares survive.
 //
 // The handshake callback's `Err` type is tungstenite's large `ErrorResponse`, fixed by
 // its `Callback` trait (same as the real relay) — and we only ever return `Ok`.
 #[allow(clippy::result_large_err)]
-async fn spawn_role_relay() -> u16 {
+async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
     use futures::{SinkExt, StreamExt};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -374,12 +375,15 @@ async fn spawn_role_relay() -> u16 {
     }
 
     let rooms: Arc<Mutex<HashMap<String, Room>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (kill_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let kill = kill_tx.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let rooms = rooms.clone();
+            let kill = kill.clone();
             tokio::spawn(async move {
                 let mut path = String::new();
                 let ws = accept_hdr_async(stream, |req: &Request, resp: Response| {
@@ -418,6 +422,7 @@ async fn spawn_role_relay() -> u16 {
                     Err(_) => return,
                 };
                 // Pump verbatim until either side closes.
+                let mut killed = kill.subscribe();
                 let (mut at, mut ar) = ws.split();
                 let (mut bt, mut br) = partner.split();
                 loop {
@@ -430,12 +435,13 @@ async fn spawn_role_relay() -> u16 {
                             Some(Ok(x)) => if at.send(x).await.is_err() { break },
                             _ => break,
                         },
+                        _ = killed.recv() => break,
                     }
                 }
             });
         }
     });
-    port
+    (port, kill_tx)
 }
 
 // Two `RelayClient`s attach to one session concurrently over the role-aware relay: the
@@ -445,7 +451,7 @@ async fn spawn_role_relay() -> u16 {
 // `issues/relay-single-remote-client.md`.
 #[tokio::test]
 async fn relay_two_clients_attach_concurrently() {
-    let port = spawn_role_relay().await;
+    let (port, _kill) = spawn_role_relay().await;
     let base = format!("ws://127.0.0.1:{port}/room1");
     let host_url = format!("{base}/host");
     let client_url = format!("{base}/client");
@@ -489,6 +495,69 @@ async fn relay_two_clients_attach_concurrently() {
         .unwrap();
     expect_text(&mut a, "hi-all").await;
     expect_text(&mut b, "hi-all").await;
+
+    daemon.abort();
+    bb.task.abort();
+}
+
+async fn expect_notice(ctrl: &mut Controller, want: &str) {
+    match next_event(ctrl).await {
+        Some(ControllerEvent::Notice { text }) if text.contains(want) => {}
+        other => panic!("expected a Notice containing {want:?}, got {other:?}"),
+    }
+}
+
+// A `--connect` TUI's relay connection is killed mid-session (a laptop sleep): the
+// client says so, redials the same pairing on its own, and resumes after the last
+// event it saw — the missed event arrives once, and nothing already seen replays.
+#[tokio::test]
+async fn relay_client_reconnects_and_resumes_after_a_drop() {
+    let (port, kill) = spawn_role_relay().await;
+    let base = format!("ws://127.0.0.1:{port}/room1");
+    let cipher = Cipher::generate();
+    let bb = spawn_bare_broker(Vec::new());
+    let daemon = tokio::spawn(run_relay_daemon(
+        vec![RelayLeg {
+            dial_url: format!("{base}/host"),
+            cipher: cipher.clone(),
+            profile: ClientProfile::human(),
+            peer_accept: None,
+        }],
+        bb.handle.clone(),
+    ));
+
+    let client = RelayClient::new(format!("{base}/client"), cipher);
+    let mut a = timeout(
+        Duration::from_secs(5),
+        client.attach(ClientIdentity::human("a")),
+    )
+    .await
+    .expect("attach timed out")
+    .expect("attach failed");
+    for text in ["one", "two"] {
+        bb.agent_tx
+            .send(AgentEvent::AssistantText { text: text.into() })
+            .await
+            .unwrap();
+        expect_text(&mut a, text).await;
+    }
+
+    kill.send(()).unwrap();
+    expect_notice(&mut a, "reconnecting").await;
+    bb.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "three".into(),
+        })
+        .await
+        .unwrap();
+    expect_notice(&mut a, "reconnected").await;
+    expect_text(&mut a, "three").await;
+    assert!(
+        timeout(Duration::from_millis(300), a.events.recv())
+            .await
+            .is_err(),
+        "a resumed attach replayed events the client already had"
+    );
 
     daemon.abort();
     bb.task.abort();

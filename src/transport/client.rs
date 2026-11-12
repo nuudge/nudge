@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use futures::stream::{SplitSink, SplitStream};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::encryption::Cipher;
 use super::wire::{
@@ -115,28 +117,62 @@ impl SessionHandle for SocketClient {
 
 // The relayed counterpart of `SocketClient`: it owns no loop, only the relay URL
 // (rendezvous path included) it dials OUT to. `attach` opens a fresh WebSocket
-// through the relay, runs the same handshake, and spawns the same bridge tasks as
-// the Unix client — only the codec differs (`WsReader`/`WsWriter` instead of
-// `LineReader`/`LineWriter`), so the TUI is unchanged across transports. Every
-// frame is end-to-end encrypted under `cipher` before it hits the relay (8.2-d).
+// through the relay, runs the same handshake as the Unix client — only the codec
+// differs (`WsReader`/`WsWriter` instead of `LineReader`/`LineWriter`), so the TUI is
+// unchanged across transports. Unlike a Unix socket, a relayed connection can die
+// under a live TUI (a laptop sleeping), so the connection is supervised and redialed
+// (see `stay_attached`). Every frame is end-to-end encrypted under `cipher` before it
+// hits the relay (8.2-d).
+#[derive(Clone)]
 pub struct RelayClient {
     relay_url: String,
     cipher: Cipher,
 }
+
+type RelayWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type RelayReader = WsReader<SplitStream<RelayWs>>;
+type RelayWriter = WsWriter<SplitSink<RelayWs, Message>>;
 
 impl RelayClient {
     pub fn new(relay_url: String, cipher: Cipher) -> Self {
         Self { relay_url, cipher }
     }
 
-    // Dial the relay + handshake on a fresh connection. Split from the trait method
-    // (mirroring `SocketClient::connect`) so the first connect — run before the TUI
-    // owns the screen — can surface its error cause via `run_connect`.
+    // Dial the relay + handshake, then keep the TUI attached across drops. Split from
+    // the trait method (mirroring `SocketClient::connect`) so the first connect — run
+    // before the TUI owns the screen — can surface its error cause via `run_connect`.
     pub(crate) async fn connect(
         &self,
         after_seq: Option<u64>,
         who: ClientIdentity,
     ) -> Result<Option<Controller>> {
+        let Some(conn) = self.open(after_seq, who.clone()).await? else {
+            return Ok(None); // session gone (broker down)
+        };
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+        let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
+        tokio::spawn(stay_attached(
+            self.clone(),
+            who,
+            after_seq,
+            conn,
+            event_tx,
+            ui_rx,
+        ));
+
+        Ok(Some(Controller {
+            events: event_rx,
+            ui_tx,
+        }))
+    }
+
+    // One connection: dial the relay and run the attach handshake. `None` = reachable,
+    // but the session is gone (Busy).
+    async fn open(
+        &self,
+        after_seq: Option<u64>,
+        who: ClientIdentity,
+    ) -> Result<Option<(RelayReader, RelayWriter)>> {
         let (ws, _resp) = connect_async(self.relay_url.as_str())
             .await
             .with_context(|| format!("dialing relay at {}", self.relay_url))?;
@@ -153,20 +189,10 @@ impl RelayClient {
             .await?;
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
-            Some(ServerFrame::Attached) => {}
-            Some(ServerFrame::Busy) => return Ok(None), // session gone (broker down)
+            Some(ServerFrame::Attached) => Ok(Some((reader, writer))),
+            Some(ServerFrame::Busy) => Ok(None),
             other => anyhow::bail!("unexpected handshake response: {other:?}"),
         }
-
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
-        let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
-        tokio::spawn(pump_reads(reader, event_tx));
-        tokio::spawn(pump_writes(writer, ui_rx));
-
-        Ok(Some(Controller {
-            events: event_rx,
-            ui_tx,
-        }))
     }
 
     // Dial a peer session over the relay and establish the DUPLEX edge (#60): both
@@ -251,9 +277,9 @@ impl SessionHandle for RelayClient {
         self.connect(None, who).await.ok().flatten()
     }
 
-    // No-op: the connection lives in the bridge tasks. Dropping the `Controller`
-    // closes `ui_rx` (pump_writes sends a Detach frame, then drops the sink) and the
-    // event receiver, which the daemon reads as a pause-in-place detach.
+    // No-op: the connection lives in `stay_attached`. Dropping the `Controller` closes
+    // `ui_rx` (it sends a Detach frame, then drops the socket) and the event receiver,
+    // which the daemon reads as a pause-in-place detach — and which stops any redial.
     fn detach(&self) {}
 }
 
@@ -289,19 +315,123 @@ async fn pump_writes<W: FrameWriter<ClientFrame> + 'static>(
     mut writer: W,
     mut ui_rx: mpsc::Receiver<UiEvent>,
 ) {
-    let mut ping = keepalive_timer();
-    loop {
-        tokio::select! {
-            ev = ui_rx.recv() => match ev {
-                Some(ev) => if writer.send(&ClientFrame::Command(ev)).await.is_err() {
-                    return; // connection gone; the reader task will also wind down
-                },
-                None => break,
-            },
-            _ = ping.tick() => if writer.keepalive().await.is_err() { return },
+    while let Some(ev) = ui_rx.recv().await {
+        if writer.send(&ClientFrame::Command(ev)).await.is_err() {
+            return; // connection gone; the reader task will also wind down
         }
     }
     let _ = writer.send(&ClientFrame::Detach).await;
+}
+
+// Keep a TUI attached over one relay connection after another — the phone's
+// ChatViewModel pattern. When the socket dies under a still-attached TUI, redial the
+// same pairing and resume after the last event it saw (`after_seq`), so only the gap
+// replays and the transcript isn't duplicated. Ends, dropping `event_tx` (which the TUI
+// reads as "session ended"), once the TUI lets go or the session is gone.
+async fn stay_attached(
+    client: RelayClient,
+    who: ClientIdentity,
+    mut last_seq: Option<u64>,
+    (mut reader, mut writer): (RelayReader, RelayWriter),
+    event_tx: mpsc::UnboundedSender<ControllerEvent>,
+    mut ui_rx: mpsc::Receiver<UiEvent>,
+) {
+    while pump_relay(
+        &mut reader,
+        &mut writer,
+        &event_tx,
+        &mut ui_rx,
+        &mut last_seq,
+    )
+    .await
+    {
+        let _ = event_tx.send(ControllerEvent::Notice {
+            text: "relay connection lost — reconnecting…".into(),
+        });
+        match redial(&client, &who, last_seq, &event_tx).await {
+            Some(conn) => (reader, writer) = conn,
+            None => return,
+        }
+        let _ = event_tx.send(ControllerEvent::Notice {
+            text: "reconnected".into(),
+        });
+    }
+}
+
+// Bridge the TUI's channels to one live connection. `true` = the connection dropped
+// under the TUI (worth a redial); `false` = the TUI let go (detach / quit).
+async fn pump_relay(
+    reader: &mut RelayReader,
+    writer: &mut RelayWriter,
+    event_tx: &mpsc::UnboundedSender<ControllerEvent>,
+    ui_rx: &mut mpsc::Receiver<UiEvent>,
+    last_seq: &mut Option<u64>,
+) -> bool {
+    let mut ping = keepalive_timer();
+    loop {
+        tokio::select! {
+            frame = reader.recv() => match frame {
+                Ok(Some(ServerFrame::Event { seq, event })) => {
+                    *last_seq = Some(seq);
+                    if event_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => return true,
+            },
+            ui = ui_rx.recv() => match ui {
+                Some(ui) => {
+                    // The daemon answers a Quit by closing; that close is no drop.
+                    let quitting = matches!(ui, UiEvent::Quit);
+                    let sent = writer.send(&ClientFrame::Command(ui)).await.is_ok();
+                    if quitting {
+                        return false;
+                    }
+                    if !sent {
+                        return true;
+                    }
+                }
+                None => break,
+            },
+            _ = ping.tick() => {
+                if FrameWriter::<ClientFrame>::keepalive(writer).await.is_err() {
+                    return true;
+                }
+            }
+        }
+    }
+    let _ = writer.send(&ClientFrame::Detach).await;
+    false
+}
+
+// Redial with backoff — 1s, 2s, 4s, then every 8s, the phone's schedule — for as long
+// as the TUI stays attached: with no Reattach button to fall back on, giving up would
+// strand a TUI whose network is slow to return after a wake. `None` = stop: the TUI
+// let go, or the session is gone.
+async fn redial(
+    client: &RelayClient,
+    who: &ClientIdentity,
+    last_seq: Option<u64>,
+    event_tx: &mpsc::UnboundedSender<ControllerEvent>,
+) -> Option<(RelayReader, RelayWriter)> {
+    let mut attempt: u32 = 0;
+    loop {
+        let backoff = Duration::from_secs(1 << attempt.min(3));
+        attempt += 1;
+        let dialed = tokio::select! {
+            _ = event_tx.closed() => return None,
+            dialed = async {
+                tokio::time::sleep(backoff).await;
+                client.open(last_seq, who.clone()).await
+            } => dialed,
+        };
+        match dialed {
+            Ok(Some(conn)) => return Some(conn),
+            Ok(None) => return None,
+            Err(_) => {}
+        }
+    }
 }
 
 // The dialer's half of the duplex peer edge (#60): both directed edges over one
