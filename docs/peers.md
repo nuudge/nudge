@@ -101,10 +101,9 @@ driving their own sessions throughout.
 - **Disconnects are reaped, not repaired.** If the peer exits or the link drops you get
   `[peer <name>] disconnected` and the roster updates. There's no auto-reconnect yet:
   re-run `/connect-peer` with the same code (it stays valid until the target daemon
-  restarts). Deployed relays without keepalive can also drop idle connections or delay
-  disconnect detection — known, tracked in
-  [#65](https://github.com/nuudge/nudge/issues/65) /
-  [#62](https://github.com/nuudge/nudge/issues/62); a retry is safe.
+  restarts). A link that dies silently (say, the other laptop went to sleep) is caught
+  by keepalive pings within about a minute of the machine being awake; auto-reconnect
+  is tracked in [#62](https://github.com/nuudge/nudge/issues/62). A retry is safe.
 
 ## Command reference
 

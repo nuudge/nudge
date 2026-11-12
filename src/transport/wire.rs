@@ -1,10 +1,12 @@
 use std::future::Future;
+use std::time::Duration;
 
 use anyhow::Result;
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::time::{Instant, Interval, interval_at, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::encryption::Cipher;
@@ -133,6 +135,25 @@ pub trait FrameReader<F>: Send {
 
 pub trait FrameWriter<F>: Send {
     fn send(&mut self, frame: &F) -> impl Future<Output = Result<()>> + Send;
+
+    // Prove the connection is alive to the far hop. Only a relayed WebSocket can die
+    // silently (a sleeping laptop leaves it half-open); a Unix socket's peer dying
+    // surfaces as EOF, so it has nothing to send.
+    fn keepalive(&mut self) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+}
+
+// How often every relay leg pings; matches the phone (OkHttp `pingInterval(20s)`).
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+// No frame of any kind for this long — three ping intervals without even a pong —
+// means the socket is dead. Must stay above the relay's own ping interval too.
+const READ_DEADLINE: Duration = Duration::from_secs(60);
+
+// The tick that drives `FrameWriter::keepalive` next to each read/write loop.
+pub fn keepalive_timer() -> Interval {
+    interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL)
 }
 
 // The newline-delimited-JSON codec over a raw byte stream — the Unix-socket
@@ -167,9 +188,15 @@ where
 // sealed with the app-layer [`Cipher`] before it becomes a Message and opened on
 // receipt, so the relay only ever forwards opaque ciphertext (8.2-d). Generic over
 // the underlying sink/stream so it works for any tokio-tungstenite connection.
+//
+// The read deadline is reader state (time of the last frame) rather than a per-call
+// timeout, because callers `select!` on `recv` alongside ping ticks and events: each
+// of those restarts the call, and a per-call timeout would never trip.
 pub struct WsReader<St> {
     stream: St,
     cipher: Cipher,
+    deadline: Duration,
+    last_frame: Instant,
 }
 pub struct WsWriter<Si> {
     sink: Si,
@@ -178,7 +205,12 @@ pub struct WsWriter<Si> {
 
 impl<St> WsReader<St> {
     pub fn new(stream: St, cipher: Cipher) -> Self {
-        Self { stream, cipher }
+        Self {
+            stream,
+            cipher,
+            deadline: READ_DEADLINE,
+            last_frame: Instant::now(),
+        }
     }
 }
 
@@ -195,8 +227,14 @@ where
     F: DeserializeOwned,
 {
     async fn recv(&mut self) -> Result<Option<F>> {
-        while let Some(msg) = self.stream.next().await {
-            match msg? {
+        loop {
+            let msg = match timeout_at(self.last_frame + self.deadline, self.stream.next()).await {
+                Ok(Some(msg)) => msg?,
+                Ok(None) => return Ok(None), // stream ended without a Close frame
+                Err(_) => anyhow::bail!("no frame received in {:?}", self.deadline),
+            };
+            self.last_frame = Instant::now();
+            match msg {
                 Message::Binary(sealed) => {
                     let plaintext = self.cipher.open(&sealed)?;
                     return Ok(Some(serde_json::from_slice(&plaintext)?));
@@ -204,11 +242,11 @@ where
                 // A Close (like a byte-stream EOF) ends the frame stream cleanly.
                 Message::Close(_) => return Ok(None),
                 // Only Binary carries sealed application frames; ping/pong/text/
-                // continuation frames have no payload for us — skip and keep reading.
+                // continuation frames have no payload for us — but they do prove the
+                // socket alive, so skip them and keep reading.
                 _ => continue,
             }
         }
-        Ok(None) // stream ended without a Close frame
     }
 }
 
@@ -224,6 +262,11 @@ where
         // `SinkExt::send` feeds + flushes, matching the line codec's flush-per-frame
         // so an interactive control channel stays low-latency.
         self.sink.send(Message::Binary(sealed)).await?;
+        Ok(())
+    }
+
+    async fn keepalive(&mut self) -> Result<()> {
+        self.sink.send(Message::Ping(Vec::new())).await?;
         Ok(())
     }
 }
@@ -260,6 +303,60 @@ mod tests {
             }
             other => panic!("round-trip changed the variant: {other:?}"),
         }
+    }
+
+    type WsItem = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>;
+
+    fn ws_reader<St>(stream: St, cipher: Cipher, deadline: Duration) -> WsReader<St> {
+        WsReader {
+            stream,
+            cipher,
+            deadline,
+            last_frame: Instant::now(),
+        }
+    }
+
+    // A WebSocket that delivers nothing at all (half-open after a sleep) errors out
+    // at the read deadline instead of pending forever.
+    #[tokio::test]
+    async fn ws_read_deadline_fires_on_a_silent_socket() {
+        let stream = futures::stream::pending::<WsItem>();
+        let mut reader = ws_reader(stream, Cipher::generate(), Duration::from_millis(100));
+        let res = tokio::time::timeout(Duration::from_secs(2), async {
+            FrameReader::<ServerFrame>::recv(&mut reader).await
+        })
+        .await
+        .expect("the read deadline never fired");
+        assert!(res.is_err(), "expected a deadline error, got {res:?}");
+    }
+
+    // Any frame — a bare Pong included — proves the socket alive and pushes the
+    // deadline out, even across `recv` calls cancelled by a caller's `select!`.
+    #[tokio::test]
+    async fn ws_control_frames_keep_the_read_deadline_at_bay() {
+        let cipher = Cipher::generate();
+        let sealed = cipher.seal(&serde_json::to_vec(&ServerFrame::Attached).unwrap());
+        let (tx, rx) = futures::channel::mpsc::unbounded::<WsItem>();
+        let mut reader = ws_reader(rx, cipher, Duration::from_millis(150));
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                tx.unbounded_send(Ok(Message::Pong(Vec::new()))).unwrap();
+            }
+            tx.unbounded_send(Ok(Message::Binary(sealed))).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let got = loop {
+            tokio::select! {
+                frame = FrameReader::<ServerFrame>::recv(&mut reader) => break frame,
+                _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+            }
+        };
+        assert!(
+            matches!(got, Ok(Some(ServerFrame::Attached))),
+            "expected the frame after the pongs, got {got:?}"
+        );
     }
 
     // Frames written back-to-back are read back in order, and EOF reads as None.

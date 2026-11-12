@@ -11,6 +11,7 @@ use tokio_tungstenite::connect_async;
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
+    keepalive_timer,
 };
 use crate::core::{
     BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, PeerRegistration,
@@ -288,9 +289,16 @@ async fn pump_writes<W: FrameWriter<ClientFrame> + 'static>(
     mut writer: W,
     mut ui_rx: mpsc::Receiver<UiEvent>,
 ) {
-    while let Some(ev) = ui_rx.recv().await {
-        if writer.send(&ClientFrame::Command(ev)).await.is_err() {
-            return; // connection gone; the reader task will also wind down
+    let mut ping = keepalive_timer();
+    loop {
+        tokio::select! {
+            ev = ui_rx.recv() => match ev {
+                Some(ev) => if writer.send(&ClientFrame::Command(ev)).await.is_err() {
+                    return; // connection gone; the reader task will also wind down
+                },
+                None => break,
+            },
+            _ = ping.tick() => if writer.keepalive().await.is_err() { return },
         }
     }
     let _ = writer.send(&ClientFrame::Detach).await;
@@ -315,8 +323,10 @@ async fn dial_pump<R, W>(
     W: FrameWriter<ClientFrame> + 'static,
 {
     let mut rev_seq: u64 = 0;
+    let mut ping = keepalive_timer();
     loop {
         tokio::select! {
+            _ = ping.tick() => if writer.keepalive().await.is_err() { break },
             ui = fwd_ui_rx.recv() => match ui {
                 // Drive the acceptor (forward).
                 Some(ui) => if writer.send(&ClientFrame::Command(ui)).await.is_err() { break },
