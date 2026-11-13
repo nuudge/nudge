@@ -79,4 +79,9 @@ pub struct Cli {
     /// dials it with `/connect-peer` to form a mutual, unsupervised peer edge.
     #[arg(long, requires = "daemon", conflicts_with = "socket")]
     pub peer: bool,
+
+    /// Internal: a headless host started by `/connect-peer` for an ended session. It
+    /// exits when its last supervisor leaves.
+    #[arg(long, hide = true, requires = "resume", group = "run_mode")]
+    pub peer_host: bool,
 }
