@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, run_agent};
@@ -72,6 +72,10 @@ enum HostCommand {
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
         who: ClientIdentity,
         ack: oneshot::Sender<ClientProfile>,
+    },
+    // Replies with a live count of attached `supervisor` controllers.
+    Supervisors {
+        reply: oneshot::Sender<watch::Receiver<usize>>,
     },
     Quit,
 }
@@ -271,6 +275,12 @@ impl BrokerHandle {
             .await?;
         Some((controller, granted == ClientProfile::supervisor()))
     }
+
+    pub async fn supervisors(&self) -> Option<watch::Receiver<usize>> {
+        let (reply, rx) = oneshot::channel();
+        self.ctl_tx.send(HostCommand::Supervisors { reply }).ok()?;
+        rx.await.ok()
+    }
 }
 
 // Derived from the *claimed* kind, so no security decision may depend on it; real
@@ -457,6 +467,7 @@ async fn broker(
     }
     let mut buffer: Vec<ControllerEvent> = seed;
     let mut pending: HashMap<String, (oneshot::Sender<bool>, String)> = HashMap::new();
+    let (supervisors, _) = watch::channel(0usize);
 
     loop {
         tokio::select! {
@@ -464,6 +475,10 @@ async fn broker(
                 let (ui_rx, event_tx, who, profile, ack) = match cmd {
                     Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
                         (ui_rx, event_tx, who, profile, ack)
+                    }
+                    Some(HostCommand::Supervisors { reply }) => {
+                        let _ = reply.send(supervisors.subscribe());
+                        continue;
                     }
                     Some(HostCommand::AttachPeer { ui_rx, event_tx, who, ack }) => {
                         // A dropped front-end lingers until reaped; it answers nothing.
@@ -590,6 +605,11 @@ async fn broker(
                 }
             }
         }
+        let count = attached
+            .values()
+            .filter(|c| c.profile == ClientProfile::supervisor())
+            .count();
+        supervisors.send_if_modified(|n| std::mem::replace(n, count) != count);
     }
 }
 
@@ -1577,6 +1597,35 @@ mod tests {
             controllers.push(task.await.unwrap().unwrap());
         }
         assert_eq!(controllers.iter().filter(|(_, s)| *s).count(), 1);
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_count_follows_attach_and_detach() {
+        let bb = spawn_bare_broker(Vec::new());
+        let count = bb.handle.supervisors().await.unwrap();
+        let wait = |count: &watch::Receiver<usize>, want: usize| {
+            let mut count = count.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    count.wait_for(|n| *n == want),
+                )
+                .await
+                .expect("count never reached the expected value")
+                .unwrap();
+            }
+        };
+
+        let (supervisor, granted) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        assert!(granted);
+        wait(&count, 1).await;
+        let (peer, granted) = bb.handle.attach_peer(agent("b")).await.unwrap();
+        assert!(!granted);
+        drop(peer);
+        assert_eq!(*count.borrow(), 1, "an unsupervised peer doesn't count");
+        drop(supervisor);
+        wait(&count, 0).await;
         bb.task.abort();
     }
 }
