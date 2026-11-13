@@ -110,6 +110,10 @@ impl Pairing {
         format!("{SCHEME}{}", URL_SAFE_NO_PAD.encode(&bytes))
     }
 
+    pub fn is_code(s: &str) -> bool {
+        s.trim().starts_with(SCHEME)
+    }
+
     // The relay URL is variable-length, so it goes last and needs no length prefix.
     pub fn decode(code: &str) -> Result<Self> {
         let b64 = code
@@ -156,6 +160,14 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_scheme_marks_a_pairing_code() {
+        let code = Pairing::generate("wss://relay.example".into()).encode();
+        assert!(Pairing::is_code(&code));
+        assert!(!Pairing::is_code("my-session"));
+        assert!(!Pairing::is_code("0123abcd-uuid"));
+    }
 
     #[test]
     fn encode_decode_round_trip() {

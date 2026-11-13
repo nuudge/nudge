@@ -429,6 +429,19 @@ async fn connect_peer_command_invokes_dialer_and_registers_edge() {
     .expect("timed out waiting for the peer in Capabilities");
     assert!(landed, "the dialed peer must appear in the roster");
 
+    // A session reference is routed by the composition root, so it arrives untouched.
+    ctrl.ui_tx
+        .send(UiEvent::Command {
+            line: "/connect-peer  my-session ".into(),
+        })
+        .await
+        .unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), code_rx.recv())
+        .await
+        .expect("dialer was not invoked")
+        .expect("reference");
+    assert_eq!(got, "my-session");
+
     host.shutdown().await.unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
