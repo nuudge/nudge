@@ -2,7 +2,6 @@
 
 Instructions for AI agents (and humans) working in this repo.
 
-
 ## Think before coding
 
 - State your assumptions. If a request has several readings, say which you picked, or ask.
