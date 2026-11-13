@@ -8,7 +8,8 @@ use tokio::time::timeout;
 use super::daemon::PeerAccept;
 use super::encryption::Cipher;
 use super::wire::{ClientFrame, ServerFrame};
-use super::{RelayClient, RelayLeg, SocketClient, bind_listener, run_daemon, run_relay_daemon};
+use super::{RelayClient, RelayLeg, SocketClient, bind_listener, run_relay_daemon, serve_socket};
+use crate::core::BrokerHandle;
 use crate::core::host::spawn_bare_broker;
 use crate::core::peer::{PeerRegistration, PeerSet};
 use crate::core::{
@@ -23,7 +24,28 @@ fn unique_socket_path() -> PathBuf {
     std::env::temp_dir().join(format!("ra-it-{token}.sock"))
 }
 
-// The serial server blocks a reattach until the previous detach frees `accept`.
+fn spawn_socket_host(
+    broker: BrokerHandle,
+    identity: ClientIdentity,
+) -> (
+    PathBuf,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>,
+) {
+    let path = unique_socket_path();
+    let listener = bind_listener(&path).expect("bind socket listener");
+    let (registrar, reg_rx) = tokio::sync::mpsc::unbounded_channel();
+    let serve = tokio::spawn(serve_socket(
+        listener,
+        broker,
+        PeerAccept {
+            identity,
+            registrar,
+        },
+    ));
+    (path, serve, reg_rx)
+}
+
 async fn attach_at(client: &SocketClient, after_seq: Option<u64>) -> Controller {
     timeout(
         Duration::from_secs(5),
@@ -32,7 +54,7 @@ async fn attach_at(client: &SocketClient, after_seq: Option<u64>) -> Controller 
     .await
     .expect("attach timed out")
     .expect("attach errored")
-    .expect("attach refused (Busy) — unexpected with a serial accept loop")
+    .expect("attach refused (Busy)")
 }
 
 async fn next_event(ctrl: &mut Controller) -> Option<ControllerEvent> {
@@ -50,10 +72,8 @@ async fn expect_text(ctrl: &mut Controller, want: &str) {
 
 #[tokio::test]
 async fn socket_round_trip_replay_resume_and_guest_quit() {
-    let path = unique_socket_path();
     let bb = spawn_bare_broker(Vec::new());
-    let listener = bind_listener(&path).expect("bind daemon listener");
-    let serve = tokio::spawn(run_daemon(listener, path.clone(), bb.handle.clone()));
+    let (path, serve, _reg_rx) = spawn_socket_host(bb.handle.clone(), agent_id("host"));
 
     let client = SocketClient::new(path.clone());
 
@@ -101,6 +121,111 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
     drop(c);
     serve.abort();
     drop(bb);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn socket_serves_two_clients_at_once() {
+    let bb = spawn_bare_broker(Vec::new());
+    let (path, serve, _reg_rx) = spawn_socket_host(bb.handle.clone(), agent_id("host"));
+    let client = SocketClient::new(path.clone());
+
+    let mut a = attach_at(&client, None).await;
+    let mut b = attach_at(&client, None).await;
+    bb.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "hi-all".into(),
+        })
+        .await
+        .unwrap();
+    expect_text(&mut a, "hi-all").await;
+    expect_text(&mut b, "hi-all").await;
+
+    serve.abort();
+    bb.task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn bind_listener_rebinds_a_stale_socket_and_restricts_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = unique_socket_path();
+    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+    assert!(path.exists(), "a dropped listener leaves its file behind");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let live = bind_listener(&path).expect("a stale socket file must be rebound");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert!(
+        bind_listener(&path).is_err(),
+        "a live socket must not be stolen"
+    );
+
+    drop(live);
+    let _ = std::fs::remove_file(&path);
+}
+
+// The socket counterpart of the relay duplex test: one dial yields both edges.
+#[tokio::test]
+async fn socket_peer_handshake_registers_both_edges() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
+
+    timeout(
+        Duration::from_secs(5),
+        SocketClient::new(path.clone()).dial_peer(
+            bb_a.handle.clone(),
+            reg_a_tx,
+            agent_id("peer-a"),
+        ),
+    )
+    .await
+    .expect("dial_peer timed out")
+    .expect("dial_peer failed");
+
+    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
+        .await
+        .expect("A registrar timeout")
+        .expect("A received peer B");
+    let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
+        .await
+        .expect("B registrar timeout")
+        .expect("B received peer A");
+    assert_eq!(peer_b.who.name, "peer-b");
+    assert_eq!(peer_a.who.name, "peer-a");
+    assert!(
+        !peer_b.supervised && !peer_a.supervised,
+        "both edges unsupervised"
+    );
+
+    let mut peers_a = PeerSet::default();
+    let mut peers_b = PeerSet::default();
+    peers_a.register(peer_b);
+    peers_b.register(peer_a);
+    for (tx, peers, text) in [
+        (&bb_b.agent_tx, &mut peers_a, "from-b"),
+        (&bb_a.agent_tx, &mut peers_b, "from-a"),
+    ] {
+        tx.send(AgentEvent::AssistantText { text: text.into() })
+            .await
+            .unwrap();
+        match timeout(Duration::from_secs(5), peers.recv())
+            .await
+            .expect("observe timeout")
+        {
+            (_, Some(ControllerEvent::AssistantText { text: got })) => assert_eq!(got, text),
+            other => panic!("expected to observe {text:?}, got {other:?}"),
+        }
+    }
+
+    serve.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
     let _ = std::fs::remove_file(&path);
 }
 

@@ -8,7 +8,7 @@ pub mod wire;
 
 pub use client::{RelayClient, SocketClient};
 pub use daemon::{
-    PeerAccept, RelayLeg, bind_listener, run_daemon, run_relay_daemon, serve_relay_handoff,
+    PeerAccept, RelayLeg, bind_listener, run_relay_daemon, serve_relay_handoff, serve_socket,
 };
 pub use pairing::{Pairing, PairingScope};
 

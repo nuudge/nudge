@@ -197,6 +197,10 @@ impl BrokerHandle {
         !self.ctl_tx.is_closed()
     }
 
+    pub async fn closed(&self) {
+        self.ctl_tx.closed().await
+    }
+
     // The ui channel stays bounded: backpressure on one flooding sender is wanted.
     async fn attach_inner(
         &self,

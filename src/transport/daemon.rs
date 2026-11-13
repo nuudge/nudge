@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
@@ -17,63 +18,61 @@ use crate::core::{
     PeerRegistration, SessionHandle, UiEvent,
 };
 
-enum ConnOutcome {
-    // The client left but the session lives on headless; accept the next one.
-    Disconnected,
-    SessionEnded,
-}
-
 // A stale socket file (nothing listening) is removed and rebound; a live one means
-// another daemon owns the path, so refuse rather than steal it.
+// another host owns the path, so refuse rather than steal it.
 pub fn bind_listener(path: &Path) -> Result<UnixListener> {
-    match UnixListener::bind(path) {
-        Ok(l) => Ok(l),
+    let listener = match UnixListener::bind(path) {
+        Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                anyhow::bail!("a daemon is already running at {}", path.display());
+                anyhow::bail!("a session is already listening at {}", path.display());
             }
             std::fs::remove_file(path)
                 .with_context(|| format!("removing stale socket {}", path.display()))?;
-            UnixListener::bind(path).with_context(|| format!("binding socket {}", path.display()))
+            UnixListener::bind(path)
+                .with_context(|| format!("binding socket {}", path.display()))?
         }
-        Err(e) => Err(e).with_context(|| format!("binding socket {}", path.display())),
-    }
+        Err(e) => return Err(e).with_context(|| format!("binding socket {}", path.display())),
+    };
+    // Whoever can connect gets full rights, so the trust boundary is the OS user.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting socket {}", path.display()))?;
+    Ok(listener)
 }
 
-// Serial by design: this standalone `--daemon --socket` debug host only needs one
-// client at a time. It has no TUI, so it logs to stderr freely.
-async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
+// Runs until aborted; the caller owns the socket file. Shares the process with the
+// local TUI, so it must never write stderr.
+pub async fn serve_socket(listener: UnixListener, broker: BrokerHandle, peer_accept: PeerAccept) {
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("[daemon] accept error: {e:#}");
-                continue;
-            }
+        let Ok((stream, _addr)) = listener.accept().await else {
+            // Errors like EMFILE persist; without a pause this would spin a core.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         };
-        let (read_half, write_half) = stream.into_split();
-        let reader = LineReader(BufReader::new(read_half));
-        let writer = LineWriter(write_half);
-        match handle_conn(reader, writer, broker).await {
-            ConnOutcome::Disconnected => {
-                eprintln!("[daemon] client disconnected; session still running");
-            }
-            ConnOutcome::SessionEnded => {
-                eprintln!("[daemon] session ended; shutting down");
-                break;
-            }
-        }
+        let broker = broker.clone();
+        let peer_accept = peer_accept.clone();
+        tokio::spawn(async move {
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = LineReader(BufReader::new(read_half));
+            let writer = LineWriter(write_half);
+            let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await else {
+                return;
+            };
+            // A peer dialer gets the relay agent leg's profile; anything else is kind-derived.
+            let profile = reverse_offer.then(ClientProfile::agent);
+            bridge(
+                reader,
+                writer,
+                &broker,
+                after_seq,
+                who,
+                profile,
+                reverse_offer,
+                Some(peer_accept),
+            )
+            .await;
+        });
     }
-}
-
-// Runs until the process is stopped (a controller's Quit is only a detach), so it
-// owns socket-file cleanup.
-pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHandle) -> Result<()> {
-    eprintln!("[daemon] listening on {}", path.display());
-    serve(&listener, &broker).await;
-    // The listener doesn't unlink the socket file on drop.
-    let _ = std::fs::remove_file(&path);
-    Ok(())
 }
 
 // Full and watch-only are separate rooms, so the profile follows the room and a
@@ -235,24 +234,8 @@ where
     }
 }
 
-async fn handle_conn<R, W>(mut reader: R, writer: W, broker: &BrokerHandle) -> ConnOutcome
-where
-    R: FrameReader<ClientFrame>,
-    W: FrameWriter<ServerFrame>,
-{
-    match recv_attach(&mut reader).await {
-        // The Unix debug host uses the kind-derived profile and never accepts
-        // reverse-edge offers; peer edges are relay-only.
-        Some((after_seq, who, _reverse_offer)) => {
-            bridge(reader, writer, broker, after_seq, who, None, false, None).await
-        }
-        None => ConnOutcome::Disconnected,
-    }
-}
-
-// `profile` is `Some` from a relay leg (the pairing decides) and `None` on the Unix
-// debug host (kind-derived). Reverse-edge frames are produced only when the dialer
-// offered and this leg has `peer_accept`; otherwise the socket is forward-only.
+// `profile` is `None` for kind-derived rights. Reverse-edge frames are produced only
+// when the dialer offered and this leg has `peer_accept`; otherwise it is forward-only.
 #[allow(clippy::too_many_arguments)]
 async fn bridge<R, W>(
     mut reader: R,
@@ -263,8 +246,7 @@ async fn bridge<R, W>(
     profile: Option<ClientProfile>,
     reverse_offer: bool,
     peer_accept: Option<PeerAccept>,
-) -> ConnOutcome
-where
+) where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
@@ -277,12 +259,12 @@ where
         None => {
             // Attach fails only if the broker is gone (host shut down since accept).
             let _ = writer.send(&ServerFrame::Busy).await;
-            return ConnOutcome::Disconnected;
+            return;
         }
     };
     if writer.send(&ServerFrame::Attached).await.is_err() {
         // Dropping `controller` detaches it; the session lives on.
-        return ConnOutcome::Disconnected;
+        return;
     }
 
     let mut rev_ev_tx: Option<mpsc::UnboundedSender<ControllerEvent>> = None;
@@ -297,7 +279,7 @@ where
             .await
             .is_err()
         {
-            return ConnOutcome::Disconnected;
+            return;
         }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
@@ -324,7 +306,7 @@ where
         tokio::select! {
             _ = ping.tick() => {
                 if writer.keepalive().await.is_err() {
-                    return ConnOutcome::Disconnected;
+                    return;
                 }
             }
             maybe_ev = events.recv() => {
@@ -341,10 +323,10 @@ where
                             .await
                             .is_err()
                         {
-                            return ConnOutcome::Disconnected;
+                            return;
                         }
                     }
-                    None => return ConnOutcome::SessionEnded,
+                    None => return,
                 }
             }
             frame = reader.recv() => {
@@ -352,11 +334,8 @@ where
                     Ok(Some(ClientFrame::Command(ui))) => {
                         // Quit detaches only this controller: a daemon ends only when its
                         // process stops, and one controller leaving must not strand others.
-                        if matches!(ui, UiEvent::Quit) {
-                            return ConnOutcome::Disconnected;
-                        }
-                        if ui_tx.send(ui).await.is_err() {
-                            return ConnOutcome::SessionEnded;
+                        if matches!(ui, UiEvent::Quit) || ui_tx.send(ui).await.is_err() {
+                            return;
                         }
                     }
                     Ok(Some(ClientFrame::ReverseEvent { event, .. })) => {
@@ -364,12 +343,9 @@ where
                             let _ = tx.send(event);
                         }
                     }
-                    Ok(Some(ClientFrame::Detach)) | Ok(None) => {
-                        return ConnOutcome::Disconnected;
-                    }
+                    Ok(Some(ClientFrame::Detach)) | Ok(None) | Err(_) => return,
                     // A second Attach mid-session is a protocol error; ignore it.
                     Ok(Some(ClientFrame::Attach { .. })) => {}
-                    Err(_) => return ConnOutcome::Disconnected,
                 }
             }
             // A closed channel (the PeerSet reaped the return peer) quiets only this arm.
@@ -377,7 +353,7 @@ where
                 match rev_ui {
                     Some(ui) => {
                         if writer.send(&ServerFrame::ReverseCommand(ui)).await.is_err() {
-                            return ConnOutcome::Disconnected;
+                            return;
                         }
                     }
                     None => rev_ui_rx = None,
