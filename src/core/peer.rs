@@ -65,7 +65,8 @@ pub struct PeerRegistration {
     pub controller: Controller,
     pub who: ClientIdentity,
     pub host: Option<SessionHost>,
-    // Set only by local wiring, never announced over the handshake, so a peer can't claim it.
+    // Set by local wiring or granted by a same-user socket target, never taken from a
+    // relay peer, so a remote side can't claim it.
     pub supervised: bool,
     // Set only when seeding a child's return edge, like `supervised`.
     pub spawner: bool,
