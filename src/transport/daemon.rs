@@ -10,6 +10,7 @@ use tokio_tungstenite::connect_async;
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
+    keepalive_timer,
 };
 use crate::core::{
     BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, HandoffStatus,
@@ -217,13 +218,24 @@ async fn relay_dial_loop(
                 }
                 let (sink, stream) = ws.split();
                 let mut reader = WsReader::new(stream, cipher.clone());
-                let writer = WsWriter::new(sink, cipher.clone());
-                // Parked as a host spare: this await is the wait for a client to pair.
-                // On pairing, serve the client on its own task, then loop to re-dial a
-                // fresh spare so the next client pairs immediately. If the relay instead
-                // dropped our spare before any client paired (relay restart, etc.),
-                // recv_attach yields None and we just loop to re-dial.
-                if let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await {
+                let mut writer = WsWriter::new(sink, cipher.clone());
+                // Parked as a host spare: this wait is for a client to pair. On pairing,
+                // serve the client on its own task, then loop to re-dial a fresh spare so
+                // the next client pairs immediately. If the spare instead died before any
+                // client paired (relay restart, a dead link past the read deadline, etc.),
+                // the wait yields None and we just loop to re-dial.
+                let mut ping = keepalive_timer();
+                let attach = loop {
+                    tokio::select! {
+                        attach = recv_attach(&mut reader) => break attach,
+                        _ = ping.tick() => {
+                            if FrameWriter::<ServerFrame>::keepalive(&mut writer).await.is_err() {
+                                break None;
+                            }
+                        }
+                    }
+                };
+                if let Some((after_seq, who, reverse_offer)) = attach {
                     let broker = broker.clone();
                     // Every client through this leg is attached with the leg's profile —
                     // the rights are the room's, minted by the daemon, never presented by
@@ -394,9 +406,15 @@ where
     // index is a stable cursor across reconnects: a client that saw through seq N
     // reattaches with `after_seq = Some(N)` and we skip everything <= N.
     let mut seq: u64 = 0;
+    let mut ping = keepalive_timer();
 
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                if writer.keepalive().await.is_err() {
+                    return ConnOutcome::Disconnected;
+                }
+            }
             maybe_ev = events.recv() => {
                 match maybe_ev {
                     Some(event) => {
