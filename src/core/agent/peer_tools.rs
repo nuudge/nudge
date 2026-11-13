@@ -6,11 +6,6 @@ use super::super::host::BrokerHandle;
 use super::super::peer::{PeerFactory, PeerSet};
 use crate::llm::SystemBlock;
 
-// The loop-level peer tools. They live here — not on the `Backend` — because the
-// `PeerSet` is the loop's own state: the backend stays peer-ignorant, and the loop
-// appends these schemas to the request and intercepts their tool_use blocks before
-// backend dispatch (see `dispatch_tools`).
-
 pub(super) const MESSAGE_PEER: &str = "MessagePeer";
 pub(super) const SPAWN: &str = "Spawn";
 pub(super) const RESPOND_TO_PEER: &str = "RespondToPeer";
@@ -20,11 +15,7 @@ pub(super) fn is_peer_tool(name: &str) -> bool {
     name == MESSAGE_PEER || name == SPAWN || name == RESPOND_TO_PEER || name == DISMISS_PEER
 }
 
-// A model-facing listing of the peers currently held, so the agent knows which names
-// it can address with MessagePeer without having to guess (and learn the roster from a
-// failed call). `None` when peerless. The loop appends this as a TRAILING, uncached
-// system block — after the volatile env breakpoint — so a peer connecting or leaving
-// only reprocesses this small tail, never the cached stable prefix.
+// Sent as a trailing, uncached system block so roster changes never bust the cached prefix.
 pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
     let infos = peers.infos();
     if infos.is_empty() {
@@ -45,19 +36,14 @@ pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
     Some(out)
 }
 
-// Spawning is autonomous token-spending and dismissal destroys a child's in-memory
-// context (in-flight work stops) — the human gates both lifecycle actions. In auto
-// mode nothing waits on the human: turning it on is their consent to delegation, and
-// finished children must be dismissable unattended. Messaging is conversation (the
-// addressee's own gates apply to whatever it causes), and a RespondToPeer verdict IS
-// the supervision decision — gating it would just re-ask.
+// Spawn spends tokens and dismissal kills in-flight work, so the human gates both;
+// enabling auto mode is their consent. MessagePeer and RespondToPeer need no gate.
 pub(super) fn requires_permission(name: &str, auto: bool) -> bool {
     !auto && (name == SPAWN || name == DISMISS_PEER)
 }
 
-// In auto mode the agent's own gated tools are refused instead of prompting the human.
-// This is an error result, not a denial: a denial parks the loop waiting for human
-// guidance, while an error lets the model read it and delegate in the same turn.
+// An error result, not a denial: a denial parks the loop waiting for human guidance,
+// while an error lets the model delegate in the same turn.
 pub(super) fn auto_mode_refusal(name: &str) -> String {
     format!(
         "Auto mode is on: you supervise and do not run {name} yourself. Send the work to \
@@ -109,10 +95,7 @@ pub(super) fn permission_summary(name: &str, input: &Value) -> String {
     }
 }
 
-// Schemas the loop appends to the backend's tool array, per capability: `Spawn` only
-// when a factory was injected (a top-level agent); `MessagePeer` whenever a peer is
-// held or could be spawned. A factory-less, peerless agent advertises nothing.
-// Placed after the backend's tools, so the stable cached prefix is never invalidated.
+// Appended after the backend's tools so the cached stable prefix is never invalidated.
 pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool) -> Vec<Value> {
     let mut out = Vec::new();
     if factory.is_some() {
@@ -174,8 +157,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
         }));
     }
     if peers.has_supervised() {
-        // Auto mode drops escalate: nothing may wait on the absent human, so a risky
-        // call is denied with a skip-and-report message instead.
+        // Nothing may wait on the absent human in auto mode.
         let (verdicts, escalate_text) = if auto {
             (json!(["approve", "deny"]), "")
         } else {
@@ -231,8 +213,6 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
     out
 }
 
-// One-line collapsed-header summary (the loop can't ask the backend about a tool it
-// doesn't know).
 pub(super) fn summary(name: &str, input: &Value) -> String {
     match name {
         SPAWN => {
@@ -263,17 +243,8 @@ fn truncated(s: &str, max: usize) -> String {
     t
 }
 
-// Execute a peer tool against the loop's own state.
-//
-// Spawn: the factory builds the child (and its return edge — it receives
-// `self_handle` so the child can attach back to *this* agent), the loop registers it
-// here, and the tool_result records name/id/task in the caller's transcript — which
-// is exactly what makes the parent durably aware of its child.
-//
-// MessagePeer: resolve the addressee by name and drive its ui_tx — the exact path a
-// human message takes into that agent, so it folds into the peer's context and
-// triggers a turn with no extra machinery. Unknown name → error listing the current
-// roster, so the model can self-correct.
+// The Spawn tool_result is what makes the parent durably aware of its child. MessagePeer
+// drives the same path a human message takes into that agent.
 pub(super) async fn execute(
     name: &str,
     input: &Value,
@@ -297,12 +268,9 @@ pub(super) async fn execute(
                 "spawned peer {peer_name} (session {session_id}); it is now working on: {task}"
             ))
         }
-        // A RespondToPeer outside a steering turn has nothing to answer — the forced
-        // call during steering is handled by `steering::run_steering_turn`, never here.
+        // During steering the verdict call is handled by the steering turn, never here.
         RESPOND_TO_PEER => bail!("no pending peer check-in to respond to"),
-        // Dropping the Peer sends its owned SessionHost a final Quit: the child's
-        // loop winds down cleanly and marks its session row ended; the transcript
-        // persists in the store.
+        // Dropping the Peer sends its SessionHost a final Quit, ending the child cleanly.
         DISMISS_PEER => {
             let Some(peer) = input.get("peer").and_then(Value::as_str) else {
                 bail!("DismissPeer requires a 'peer' string");

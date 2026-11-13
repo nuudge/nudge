@@ -79,9 +79,7 @@ pub async fn execute(input: &Value) -> Result<String> {
         bail!("rg exited {status}: {}", stderr.trim());
     }
 
-    // rg's --files emits in filesystem-walk order, which is non-deterministic
-    // across runs. Sort for stable output — cheap on file lists and helps the
-    // model see consistent results across calls.
+    // rg --files emits in nondeterministic walk order.
     let mut lines: Vec<&str> = stdout.lines().collect();
     if lines.is_empty() {
         return Ok("(no matches)".into());

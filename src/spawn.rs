@@ -5,9 +5,7 @@ use crate::core::{self, AgentConfig, ClientIdentity, ClientKind};
 use crate::llm;
 use crate::run::MAX_TOKENS;
 
-// Identity a spawned agent announces at attach — the first real use of
-// `ClientKind::Agent`. `session_id`/`task` give a peer legible provenance in the other
-// side's transcript and Notices.
+// `session_id`/`task` give a peer legible provenance in the other side's transcript.
 fn agent_identity(
     name: String,
     session_id: Option<String>,
@@ -21,12 +19,8 @@ fn agent_identity(
     }
 }
 
-// Build the executor behind the model-facing Spawn tool (`core::PeerFactory`). Each
-// call stands up a built-ins-only child agent in the current directory, mutually
-// attaches it to the spawner (whose broker handle the loop passes in), kicks it with
-// the task, and returns the registration — including the child's `SessionHost`, which
-// the spawner's `Peer` then owns as the keep-alive (reaping the peer ends the child).
-// The child gets NO factory of its own, so there is no recursive spawning yet.
+// The returned registration carries the child's `SessionHost`, which the spawner's
+// `Peer` owns as the keep-alive: reaping the peer ends the child.
 pub fn peer_factory(
     api_key: String,
     parent_session_id: String,
@@ -53,9 +47,7 @@ pub fn peer_factory(
                 Some(task.clone()),
             );
 
-            // Built-ins only: no .mcp.json servers. Skills are still discovered
-            // locally (cheap). `into_subagent` installs the role contract (report back
-            // to the spawner via MessagePeer).
+            // Built-ins only: no .mcp.json servers.
             let mcp = coding::mcp::McpRegistry::bootstrap(&[]).await;
             let skills = coding::skills::SkillRegistry::discover(&cwd, None);
             let backend = coding::CodingBackend::new(cwd, mcp, skills, web_search)
@@ -65,25 +57,15 @@ pub fn peer_factory(
                 max_tokens: MAX_TOKENS,
                 max_iterations,
                 thinking_display: "omitted".into(),
-                // A subagent's only controller is its spawner (an agent), which renders
-                // no picker; the model catalog is a human-front-end concern.
+                // The only controller is the spawning agent, which renders no picker.
                 models: Vec::new(),
             };
             let provider = llm::AnthropicProvider::new(api_key);
 
-            // Two edges, and on each one `attach(who)` announces the ATTACHER — the
-            // broker stamps that identity on everything sent through the controller,
-            // so getting a side wrong mislabels every message on that edge (the
-            // child would see its own name on the parent's messages). The
-            // registrations are the mirror: each PeerSet records whom that side
-            // HOLDS.
-            //
-            // Return edge (child → parent), seeded into the child's PeerSet at spawn
-            // (not raced through a runtime registration), so the child can address
-            // its spawner via MessagePeer from its very first turn. The child is the
-            // attacher here, so it announces child_who — and gets a bare agent_peer
-            // profile on the parent's broker: it may drive/observe the parent but may
-            // NOT answer the parent's permission prompts (that's the human's/parent's).
+            // `attach(who)` announces the ATTACHER, and the broker stamps it on every
+            // message through that controller, so a swapped side mislabels the edge.
+            // The return edge is seeded at spawn so the child can message its spawner
+            // from turn one; agent_peer can't answer the parent's permission prompts.
             let parent_ctrl = parent
                 .attach_as(child_who.clone(), core::ClientProfile::agent_peer())
                 .await
@@ -103,21 +85,16 @@ pub fn peer_factory(
                 Vec::new(),
                 Vec::new(),
                 core::PeerWiring {
-                    // No factory: a child may not spawn its own subagents yet.
                     factory: None,
                     initial_peers: child_peers,
                     register_rx: None,
-                    // No dialer: a subagent cannot open peer edges (provenance —
-                    // /connect-peer is human-only, and a child has no human).
+                    // /connect-peer is human-only, and a child has no human.
                     dialer: None,
                 },
             );
 
-            // Spawner's edge (parent → child): the parent is the attacher, so it
-            // announces parent_who; then it kicks the child with the task. Events
-            // buffer until the spawner's loop drains them. It gets a supervisor profile
-            // on the child's broker — the one edge allowed to answer the child's
-            // permission check-ins (steering.rs drives the verdict down this edge).
+            // Supervisor profile: the one edge allowed to answer the child's permission
+            // check-ins. Events buffer until the spawner's loop drains them.
             let child_ctrl = child
                 .attach_as(parent_who.clone(), core::ClientProfile::supervisor())
                 .await

@@ -69,7 +69,6 @@ impl App {
                 is_error,
             } => {
                 let outcome = ToolOutcome { content, is_error };
-                // Resolve the matching ToolCall newest-first.
                 let idx = self.log.iter().rposition(
                     |e| matches!(e, LogEntry::ToolCall { id: eid, result: None, .. } if *eid == id),
                 );
@@ -116,7 +115,6 @@ impl App {
                 self.push(LogEntry::Error(message));
                 self.status.clear();
             }
-            // Adopt the daemon's context as the header (replayed first on attach).
             ControllerEvent::SessionInfo {
                 model,
                 cwd,
@@ -132,9 +130,7 @@ impl App {
                 self.session_name = session_name;
                 self.auto = auto;
             }
-            // The daemon's capability surface — the /model picker renders from this
-            // (replayed first on attach), not a compiled-in list. commands/mcp aren't
-            // surfaced in the TUI yet.
+            // The /model picker renders from the daemon's models, not a compiled-in list.
             ControllerEvent::Capabilities { models, .. } => {
                 self.models = models.into_iter().map(|m| (m.label, m.id)).collect();
             }

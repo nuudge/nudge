@@ -12,15 +12,11 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quit = true;
             }
-            // Cycle the visible pairing QR across the dialed legs (full-access →
-            // watch-only → agent-peer, skipping absent scopes); a no-op when only one
-            // pairing exists.
             KeyCode::Char('w') => self.cycle_pairing(),
             _ => {}
         }
     }
 
-    // Byte offset for the char cursor; clamps to the end so it can't panic.
     fn cursor_byte(&self) -> usize {
         self.input
             .char_indices()
@@ -49,7 +45,6 @@ impl App {
         self.cursor = 0;
     }
 
-    // Byte offset for an arbitrary char index; clamps to the end so it can't panic.
     fn byte_at(&self, char_idx: usize) -> usize {
         self.input
             .char_indices()
@@ -58,15 +53,13 @@ impl App {
             .unwrap_or(self.input.len())
     }
 
-    // Remove chars [start, end) and leave the cursor at start.
     fn delete_chars(&mut self, start: usize, end: usize) {
         let range = self.byte_at(start)..self.byte_at(end);
         self.input.replace_range(range, "");
         self.cursor = start;
     }
 
-    // Char index of the previous word's start: skip trailing whitespace, then the
-    // word itself (readline Ctrl-W semantics).
+    // readline Ctrl-W semantics: skip trailing whitespace, then the word.
     fn prev_word_start(&self) -> usize {
         let chars: Vec<char> = self.input.chars().take(self.cursor).collect();
         let mut i = chars.len();
@@ -79,8 +72,6 @@ impl App {
         i
     }
 
-    // Move the cursor one wrapped display row up/down, keeping the column where
-    // possible (clamped to the target row's length).
     fn move_cursor_row(&mut self, delta: isize) {
         let width = self.input_view_width.max(1);
         let (rows, row, col) = wrap_input(&self.input, self.cursor, width);
@@ -91,7 +82,6 @@ impl App {
         self.cursor = char_index_at(&self.input, target as usize, col, width);
     }
 
-    // Char index of the cursor's line start (powers Ctrl-A).
     fn line_start(&self) -> usize {
         let mut start = 0;
         for (i, c) in self.input.chars().take(self.cursor).enumerate() {
@@ -102,7 +92,6 @@ impl App {
         start
     }
 
-    // Char index of the cursor's line end (powers Ctrl-E).
     fn line_end(&self) -> usize {
         self.input
             .chars()
@@ -209,8 +198,8 @@ impl App {
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.insert_char('\n');
             }
-            // Trailing-backslash continuation (POSIX parity: odd count = newline, even = submit).
-            // The always-available newline escape hatch, independent of terminal quirks.
+            // Odd trailing-backslash count = newline (POSIX parity): the newline escape
+            // hatch that works regardless of terminal quirks.
             KeyCode::Enter
                 if self
                     .input
@@ -292,11 +281,8 @@ impl App {
         }
     }
 
-    // Client-local commands only. A bare `/model` opens the picker (rendered from the
-    // daemon's Capabilities) and `/background` detaches — both are front-end UI. Every
-    // other `/…` line — including `/model <id>` — is a session-level command parsed
-    // server-side, so it's sent verbatim as UiEvent::Command and works identically on
-    // any front-end.
+    // Only front-end UI commands are handled here; every other `/…` line (including
+    // `/model <id>`) is sent verbatim and parsed server-side.
     fn handle_command(&mut self, cmd: &str, ui_tx: &mpsc::Sender<UiEvent>) {
         let mut parts = cmd.split_whitespace();
         match parts.next() {
@@ -374,10 +360,8 @@ impl App {
     }
 }
 
-// Character-wrap the input into display rows and locate the cursor within them.
-// Char-based (not word) so a row maps to an exact cell range and the cursor lands
-// precisely. Each logical line yields >=1 row; a width-filled final line gets a
-// trailing empty row so the cursor has a cell to sit in.
+// Char-based (not word) wrap so a row maps to an exact cell range. A width-filled
+// final line gets a trailing empty row so the cursor has a cell to sit in.
 pub(super) fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<String>, usize, usize) {
     let width = width.max(1);
     let mut rows: Vec<String> = Vec::new();
@@ -415,8 +399,7 @@ pub(super) fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<Strin
     (rows, cursor_row, cursor_col)
 }
 
-// Inverse of wrap_input's cursor mapping: char index for a (display row, col),
-// using the same char-wrap. col is clamped to the row's length.
+// Inverse of wrap_input's cursor mapping; must use the same char-wrap.
 fn char_index_at(input: &str, row: usize, col: usize, width: usize) -> usize {
     let width = width.max(1);
     let mut char_pos = 0;
@@ -463,8 +446,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    // `w` cycles the visible pairing across all present legs: full → watch → agent →
-    // full, each flip changing which pairing `visible_pairing_*` returns.
     #[tokio::test]
     async fn background_w_cycles_the_visible_pairing() {
         let mut app = test_app();
@@ -504,7 +485,6 @@ mod tests {
             Some("agent-code")
         );
 
-        // Wraps back to full-access.
         app.handle_background_key(press(KeyCode::Char('w')));
         assert_eq!(app.pair_scope, PairScope::Full);
         assert_eq!(
@@ -513,8 +493,6 @@ mod tests {
         );
     }
 
-    // `w` skips an absent scope: with full + agent present but no watch, it cycles
-    // full → agent → full (the wrap logic most likely to regress).
     #[tokio::test]
     async fn background_w_skips_a_missing_scope() {
         let mut app = test_app();
@@ -539,7 +517,6 @@ mod tests {
         );
     }
 
-    // With only the full-access pairing (a guest, or no other legs), `w` does nothing.
     #[tokio::test]
     async fn background_w_is_a_noop_with_only_full() {
         let mut app = test_app();

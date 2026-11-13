@@ -2,10 +2,7 @@ use anyhow::Result;
 
 use crate::llm;
 
-// (display label, API model id). The TUI's /model picker renders labels;
-// the id is what goes on the wire. Used as-is by guest/--connect clients
-// (no local API key to fetch with) and as the fallback when the owning
-// process's `list_models` call fails (offline, bad key, etc).
+// (display label, API model id). Fallback when the owner's `list_models` call fails.
 pub const MODELS: &[(&str, &str)] = &[
     ("Fable 5", "claude-fable-5"),
     ("Mythos 5", "claude-mythos-5"),
@@ -23,8 +20,7 @@ pub fn owned_models(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-// Refreshes the /model picker from the provider so newly released models show
-// up without a code change; keeps the static `fallback` on any fetch failure.
+// Fetched so newly released models show up without a code change.
 pub async fn resolve_models(
     provider: &llm::AnthropicProvider,
     fallback: &[(&str, &str)],

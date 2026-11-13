@@ -4,32 +4,15 @@ use std::path::Path;
 
 use crate::core::identity::{ClientIdentity, ClientKind};
 
-// Bump when the schema changes in a way an older binary can't safely ignore; `open`
-// refuses a database from a NEWER version (an older binary must not scribble on a
-// schema it doesn't understand) and will host forward migrations for older ones once
-// any exist. A new column with a default is NOT such a change: every query names its
-// columns, so older binaries never see it. Those are added in place by
-// `add_missing_columns` without a bump, which keeps older binaries working against
-// the shared database.
+// Bump only for changes an older binary can't safely ignore: `open` refuses a newer
+// version. Defaulted columns don't count — every query names its columns, so they're
+// added in place by `add_missing_columns`.
 const SCHEMA_VERSION: i64 = 1;
 
-// The relational session store (issue #26): one SQLite database owning every
-// session and its transcript. This is the storage MECHANISM — schema, queries,
-// invariants. Where the database file lives is the caller's policy (`coding`
-// points it at ~/.nudge/nudge.db), mirroring how `Session::create(cwd, dir)`
-// kept path policy out of core.
-//
-// Invariants owned here:
-// - append-only audit: message rows are never deleted; resume's strict
-//   truncation marks rows `superseded` instead (excluded from reads, kept on
-//   disk), fixing the JSONL latent bug where truncated junk was replayed
-//   mid-transcript on a later resume.
-// - byte-exact content: `content` is stored and returned as the caller's
-//   serialized JSON string, never re-serialized through an intermediate value —
-//   resume and the floating cache breakpoint depend on the round-trip.
-// - one writer per session: ordinals are assigned in a write transaction; a
-//   second writer on the same session id fails loudly on the primary key
-//   instead of silently interleaving (which JSONL allowed).
+// Invariants:
+// - append-only: truncation marks rows `superseded`; message rows are never deleted.
+// - byte-exact `content`: never re-serialized — resume and the cache breakpoint rely on it.
+// - one writer per session: a second writer fails on the primary key, never interleaves.
 pub struct SessionStore {
     conn: Connection,
 }
@@ -70,8 +53,6 @@ pub struct SessionRow {
     pub spawn_task: Option<String>,
 }
 
-// One transcript entry as stored: the wire-faithful message JSON plus the
-// structured sender metadata the JSONL envelope carried as a nested object.
 #[derive(Debug, Clone)]
 pub struct MessageRow {
     pub ordinal: i64,
@@ -80,9 +61,6 @@ pub struct MessageRow {
     pub sender: Option<ClientIdentity>,
 }
 
-// A transcript entry as the inspection view sees it: the stored row plus the
-// denormalized role column and the superseded flag (surfaced only here — the
-// live transcript never returns superseded rows).
 #[derive(Debug, Clone)]
 pub struct InspectRow {
     pub row: MessageRow,
@@ -90,7 +68,6 @@ pub struct InspectRow {
     pub superseded: bool,
 }
 
-// One substring-search hit, joined with its session for display context.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub session_id: String,
@@ -103,16 +80,13 @@ pub struct SearchHit {
     pub content: String,
 }
 
-// A session row joined with its live (non-superseded) message count, for --list.
 #[derive(Debug, Clone)]
 pub struct SessionListing {
     pub row: SessionRow,
     pub turns: i64,
 }
 
-// One transcript entry to import: like a live append, but with the timestamp
-// recovered from the legacy envelope instead of now(). Ordinals are assigned by
-// slice position in `import_session`.
+// Timestamp is recovered from the legacy envelope, not now().
 pub struct ImportedMessage {
     pub timestamp: String,
     pub role: String,
@@ -128,14 +102,12 @@ impl SessionStore {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("could not open session store {}", path.display()))?;
-        // WAL so readers never block writers across connections/processes; the
-        // pragma returns the resulting mode, so query it rather than execute it.
+        // The pragma returns the resulting mode, so query it rather than execute it.
         conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
             .context("enabling WAL on session store")?;
         Self::init(conn)
     }
 
-    // Tests only: a private in-memory database (no WAL — it's meaningless there).
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory().context("opening in-memory store")?)
@@ -217,12 +189,8 @@ impl SessionStore {
             .with_context(|| format!("loading session {id}"))
     }
 
-    // Import one legacy session atomically: the full row plus its transcript in
-    // ordinal order, all timestamps the caller's (recovered from the old files,
-    // not now()). Returns false — writing nothing — when the id already exists,
-    // which makes a retried import (crash before the marker was set) skip work
-    // already landed. The transaction means a session is either fully imported
-    // or absent, never half.
+    // Returns false, writing nothing, when the id exists — so a retried import
+    // (crash before the marker was set) skips sessions already landed.
     pub fn import_session(
         &mut self,
         row: &SessionRow,
@@ -284,8 +252,7 @@ impl SessionStore {
         Ok(true)
     }
 
-    // The one-time legacy-JSONL import marker in `meta`. The importer sets it
-    // only after a fully successful run, so a crash mid-import retries.
+    // Set only after a fully successful import, so a crash mid-import retries.
     pub fn legacy_import_done(&self) -> Result<bool> {
         Ok(self
             .conn
@@ -323,7 +290,6 @@ impl SessionStore {
         Ok(())
     }
 
-    // Whether auto mode was on when the session last toggled it, so a resume restores it.
     pub fn auto(&self, id: &str) -> Result<bool> {
         self.conn
             .query_row(
@@ -358,10 +324,8 @@ impl SessionStore {
         Ok(())
     }
 
-    // Append one transcript entry, assigning the next ordinal (superseded rows
-    // included in the max — audit order is total). The ordinal read and the
-    // insert share an immediate transaction so a concurrent writer on the same
-    // session surfaces as a constraint/busy error, never a silent interleave.
+    // Ordinal read and insert share an immediate transaction so a concurrent writer
+    // errors instead of interleaving; superseded rows count toward the max.
     pub fn append_message(
         &mut self,
         session_id: &str,
@@ -408,7 +372,6 @@ impl SessionStore {
         Ok(ordinal)
     }
 
-    // The live transcript: every non-superseded entry in append order.
     pub fn load_transcript(&self, session_id: &str) -> Result<Vec<MessageRow>> {
         let mut stmt = self
             .conn
@@ -428,9 +391,7 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // The last `limit` transcript entries in append order, bounded at the SQL
-    // level so inspecting a huge transcript never loads it whole. The audit
-    // view (`include_superseded`) also returns truncated-away rows, flagged.
+    // Bounded in SQL so inspecting a huge transcript never loads it whole.
     pub fn transcript_tail(
         &self,
         session_id: &str,
@@ -463,10 +424,6 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // A bounded window of transcript entries around one ordinal (roughly half
-    // before, half after), in append order — how search-surfaced ordinals in
-    // the middle of a long session become inspectable. Same SQL-level bound
-    // and superseded semantics as `transcript_tail`.
     pub fn transcript_around(
         &self,
         session_id: &str,
@@ -500,7 +457,6 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // Live (non-superseded) entry count for one session.
     pub fn turn_count(&self, session_id: &str) -> Result<i64> {
         self.conn
             .query_row(
@@ -511,9 +467,7 @@ impl SessionStore {
             .with_context(|| format!("counting turns of session {session_id}"))
     }
 
-    // Strict-truncation bookkeeping: mark every live entry past `last_kept_ordinal`
-    // superseded (pass -1 to supersede the whole transcript). The rows stay on
-    // disk — truncation narrows the model-facing view, it never unlogs.
+    // Pass -1 to supersede the whole transcript. Rows stay on disk.
     pub fn mark_superseded_after(&self, session_id: &str, last_kept_ordinal: i64) -> Result<()> {
         self.conn
             .execute(
@@ -525,11 +479,8 @@ impl SessionStore {
         Ok(())
     }
 
-    // Resolve a user-supplied reference (uuid or human name) to a session id,
-    // scoped to `cwd` for names (per-project resume semantics, as today). A
-    // reference that IS a session id wins outright; otherwise the most recently
-    // active session with that name in this cwd; otherwise the reference passes
-    // through unchanged so the caller's open surfaces a clear not-found error.
+    // Exact id wins, then the most recent same-named session in `cwd`; otherwise the
+    // reference passes through so the caller's open reports not-found.
     pub fn resolve_reference(&self, cwd: &str, reference: &str) -> Result<String> {
         if self.session(reference)?.is_some() {
             return Ok(reference.to_string());
@@ -547,8 +498,6 @@ impl SessionStore {
         Ok(by_name.unwrap_or_else(|| reference.to_string()))
     }
 
-    // Sessions for one project directory, most recently active first, with live
-    // turn counts — the `--list` query.
     pub fn list_by_cwd(&self, cwd: &str) -> Result<Vec<SessionListing>> {
         let mut stmt = self
             .conn
@@ -575,8 +524,6 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // Sessions across every project, most recently active first — the
-    // cross-directory discovery view. Bounded at the SQL level.
     pub fn list_all(&self, limit: i64) -> Result<Vec<SessionListing>> {
         let mut stmt = self
             .conn
@@ -603,10 +550,7 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // Naive substring search over message content (deliberately no FTS or
-    // ranking), most recently active session first. The user's query is escaped
-    // and bound as a single parameter, so `%`/`_` in it match literally.
-    // Searches every row, superseded included — this is the forensics view.
+    // Deliberately naive (no FTS); includes superseded rows — this is the forensics view.
     pub fn search_messages(
         &self,
         query: &str,
@@ -647,8 +591,6 @@ impl SessionStore {
         Ok(rows)
     }
 
-    // Total match count for the same predicate as `search_messages` — lets the
-    // caller disclose truncation ("showing N of M") when hits were capped.
     pub fn search_message_count(
         &self,
         query: &str,
@@ -669,9 +611,6 @@ impl SessionStore {
             .context("counting search matches")
     }
 
-    // Total session count across every project — the truncation-disclosure
-    // companion to `list_all` (the cwd-scoped list is unbounded, so its caller
-    // already holds the full count).
     pub fn session_count(&self) -> Result<i64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
@@ -679,8 +618,7 @@ impl SessionStore {
     }
 }
 
-// LIKE pattern for a literal substring: escape the wildcard characters, then
-// wrap in `%…%`. Pairs with `ESCAPE '\'` in the queries that bind it.
+// Pairs with `ESCAPE '\'` in the queries that bind it.
 fn like_pattern(query: &str) -> String {
     let escaped = query
         .replace('\\', "\\\\")
@@ -746,8 +684,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     })
 }
 
-// Columns added after a database may already exist (see SCHEMA_VERSION). Each is
-// added in place when missing; SCHEMA carries them too, for fresh databases.
+// SCHEMA carries these too, for fresh databases.
 fn add_missing_columns(conn: &Connection) -> Result<()> {
     const ADDED: &[(&str, &str)] = &[("auto", "INTEGER NOT NULL DEFAULT 0")];
     let mut stmt = conn
@@ -860,8 +797,7 @@ mod tests {
         assert!(s.set_auto("missing", true).is_err());
     }
 
-    // A database created before the auto column existed gets it on open, keeps its
-    // schema version (so older binaries can still open it), and its rows read as off.
+    // Older binaries must still open it, so the schema version stays put.
     #[test]
     fn open_adds_the_auto_column_to_an_older_database() {
         let path = temp_db();
@@ -961,19 +897,15 @@ mod tests {
         assert_eq!(rows[0].content, "{\"a\":1}");
         assert_eq!(rows[1].sender.as_ref().unwrap().name, "child-1");
 
-        // A second import of the same id writes nothing.
         assert!(!s.import_session(&row, &messages).unwrap());
         assert_eq!(s.load_transcript("imp").unwrap().len(), 2);
     }
 
-    // The load-bearing property: content comes back as the exact bytes stored,
-    // with no re-serialization in between.
     #[test]
     fn message_content_round_trips_byte_exact() {
         let mut s = store();
         s.insert_session("a", "/proj", None, None).unwrap();
-        // Key order and spacing chosen to differ from serde_json's canonical
-        // output — byte equality proves we never re-serialize.
+        // Key order and spacing differ from serde_json's canonical output.
         let content =
             r#"{"role":"assistant",  "content":[{"type":"text","text":"héllo \u0000"}],"zz":1}"#;
         s.append_message("a", "assistant", content, None).unwrap();
@@ -1005,8 +937,6 @@ mod tests {
         assert!(rows[1].sender.is_none());
     }
 
-    // Append-only audit: superseding hides rows from the transcript but never
-    // deletes them, and later appends continue the ordinal sequence past them.
     #[test]
     fn superseded_rows_are_hidden_not_deleted_and_ordinals_continue() {
         let mut s = store();
@@ -1021,7 +951,6 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live.last().unwrap().ordinal, 1);
 
-        // The audit record is intact underneath.
         let total: i64 = s
             .conn
             .query_row(
@@ -1032,7 +961,6 @@ mod tests {
             .unwrap();
         assert_eq!(total, 4);
 
-        // A new append lands after the superseded tail, keeping audit order total.
         assert_eq!(s.append_message("a", "user", "{}", None).unwrap(), 4);
         let live = s.load_transcript("a").unwrap();
         assert_eq!(live.len(), 3);
@@ -1087,10 +1015,8 @@ mod tests {
 
         let listings = s.list_by_cwd("/proj").unwrap();
         assert_eq!(listings.len(), 2);
-        // b appended last, so it's most recent.
         assert_eq!(listings[0].row.id, "b");
         assert_eq!(listings[0].turns, 1);
-        // a's superseded row is excluded from its live count.
         assert_eq!(listings[1].row.id, "a");
         assert_eq!(listings[1].turns, 1);
     }
@@ -1111,7 +1037,6 @@ mod tests {
         let row = s.session("child").unwrap().unwrap();
         assert_eq!(row.state, SessionState::Ended);
 
-        // The FK is enforced: a dangling spawned_by is a bug, not data.
         assert!(
             s.insert_session("orphan", "/proj", Some("no-such-parent"), None)
                 .is_err()
@@ -1130,12 +1055,10 @@ mod tests {
         let win = s.transcript_around("a", 10, 5, false).unwrap();
         assert_eq!(ordinals(&win), vec![8, 9, 10, 11, 12]);
 
-        // Anchors clamp at the edges; past the end is empty, not an error.
         let head = s.transcript_around("a", 0, 5, false).unwrap();
         assert_eq!(ordinals(&head), vec![0, 1, 2, 3, 4]);
         assert!(s.transcript_around("a", 100, 5, false).unwrap().is_empty());
 
-        // Superseded rows drop from the live window, appear flagged in audit.
         s.mark_superseded_after("a", 9).unwrap();
         let live = s.transcript_around("a", 10, 5, false).unwrap();
         assert_eq!(ordinals(&live), vec![8, 9]);

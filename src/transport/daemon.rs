@@ -17,20 +17,14 @@ use crate::core::{
     PeerRegistration, SessionHandle, UiEvent,
 };
 
-// How one client connection ended — decides what the accept loop does next.
 enum ConnOutcome {
-    // The client left (clean detach, dropped socket, or transport error) but the
-    // session lives on, headless. The daemon loops back and accepts the next one.
+    // The client left but the session lives on headless; accept the next one.
     Disconnected,
-    // A client quit the session (or the loop ended on its own). The daemon stops
-    // and the caller shuts the host down.
     SessionEnded,
 }
 
-// Bind the listener without clobbering a live daemon. A leftover socket file from
-// a crashed daemon (nothing listening behind it) is removed and rebound; a socket
-// that still accepts connections means a daemon already owns this path, so we
-// refuse rather than steal its address.
+// A stale socket file (nothing listening) is removed and rebound; a live one means
+// another daemon owns the path, so refuse rather than steal it.
 pub fn bind_listener(path: &Path) -> Result<UnixListener> {
     match UnixListener::bind(path) {
         Ok(l) => Ok(l),
@@ -38,7 +32,6 @@ pub fn bind_listener(path: &Path) -> Result<UnixListener> {
             if std::os::unix::net::UnixStream::connect(path).is_ok() {
                 anyhow::bail!("a daemon is already running at {}", path.display());
             }
-            // Stale socket file → remove and rebind once.
             std::fs::remove_file(path)
                 .with_context(|| format!("removing stale socket {}", path.display()))?;
             UnixListener::bind(path).with_context(|| format!("binding socket {}", path.display()))
@@ -47,12 +40,8 @@ pub fn bind_listener(path: &Path) -> Result<UnixListener> {
     }
 }
 
-// Accept one client at a time and bridge it to the broker. Serial by design: the
-// broker is multi-attach, but this standalone `--daemon --socket` debug host only
-// needs one client at a time, so the accept loop stays simple. (True concurrent
-// clients — remote watch-mode — would spawn `handle_conn` per connection.) Only this
-// debug host reaches here (the local session's handoff is relay-only), so it logs
-// freely — there's no TUI to corrupt.
+// Serial by design: this standalone `--daemon --socket` debug host only needs one
+// client at a time. It has no TUI, so it logs to stderr freely.
 async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
     loop {
         let (stream, _addr) = match listener.accept().await {
@@ -62,9 +51,6 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
                 continue;
             }
         };
-        // Wrap the accepted byte stream in the line codec, then hand the framed
-        // halves to the transport-agnostic `handle_conn`. The relay path wraps a WS
-        // connection in its own codec and calls the same function.
         let (read_half, write_half) = stream.into_split();
         let reader = LineReader(BufReader::new(read_half));
         let writer = LineWriter(write_half);
@@ -72,8 +58,6 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
             ConnOutcome::Disconnected => {
                 eprintln!("[daemon] client disconnected; session still running");
             }
-            // The controller's stream closed, which means the host itself is
-            // shutting down.
             ConnOutcome::SessionEnded => {
                 eprintln!("[daemon] session ended; shutting down");
                 break;
@@ -82,24 +66,18 @@ async fn serve(listener: &UnixListener, broker: &BrokerHandle) {
     }
 }
 
-// Standalone headless daemon (the `--daemon --socket` debug host). No TUI, so it
-// logs freely. A controller's Quit no longer ends the session (it's a detach); the
-// daemon runs until its process is stopped (the caller turns that into a graceful
-// host shutdown), so this owns socket-file cleanup.
+// Runs until the process is stopped (a controller's Quit is only a detach), so it
+// owns socket-file cleanup.
 pub async fn run_daemon(listener: UnixListener, path: PathBuf, broker: BrokerHandle) -> Result<()> {
     eprintln!("[daemon] listening on {}", path.display());
     serve(&listener, &broker).await;
-    // The listener doesn't unlink the socket file on drop; do it so the next
-    // daemon binds cleanly.
+    // The listener doesn't unlink the socket file on drop.
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
 
-// One relay leg the daemon parks: a room (dial URL) + its E2E key + the profile every
-// client arriving through it is attached with. Full and watch-only are separate rooms,
-// so the profile follows the room — the client can't move between them. `peer_accept`
-// is set only on an agent-scope leg: it makes this leg answer a dialer's reverse-edge
-// offer (#60), attaching the return edge back into the local session's PeerSet.
+// Full and watch-only are separate rooms, so the profile follows the room and a
+// client can't move between them. `peer_accept` is set only on an agent-scope leg.
 pub struct RelayLeg {
     pub dial_url: String,
     pub cipher: Cipher,
@@ -107,24 +85,16 @@ pub struct RelayLeg {
     pub peer_accept: Option<PeerAccept>,
 }
 
-// What an agent-scope leg needs to answer a reverse-edge offer: this session's own
-// announced identity (mirrors the dialer's `Attach.who` — announced, never derived by
-// the other side) and the producer half of the loop's runtime registrar (#52), which
-// the return edge is registered into.
+// What an agent-scope leg needs to answer a reverse-edge offer. `identity` is
+// announced to the dialer, never derived by the other side.
 #[derive(Clone)]
 pub struct PeerAccept {
     pub identity: ClientIdentity,
     pub registrar: mpsc::UnboundedSender<PeerRegistration>,
 }
 
-// Headless daemon hosting the session over the relay (the `--daemon --relay`
-// process). Unlike the Unix daemon it does not listen — it dials OUT to the relay
-// (the only direction that crosses NAT) as this session's single host, parking one
-// spare connection per leg and opening one more per attached client (see
-// `relay_dial_loop`). A controller's Quit is just a detach; the session ends only when
-// this daemon process is stopped, which the caller turns into a graceful host shutdown.
-// Usually one leg (a full-rights code); with a watch-only code minted too, two legs run
-// concurrently, each parking its own spare so either code pairs immediately.
+// Dials OUT to the relay (the only direction that crosses NAT) rather than
+// listening. Each leg parks its own spare so every code pairs immediately.
 pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Result<()> {
     let mut tasks = Vec::new();
     for leg in legs {
@@ -148,13 +118,8 @@ pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Resu
     Ok(())
 }
 
-// Co-located relay handoff: spawned on a normal in-process session's /background to
-// arm phone pairing. It shares the process with the local TUI, so it never writes
-// stderr — instead it reports progress over `status`, which the TUI renders on the
-// background pair screen. The session is never ended by this loop, only by the local
-// owner quitting (which tears the process down). `profile` is the rights this leg grants
-// — the co-located session arms two legs (a full-access `human()` one and a watch-only
-// one), each a separate room, so the rights follow the room exactly as `--daemon --watch`.
+// Shares the process with the local TUI, so it must never write stderr; progress
+// goes over `status` instead.
 pub async fn serve_relay_handoff(
     relay_url: String,
     cipher: Cipher,
@@ -163,8 +128,6 @@ pub async fn serve_relay_handoff(
     profile: ClientProfile,
     peer_accept: Option<PeerAccept>,
 ) {
-    // Full/watch legs pass `None`; the agent-peer leg passes `Some`, so an inbound
-    // dialer's reverse-edge offer is accepted and the return edge registered (#61).
     relay_dial_loop(
         relay_url,
         cipher,
@@ -176,20 +139,12 @@ pub async fn serve_relay_handoff(
     .await;
 }
 
-// Keep one spare host connection parked on the relay at all times. Each iteration
-// dials OUT (the only direction that crosses NAT), parks as the room's host spare,
-// and blocks until a client pairs with it — the first frame (its Attach) is that
-// signal. On pairing we hand the connection to a `bridge` task and immediately loop
-// to dial the next spare, so a second client never waits: the broker is multi-attach,
-// so every bridge attaches alongside the others. A client leaving ends only its own
-// bridge task. The loop (and the daemon) ends only when the broker is gone.
+// Keeps one spare host connection parked on the relay; on pairing it hands the
+// connection to a `bridge` task and re-dials at once, so a second client never waits.
 //
-// `status` distinguishes the two callers: `None` is the standalone `--daemon` (logs
-// to stderr, retries forever on an unreachable relay); `Some(tx)` is the co-located
-// in-process handoff (silent, reports progress to the TUI, and does NOT retry a failed
-// dial — the user re-/background to try again). Connecting/Connected are reported once
-// on the first successful park, not on every re-dial, so the pair screen doesn't
-// flicker as spares rotate.
+// `status: None` is the standalone daemon (logs, retries forever); `Some` is the
+// co-located handoff (silent, no retry). Connected is reported once, not per re-dial,
+// so the pair screen doesn't flicker as spares rotate.
 async fn relay_dial_loop(
     relay_url: String,
     cipher: Cipher,
@@ -200,8 +155,6 @@ async fn relay_dial_loop(
 ) {
     let mut announced = false;
     loop {
-        // Broker gone (host shut down) → stop parking spares; live bridge tasks wind
-        // down on their own when their broker sends start failing.
         if !broker.is_alive() {
             break;
         }
@@ -219,11 +172,8 @@ async fn relay_dial_loop(
                 let (sink, stream) = ws.split();
                 let mut reader = WsReader::new(stream, cipher.clone());
                 let mut writer = WsWriter::new(sink, cipher.clone());
-                // Parked as a host spare: this wait is for a client to pair. On pairing,
-                // serve the client on its own task, then loop to re-dial a fresh spare so
-                // the next client pairs immediately. If the spare instead died before any
-                // client paired (relay restart, a dead link past the read deadline, etc.),
-                // the wait yields None and we just loop to re-dial.
+                // No frame arrives while parked, so the first one (the Attach) is the
+                // pairing signal; a spare that dies first yields None and is re-dialed.
                 let mut ping = keepalive_timer();
                 let attach = loop {
                     tokio::select! {
@@ -237,9 +187,7 @@ async fn relay_dial_loop(
                 };
                 if let Some((after_seq, who, reverse_offer)) = attach {
                     let broker = broker.clone();
-                    // Every client through this leg is attached with the leg's profile —
-                    // the rights are the room's, minted by the daemon, never presented by
-                    // the client (which only sends its identity in the Attach frame).
+                    // Rights come from the leg the daemon minted, never from the client.
                     let profile = profile.clone();
                     let peer_accept = peer_accept.clone();
                     tokio::spawn(async move {
@@ -258,14 +206,11 @@ async fn relay_dial_loop(
                 }
             }
             Err(e) => match &status {
-                // Co-located: surface the failure to the TUI and stop dialing new
-                // spares. Live bridges keep running; the next /background re-arms.
+                // Live bridges keep running; the next /background re-arms.
                 Some(s) => {
                     let _ = s.send(HandoffStatus::Failed(format!("{e}"))).await;
                     break;
                 }
-                // Standalone daemon: the session stays alive headless; back off and
-                // retry rather than spinning on the dial.
                 None => {
                     eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -275,11 +220,7 @@ async fn relay_dial_loop(
     }
 }
 
-// Handshake read, split out so the relay dial loop can treat "the first frame
-// arrived" as its pairing signal: while a host connection is parked on the relay no
-// frame comes, so this pending `recv` *is* the parked-spare state. Resolves to the
-// attach params once a client pairs and sends its Attach; `None` on anything else
-// (wrong first frame, EOF, or error) — the client never bound, nothing to detach.
+// `None` on anything but an Attach: the client never bound, so there's nothing to detach.
 async fn recv_attach<R>(reader: &mut R) -> Option<(Option<u64>, ClientIdentity, bool)>
 where
     R: FrameReader<ClientFrame>,
@@ -294,18 +235,14 @@ where
     }
 }
 
-// Combined handshake + bridge for the serial Unix debug host: read the Attach, then
-// serve. The relay path calls `recv_attach` and `bridge` separately so it can spawn
-// each client's `bridge` on its own task and immediately re-dial a spare.
 async fn handle_conn<R, W>(mut reader: R, writer: W, broker: &BrokerHandle) -> ConnOutcome
 where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
     match recv_attach(&mut reader).await {
-        // The Unix debug host keeps the interim kind-derived profile (None) and never
-        // accepts reverse-edge offers (it's a localhost debug transport, not a peer
-        // leg): a peer edge is a relay-only path this phase hardens.
+        // The Unix debug host uses the kind-derived profile and never accepts
+        // reverse-edge offers; peer edges are relay-only.
         Some((after_seq, who, _reverse_offer)) => {
             bridge(reader, writer, broker, after_seq, who, None, false, None).await
         }
@@ -313,19 +250,9 @@ where
     }
 }
 
-// Bridge one attached client to the broker: register the controller, stream its
-// replay+live events out, and forward its commands in, until it leaves. `after_seq`
-// and `who` come from the already-read Attach frame. `profile` is the rights the accept
-// path assigns by provenance: `Some(p)` from a relay leg (the pairing decides), `None`
-// on the Unix debug host (falls back to the kind-derived interim in `attach`).
-//
-// When `reverse_offer` is set and this leg has a `peer_accept`, the acceptor's half of
-// the duplex peer edge (#60) also rides this one socket: after `Attached` it announces
-// its own identity (`ReverseAttach`) and registers a return `Controller` into the local
-// session's PeerSet, so the acceptor drives/observes the dialer too. On any other leg
-// (a phone, a watch code, the Unix host) the offer is inert and the socket behaves
-// exactly as before — no `Reverse*` frame is ever produced, so those clients are
-// untouched.
+// `profile` is `Some` from a relay leg (the pairing decides) and `None` on the Unix
+// debug host (kind-derived). Reverse-edge frames are produced only when the dialer
+// offered and this leg has `peer_accept`; otherwise the socket is forward-only.
 #[allow(clippy::too_many_arguments)]
 async fn bridge<R, W>(
     mut reader: R,
@@ -348,33 +275,21 @@ where
     let controller = match attached {
         Some(c) => c,
         None => {
-            // There is no single-attach lock — attach fails only if the broker is
-            // gone (the host shut down between our accept and this attach). Tell the
-            // client (it treats Busy as "couldn't attach") and drop.
+            // Attach fails only if the broker is gone (host shut down since accept).
             let _ = writer.send(&ServerFrame::Busy).await;
             return ConnOutcome::Disconnected;
         }
     };
     if writer.send(&ServerFrame::Attached).await.is_err() {
-        // Returning drops `controller`, which detaches it — the session lives on.
+        // Dropping `controller` detaches it; the session lives on.
         return ConnOutcome::Disconnected;
     }
 
-    // Reverse edge (#60): only when the dialer offered it AND this is an agent leg.
-    // Announce our own identity first (before any forward Event, so it's the dialer's
-    // first post-Attached frame), then register a return Controller into the local
-    // PeerSet — its events are fed by inbound `ReverseEvent`s and its drives go out as
-    // `ReverseCommand`s. `rev_ev_tx`/`rev_ui_rx` are the socket-facing ends held here.
     let mut rev_ev_tx: Option<mpsc::UnboundedSender<ControllerEvent>> = None;
     let mut rev_ui_rx: Option<mpsc::Receiver<UiEvent>> = None;
     if reverse_offer && let Some(pa) = peer_accept {
-        // WRITE-ORDER INVARIANT: `ReverseAttach` MUST be written here — after
-        // `Attached`, before the select loop below emits its first forward `Event` —
-        // because the dialer reads exactly one frame under a timeout for it and fails
-        // closed on anything else (`client::dial_peer`). The controller's replay events
-        // are already queued in `controller.events`, but nothing drains them until the
-        // loop, so this synchronous write is guaranteed first on the wire. A refactor
-        // that starts the event pump before this point would silently break dialing.
+        // `ReverseAttach` must be the first frame after `Attached`: the dialer reads
+        // exactly one frame for it and fails closed. Don't start the event pump before this.
         if writer
             .send(&ServerFrame::ReverseAttach {
                 who: pa.identity.clone(),
@@ -386,8 +301,7 @@ where
         }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
-        // The return edge is unsupervised on both sides (host None, supervised false);
-        // it is named by what the DIALER announced (`who`), never derived here.
+        // Unsupervised on both sides, and named by what the dialer announced.
         let _ = pa.registrar.send(PeerRegistration::new(
             Controller {
                 events: ev_rx,
@@ -401,10 +315,8 @@ where
 
     let mut events = controller.events;
     let ui_tx = controller.ui_tx;
-    // `seq` counts every event the controller stream yields, in receive order.
-    // The broker replays its whole buffer from index 0 on every attach, so this
-    // index is a stable cursor across reconnects: a client that saw through seq N
-    // reattaches with `after_seq = Some(N)` and we skip everything <= N.
+    // The broker replays its whole buffer from index 0 on every attach, so the
+    // receive index is a stable resume cursor across reconnects.
     let mut seq: u64 = 0;
     let mut ping = keepalive_timer();
 
@@ -420,8 +332,6 @@ where
                     Some(event) => {
                         let this_seq = seq;
                         seq += 1;
-                        // Honour the resume cursor: drain replayed events the
-                        // client already has without re-sending them.
                         if let Some(a) = after_seq
                             && this_seq <= a {
                                 continue;
@@ -431,60 +341,38 @@ where
                             .await
                             .is_err()
                         {
-                            // Socket write failed → client gone; pause in place.
-                            // Returning drops this controller, detaching it; the
-                            // session lives on headless.
                             return ConnOutcome::Disconnected;
                         }
                     }
-                    // The controller stream closed: the broker (and the session) shut
-                    // down. Nothing else closes it now — a second client attaching no
-                    // longer boots this one — so this connection is done and the
-                    // daemon stops.
                     None => return ConnOutcome::SessionEnded,
                 }
             }
             frame = reader.recv() => {
                 match frame {
                     Ok(Some(ClientFrame::Command(ui))) => {
-                        // A controller's Quit detaches *that controller*; it never
-                        // ends the session. A daemon is a service — only stopping its
-                        // process ends it — and a controller leaving (quit, detach, or
-                        // drop) must never strand the others. So Quit is handled
-                        // exactly like Detach (drop this controller and return), and is
-                        // not forwarded to the loop.
+                        // Quit detaches only this controller: a daemon ends only when its
+                        // process stops, and one controller leaving must not strand others.
                         if matches!(ui, UiEvent::Quit) {
                             return ConnOutcome::Disconnected;
                         }
                         if ui_tx.send(ui).await.is_err() {
-                            return ConnOutcome::SessionEnded; // broker gone
+                            return ConnOutcome::SessionEnded;
                         }
                     }
-                    // Reverse edge (#60): the dialer's own broker events → the return
-                    // Controller's stream (we observe the dialer). Dropped silently on a
-                    // non-agent leg (no `rev_ev_tx`) or once the local PeerSet reaped the
-                    // return peer.
                     Ok(Some(ClientFrame::ReverseEvent { event, .. })) => {
                         if let Some(tx) = &rev_ev_tx {
                             let _ = tx.send(event);
                         }
                     }
-                    // Explicit detach or a clean EOF (client dropped the socket):
-                    // pause in place (dropping this controller detaches it) so a later
-                    // client reattaches and replays.
                     Ok(Some(ClientFrame::Detach)) | Ok(None) => {
                         return ConnOutcome::Disconnected;
                     }
                     // A second Attach mid-session is a protocol error; ignore it.
                     Ok(Some(ClientFrame::Attach { .. })) => {}
-                    // Transport / parse error → treat as a drop.
                     Err(_) => return ConnOutcome::Disconnected,
                 }
             }
-            // Reverse edge (#60): the local PeerSet drives the return peer → out as
-            // `ReverseCommand` (we drive the dialer). Inert on a non-agent leg; a closed
-            // channel (the PeerSet reaped the return peer) just quiets the arm, leaving
-            // the forward direction running.
+            // A closed channel (the PeerSet reaped the return peer) quiets only this arm.
             rev_ui = recv_opt_ui(&mut rev_ui_rx) => {
                 match rev_ui {
                     Some(ui) => {
@@ -499,8 +387,7 @@ where
     }
 }
 
-// Await the next drive for the reverse peer, or pend forever when this leg has no
-// reverse edge — so the bridge's select arm stays quiet on a plain (phone/watch) leg.
+// Pends forever without a reverse edge, keeping the select arm quiet.
 async fn recv_opt_ui(rx: &mut Option<mpsc::Receiver<UiEvent>>) -> Option<UiEvent> {
     match rx {
         Some(rx) => rx.recv().await,

@@ -16,30 +16,23 @@ use crate::core::session::Session;
 use crate::core::{AgentConfig, AgentEvent, Backend, McpServerInfo};
 use crate::llm::{ContentBlock, Message, Provider, Request, SystemBlock};
 
-// The coding agent: it supplies the loop (in `core`) with the system prompt,
-// project context, the built-in + MCP tool surface, and tool execution. Owns
-// the MCP registry and the Read-before-Edit tracker for the session.
 pub struct CodingBackend {
     system_prompt: String,
     stable_env: String,
     agents_md: Option<String>,
-    // The subagent contract (see `into_subagent`); None for a top-level agent.
     role_preamble: Option<String>,
     cwd: PathBuf,
     mcp: McpRegistry,
     skills: SkillRegistry,
     web_search: bool,
-    // Session-scoped Read-before-Edit tracker. Resumed sessions start with an
-    // empty tracker — see file_state.rs for the rationale.
+    // Resumed sessions start with an empty tracker; see file_state.rs.
     file_state: Arc<Mutex<FileState>>,
 }
 
 impl CodingBackend {
     pub fn new(cwd: PathBuf, mcp: McpRegistry, skills: SkillRegistry, web_search: bool) -> Self {
         Self {
-            // Built once: the roster is derived from the compile-time tool set,
-            // and the env/AGENTS.md are read at session start, so these stay
-            // byte-stable across the session and anchor the cached prefix.
+            // Built once so they stay byte-stable and anchor the cached prefix.
             system_prompt: system_prompt_body(web_search),
             stable_env: stable_env_block(&cwd),
             agents_md: agents_md_block(&cwd),
@@ -52,11 +45,8 @@ impl CodingBackend {
         }
     }
 
-    // Reconfigure this backend as a spawned subagent's: `role_preamble` (see
-    // `prompt::subagent_role`) becomes a system block right after the prompt body.
-    // AGENTS.md stays: a subagent does real work in the repo, so the repo's
-    // conventions apply to it. Role by prompt, not by type: the loop and everything
-    // below stay role-free.
+    // Role by prompt, not by type: the loop stays role-free. AGENTS.md stays
+    // because a subagent does real work in the repo.
     pub fn into_subagent(mut self, role_preamble: String) -> Self {
         self.role_preamble = Some(role_preamble);
         self
@@ -92,17 +82,12 @@ impl Backend for CodingBackend {
     }
 
     fn requires_permission(&self, name: &str) -> bool {
-        // MCP tools are discovered at runtime, so the static built-in classifier
-        // can't see them — the registry classifies them from `readOnlyHint`
-        // (read-only auto-allows; everything else gates). load_tool always gates:
-        // connecting a server can spawn a subprocess or trigger an OAuth browser
-        // flow, so the user approves before the model pulls a server in.
+        // load_tool always gates: connecting can spawn a subprocess or start an
+        // OAuth browser flow.
         if name == LOAD_TOOL_NAME {
             true
         } else if name == USE_SKILL_NAME {
-            // Loading a skill only reads a local file the user installed into
-            // context — effectively read-only (like AGENTS.md auto-loading and
-            // MCP readOnlyHint). Any script the skill names still gates at Bash.
+            // Only reads a user-installed file; any script it names still gates at Bash.
             false
         } else if self.mcp.is_mcp_tool(name) {
             self.mcp.requires_permission(name)
@@ -144,8 +129,6 @@ impl Backend for CodingBackend {
     }
 
     async fn handle_mcp(&mut self, cmd: &McpCommand, notify: &mpsc::Sender<AgentEvent>) -> String {
-        // Mid-session MCP control (load / unload / list). Returns the outcome text;
-        // the loop surfaces it as a Notice (and re-emits Capabilities on a change).
         match cmd {
             McpCommand::Load(name) => match self.mcp.load(name, Some(notify)).await {
                 Ok(n) => format!("[mcp] loaded '{name}' ({n} tools) — available next turn"),
@@ -175,11 +158,8 @@ impl Backend for CodingBackend {
     }
 }
 
-// Execute the model-driven `load_tool` call: connect the named dormant server
-// and report back so the model knows what it gained. `notify` carries any OAuth
-// authorize URL out to the TUI. The newly-loaded schemas join the tool array on
-// the next inner-loop iteration (it rebuilds from the registry), so the model
-// can call them in its next response — not the current one.
+// New schemas join the tool array on the next inner-loop iteration, so the
+// model can call them in its next response, not the current one.
 async fn load_dormant(
     mcp: &mut McpRegistry,
     input: &serde_json::Value,
@@ -195,10 +175,8 @@ async fn load_dormant(
     ))
 }
 
-// The `system` field: prompt body, then optional AGENTS.md, then the stable
-// and volatile env blocks. The cache breakpoints sit on the two env blocks —
-// see the breakpoint-budget note at the call site for why the body/agents_md
-// blocks carry none.
+// Cache breakpoints sit only on the two env blocks; the stable_env marker
+// covers everything before it.
 fn build_system_blocks(
     system_prompt: &str,
     role_preamble: &Option<String>,
@@ -210,8 +188,6 @@ fn build_system_blocks(
         text: system_prompt.to_string(),
         cache: false,
     }];
-    // Role before conventions: a subagent's contract sits directly under the body.
-    // Session-stable like the body, so the stable_env marker downstream covers it.
     if let Some(role) = role_preamble {
         system.push(SystemBlock {
             text: role.clone(),
@@ -235,22 +211,14 @@ fn build_system_blocks(
     system
 }
 
-// Tool array = foundational built-ins + always-on (user-specified) MCP tools,
-// then a cache breakpoint, then any loaded-dormant MCP tools. The model sees
-// one flat list; dispatch routes by name. The breakpoint marks the
-// stable/dynamic boundary: foundational + always-on defs never change
-// mid-session, so a dormant load/unload (which only touches the tail after
-// this marker) keeps the whole stable prefix a cache hit instead of
-// re-processing every schema.
+// The cache breakpoint sits after the session-stable tools, so a dormant
+// load/unload only touches the tail and the stable prefix stays a cache hit.
 fn build_tool_array(
     mcp: &McpRegistry,
     skills: &SkillRegistry,
 ) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tool_schemas = tools::schemas();
-    // The load_tool and use_skill meta-tools are foundational: their catalogs
-    // are fixed at startup (the dormant MCP catalog is compile-time; the skill
-    // catalog is discovered once), so they sit in the stable prefix above the
-    // breakpoint alongside the native tools.
+    // Meta-tool catalogs are fixed at startup, so they belong in the stable prefix.
     if let Some(load_tool) = mcp.load_tool_schema() {
         tool_schemas.push(load_tool);
     }
@@ -258,20 +226,12 @@ fn build_tool_array(
         tool_schemas.push(use_skill);
     }
     tool_schemas.extend(mcp.always_on_schemas());
-    // Index of the stable/dynamic boundary: everything up to here never
-    // changes mid-session, so the provider marks it as the tool cache
-    // breakpoint and a later dormant load/unload touches only the tail. There
-    // is always at least one foundational tool, so this is a real boundary.
     let cache_boundary = tool_schemas.len().checked_sub(1);
     tool_schemas.extend(mcp.dormant_schemas());
     (tool_schemas, cache_boundary)
 }
 
-// `--print-prompt`: reconstruct exactly the system blocks and tool schemas the
-// first turn would send, print them, and report the token cost (system-only,
-// tools-only, total) via the count_tokens endpoint. A one-shot inspection path
-// — no TUI, no conversation. Runs against stdout, so the caller must not have
-// taken the screen yet.
+// Writes to stdout, so the caller must not have taken the screen yet.
 pub async fn print_preamble<P: Provider>(
     cfg: &AgentConfig,
     provider: &P,

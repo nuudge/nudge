@@ -1,15 +1,6 @@
-// Application-layer end-to-end encryption for the relayed path (Phase 8.2-d). Each
-// protocol frame is sealed under a pre-shared symmetric key before it becomes a
-// WebSocket message and opened on the far side, so the relay only ever forwards
-// opaque ciphertext — the "ciphertext-blind relay" guarantee. The local Unix-socket
-// path is trusted and stays plaintext; encryption applies only to the WS codec.
-//
-// Primitive: XSalsa20-Poly1305 (libsodium `crypto_secretbox`), via dryoc's
-// libsodium-compatible classic API. The wire layout per frame is
-// `nonce(24) ‖ MAC(16) ‖ ciphertext` — i.e. a fresh random nonce prepended to the
-// `crypto_secretbox_easy` output — so the Android lazysodium client can interop in
-// 8.4. The key is carried in a QR pairing code (see `pairing`) that produces the
-// `Cipher` on both ends.
+// End-to-end encryption for the relayed path so the relay only forwards ciphertext;
+// the local Unix socket is trusted and stays plaintext. Frame layout is
+// `nonce(24) ‖ MAC(16) ‖ ciphertext` (libsodium secretbox) to interop with Android lazysodium.
 
 use anyhow::Result;
 use dryoc::classic::crypto_secretbox::{
@@ -20,9 +11,7 @@ use dryoc::constants::{
 };
 use dryoc::rng::copy_randombytes;
 
-// Holds the shared secret. Intentionally not `Debug` so the key can't leak into a
-// log line. `Clone` (the key is `Copy`) so the reader and writer halves each carry
-// one without sharing mutable state.
+// Intentionally not `Debug` so the key can't leak into a log line.
 #[derive(Clone)]
 pub struct Cipher {
     key: Key,
@@ -35,9 +24,8 @@ impl Cipher {
         }
     }
 
-    // Rebuild a cipher from raw key bytes carried in a pairing code. Errors on a
-    // wrong-sized key so a malformed code fails loudly at pairing time, not later
-    // as an opaque authentication failure on every frame.
+    // Rejects a wrong-sized key so a malformed code fails at pairing time, not as
+    // an opaque authentication failure on every frame.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let key: Key = bytes.try_into().map_err(|_| {
             anyhow::anyhow!(
@@ -48,14 +36,11 @@ impl Cipher {
         Ok(Self { key })
     }
 
-    // The raw key bytes, for embedding in a pairing code. Crate-internal so the
-    // secret has no public accessor to leak through.
+    // Crate-internal so the secret has no public accessor to leak through.
     pub(crate) fn key_bytes(&self) -> &[u8; CRYPTO_SECRETBOX_KEYBYTES] {
         &self.key
     }
 
-    // Seal one frame: fresh nonce ‖ secretbox. The buffers are sized exactly, so
-    // the encrypt step cannot fail (it only errors on a wrong-sized output buffer).
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce: Nonce = [0u8; CRYPTO_SECRETBOX_NONCEBYTES];
         copy_randombytes(&mut nonce);
@@ -72,8 +57,6 @@ impl Cipher {
         out
     }
 
-    // Open one sealed frame. A wrong key or any tampering fails the Poly1305 tag,
-    // so a bad frame is an authentication error, not silent garbage.
     pub fn open(&self, framed: &[u8]) -> Result<Vec<u8>> {
         if framed.len() < CRYPTO_SECRETBOX_NONCEBYTES + CRYPTO_SECRETBOX_MACBYTES {
             anyhow::bail!("sealed frame too short to contain a nonce + MAC");
@@ -103,7 +86,6 @@ mod tests {
     #[test]
     fn fresh_nonce_each_seal() {
         let cipher = Cipher::generate();
-        // Same plaintext, different ciphertext — proves the nonce is random per call.
         assert_ne!(cipher.seal(b"same"), cipher.seal(b"same"));
     }
 

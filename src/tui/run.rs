@@ -69,7 +69,6 @@ async fn run_loop<H: SessionHandle>(
 
     let mut input_stream = EventStream::new();
     let mut tick = tokio::time::interval(SPINNER_TICK);
-    // Skip missed ticks rather than burning CPU catching up.
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     terminal.draw(|f| app.render(f))?;
@@ -136,7 +135,6 @@ async fn run_loop<H: SessionHandle>(
             }
         }
 
-        // Apply a transition here, where the host handle and channel slots live.
         if let Some(target) = app.pending_transition.take() {
             match target {
                 Mode::Background => {
@@ -147,11 +145,8 @@ async fn run_loop<H: SessionHandle>(
                     app.enter_background();
                 }
                 Mode::Foreground => {
-                    // Re-attach as an ordinary client — there is no reclaim. With the
-                    // broker multi-attach, foregrounding just adds this controller back
-                    // alongside any others (e.g. a phone still paired over the relay);
-                    // both stay live. `attach_force` is the inert seam a future
-                    // identity-aware reclaim policy would hook into.
+                    // No reclaim: the broker is multi-attach, so this controller rejoins
+                    // alongside any others (e.g. a paired phone).
                     match host.attach_force(who.clone()).await {
                         Some(c) => {
                             app.enter_foreground();

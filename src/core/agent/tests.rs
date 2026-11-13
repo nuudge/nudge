@@ -14,8 +14,6 @@ use crate::core::store::{SessionState, SessionStore};
 use crate::core::{SessionHandle, SessionHost};
 use crate::llm::{ContentBlock, Message, Provider, Request, Response, SystemBlock, Usage};
 
-// A provider that always closes the turn with a one-line assistant reply — enough
-// to prove a turn ran without touching the network.
 struct FakeProvider;
 impl Provider for FakeProvider {
     async fn complete(&self, _req: &Request<'_>) -> Result<Response> {
@@ -33,8 +31,6 @@ impl Provider for FakeProvider {
     }
 }
 
-// Like FakeProvider, but records the transcript of every request so tests can
-// assert exactly what entered the model's context (e.g. attribution prefixes).
 struct RecordingProvider {
     seen: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
 }
@@ -55,9 +51,7 @@ impl Provider for RecordingProvider {
     }
 }
 
-// Plays a fixed sequence of responses (e.g. a tool_use turn then an end_turn),
-// recording each request's transcript and tool names — how tests script the model
-// calling a loop-level peer tool and then assert what came back to it.
+// Panics once its scripted responses run out, so an unexpected extra call fails the test.
 struct ScriptedProvider {
     responses: std::sync::Mutex<Vec<Response>>,
     seen_messages: std::sync::Arc<std::sync::Mutex<Vec<Message>>>,
@@ -78,8 +72,6 @@ impl Provider for ScriptedProvider {
     }
 }
 
-// Plays a fixed sequence of responses, recording every request's system-block texts —
-// for asserting what a mode adds to (or drops from) the system prompt per request.
 struct SystemLogProvider {
     responses: std::sync::Mutex<Vec<Response>>,
     seen_system: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
@@ -123,8 +115,7 @@ fn end_turn_response(text: &str) -> Response {
     }
 }
 
-// Closes each turn with an end_turn reply, except the `fail_on`-th call (1-indexed),
-// which errors — how tests drive a provider failure mid-turn to exercise rollback.
+// `fail_on` is 1-indexed.
 struct FailOnNthProvider {
     calls: std::sync::Mutex<usize>,
     fail_on: usize,
@@ -143,8 +134,6 @@ impl Provider for FailOnNthProvider {
     }
 }
 
-// A no-tool backend: the loop needs a Backend, but these tests exercise input
-// routing (peers, drive edges), not tool dispatch. Only "GatedTool" needs permission.
 struct FakeBackend;
 impl Backend for FakeBackend {
     fn system_blocks(&self) -> Vec<SystemBlock> {
@@ -209,8 +198,6 @@ fn agent_who(name: &str) -> ClientIdentity {
     }
 }
 
-// AgentIo for a direct-run loop test: no spawn factory, and a self_handle from a
-// bare broker (only ever exercised by the Spawn tool).
 fn mk_io(
     ui_rx: mpsc::Receiver<LoopInput>,
     agent_tx: mpsc::Sender<AgentEvent>,
@@ -229,8 +216,7 @@ fn mk_io(
     }
 }
 
-// A synthetic peer: the `Controller` the loop holds, plus the far ends a test uses
-// to inject the peer's events and observe what the loop drives back to it.
+// The loop's Controller, plus far ends to inject peer events and see what the loop sends.
 fn fake_peer() -> (
     Controller,
     mpsc::UnboundedSender<ControllerEvent>,
@@ -248,8 +234,6 @@ fn fake_peer() -> (
     )
 }
 
-// A SUPERVISED peer's activity surfaces to this agent's own front-end as a Notice
-// (the parent's watch substrate). Registered at runtime via the registrar.
 #[tokio::test]
 async fn peer_activity_surfaces_as_a_notice() {
     let (session, dir) = mk_session();
@@ -275,8 +259,6 @@ async fn peer_activity_surfaces_as_a_notice() {
         })
         .unwrap();
 
-    // The registration now emits a "connected to peer" Notice first; the activity
-    // Notice (what this test is about) follows it.
     let mut saw = None;
     while let Some(ev) = agent_rx.recv().await {
         if let AgentEvent::Notice { text } = ev {
@@ -302,11 +284,7 @@ async fn peer_activity_surfaces_as_a_notice() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// #52: a peer handed to a LIVE loop through the composition-root wiring —
-// `PeerWiring.register_rx` → `AgentIo.peer_register_rx` — lands in the loop. Built on
-// the real `SessionHost::spawn` path (not `mk_io`), so it proves the seam the runtime
-// producer will drive: sending a registration through the channel makes the peer show
-// up in the re-emitted Capabilities roster.
+// Uses the real `SessionHost::spawn` wiring (`PeerWiring.register_rx`), not `mk_io`.
 #[tokio::test]
 async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
     use crate::core::PeerWiring;
@@ -333,8 +311,6 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
         .await
         .expect("initial attach");
 
-    // Drive the registrar the way the runtime producer will: a completed edge arrives
-    // through the channel. The loop registers it and re-advertises the roster.
     let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
     peer_reg_tx
         .send(PeerRegistration::new(peer_ctrl, agent_who("remote-1")))
@@ -344,7 +320,6 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
         let mut saw_notice = false;
         loop {
             match ctrl.events.recv().await {
-                // A runtime edge announces itself, so the "connecting…" line resolves.
                 Some(ControllerEvent::Notice { text })
                     if text.contains("connected to peer remote-1") =>
                 {
@@ -371,10 +346,7 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// #53: the /connect-peer command hands the pasted code to the injected dialer (off the
-// loop, non-blocking) and the completed forward edge lands via the registrar. A stub
-// dialer stands in for the network — it records the code it was handed and registers a
-// peer, whose far ends a keeper task holds alive so the edge isn't immediately reaped.
+// A stub dialer stands in for the network: it records the code and registers a peer.
 #[tokio::test]
 async fn connect_peer_command_invokes_dialer_and_registers_edge() {
     use crate::core::{BrokerHandle, PeerDialer, PeerWiring};
@@ -434,14 +406,12 @@ async fn connect_peer_command_invokes_dialer_and_registers_edge() {
         .await
         .unwrap();
 
-    // The dialer was invoked with exactly the pasted code (parse + dispatch + hand-off).
     let got = tokio::time::timeout(std::time::Duration::from_secs(5), code_rx.recv())
         .await
         .expect("dialer was not invoked")
         .expect("code");
     assert_eq!(got, "nudge:pastedcode");
 
-    // The forward edge lands through the registrar: the peer shows up in the roster.
     let landed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match ctrl.events.recv().await {
@@ -463,7 +433,6 @@ async fn connect_peer_command_invokes_dialer_and_registers_edge() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A supervised peer registration, as the Spawn path produces (steered + dismissable).
 fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistration {
     PeerRegistration {
         controller,
@@ -474,9 +443,6 @@ fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistrati
     }
 }
 
-// A supervised peer's check-in drives a steering inference; an approve verdict routes
-// allow back to the peer, the check-in carries the capped activity digest, and the
-// whole exchange is recorded in the transcript (resting on an assistant turn).
 #[tokio::test]
 async fn supervised_check_in_is_steered_to_approval() {
     let (session, dir) = mk_session();
@@ -530,7 +496,6 @@ async fn supervised_check_in_is_steered_to_approval() {
         other => panic!("expected the approve routed to the peer, got {other:?}"),
     }
 
-    // The steering request carried the check-in + digest.
     let transcript = seen_messages.lock().unwrap().clone();
     let checkin = match &transcript[0].content[0] {
         ContentBlock::Text { text } => text.clone(),
@@ -549,10 +514,8 @@ async fn supervised_check_in_is_steered_to_approval() {
     // tool_choice.
     assert!(checkin.contains("by calling RespondToPeer"), "{checkin}");
 
-    // The exchange is recorded as it happened and rests on an assistant turn: the next
-    // human turn arrives after [check-in, RespondToPeer call, its result, close]. The
-    // real call must be in the transcript — a check-in answered by plain text would
-    // teach the model to answer the next one with text instead of the tool.
+    // The real call must be recorded: a check-in answered by plain text would teach the
+    // model to answer the next one with text instead of the tool.
     ui_tx
         .send((None, UiEvent::UserMessage { text: "hi".into() }))
         .await
@@ -603,8 +566,7 @@ async fn supervised_check_in_is_steered_to_approval() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A deny verdict routes the block and then the redirect message — the peer paused on
-// denial, so the message arrives as its fresh instruction.
+// The peer pauses on denial, so the redirect arrives as its fresh instruction.
 #[tokio::test]
 async fn steering_deny_redirects_the_peer() {
     let (session, dir) = mk_session();
@@ -659,8 +621,6 @@ async fn steering_deny_redirects_the_peer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// An escalate verdict surfaces the peer's request on this agent's own broker (named),
-// and the human's answer is routed down to the peer.
 #[tokio::test]
 async fn steering_escalates_to_the_human() {
     let (session, dir) = mk_session();
@@ -698,7 +658,6 @@ async fn steering_escalates_to_the_human() {
         })
         .unwrap();
 
-    // The escalated request reaches this agent's own event stream, named.
     loop {
         match agent_rx.recv().await {
             Some(AgentEvent::PermissionRequest {
@@ -726,8 +685,7 @@ async fn steering_escalates_to_the_human() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Answers the escalated PermissionRequest that surfaces on this agent's own stream,
-// returning its summary and the Notices emitted before it.
+// Returns the escalation's summary and the Notices emitted before it.
 async fn answer_escalation(
     agent_rx: &mut mpsc::Receiver<AgentEvent>,
     allow: bool,
@@ -748,9 +706,8 @@ async fn answer_escalation(
     }
 }
 
-// No verdict on either attempt (plain text both times) is not a silent deny: the call
-// escalates to the human, whose answer reaches the peer, and the dangling check-in is
-// rolled back so the next human turn starts clean.
+// No verdict is not a silent deny: it escalates to the human, and the dangling check-in
+// is rolled back so the next human turn starts clean.
 #[tokio::test]
 async fn steering_without_verdict_retries_then_escalates() {
     let (session, dir) = mk_session();
@@ -805,9 +762,6 @@ async fn steering_without_verdict_retries_then_escalates() {
         other => panic!("expected the human's deny routed to the peer, got {other:?}"),
     }
 
-    // Both scripted no-verdict replies were consumed by the two attempts, and the
-    // dangling check-in was rolled back: the next turn's transcript is just the human
-    // message.
     ui_tx
         .send((None, UiEvent::UserMessage { text: "hi".into() }))
         .await
@@ -825,8 +779,6 @@ async fn steering_without_verdict_retries_then_escalates() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A verdict-less first reply is retried; a verdict on the second attempt decides the
-// check-in normally, without bothering the human.
 #[tokio::test]
 async fn steering_retries_a_missing_verdict() {
     let (session, dir) = mk_session();
@@ -880,11 +832,8 @@ async fn steering_retries_a_missing_verdict() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// An UNSUPERVISED peer's permission request is never answered by this agent — its
-// own supervisor (or a human) holds that decision. This is what stops a child
-// rubber-stamping its parent's gated calls. It is not narrated either (the peer's
-// prompts are its own session's business); the peer's Error event is the ordering
-// sentinel proving the prompt was processed before we assert.
+// Stops a child rubber-stamping its parent's gated calls. Peer events are FIFO, so the
+// peer's Error Notice is a sentinel proving the prompt was processed (silently).
 #[tokio::test]
 async fn unsupervised_check_in_is_not_answered() {
     let (session, dir) = mk_session();
@@ -917,8 +866,6 @@ async fn unsupervised_check_in_is_not_answered() {
         })
         .unwrap();
 
-    // Peer events are FIFO on one channel: the sentinel's notice proves the prompt
-    // was processed — silently (no "asks to use" narration precedes it).
     loop {
         match agent_rx.recv().await {
             Some(AgentEvent::Notice { text }) if text.contains("sentinel") => break,
@@ -935,14 +882,10 @@ async fn unsupervised_check_in_is_not_answered() {
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
-    // The loop ended without ever sending the peer anything; its channel just closes.
     assert!(peer_ui.recv().await.is_none(), "peer must not be answered");
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// DismissPeer (gated) removes a supervised peer: dropping the Peer ends the held
-// connection (and, for a real child, its owned SessionHost). Observable here as the
-// peer's event channel closing.
 #[tokio::test]
 async fn dismiss_peer_ends_the_supervised_child() {
     let (session, dir) = mk_session();
@@ -995,7 +938,6 @@ async fn dismiss_peer_ends_the_supervised_child() {
         }
     }
 
-    // The Peer (and its controller) is gone: the far event sender now errors.
     assert!(
         peer_ev
             .send(ControllerEvent::Notice { text: "?".into() })
@@ -1017,9 +959,7 @@ async fn dismiss_peer_ends_the_supervised_child() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// The lifecycle contract at the loop level: the row is 'running' while the loop
-// lives, 'ended' after a graceful teardown (Quit), and 'running' again once a
-// resume re-opens it. A crash writes nothing — untestable here and honest by design.
+// A crash writes nothing, so only the graceful-teardown transition is testable.
 #[tokio::test]
 async fn session_state_ends_on_teardown_and_runs_again_on_open() {
     let (session, dir) = mk_session();
@@ -1061,8 +1001,7 @@ async fn session_state_ends_on_teardown_and_runs_again_on_open() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Dismissal ends the child for real: dropping the parent's Peer sends the child's
-// host a Quit, its loop winds down, and its session row reads 'ended'.
+// Dropping the parent's Peer sends the child's host a Quit.
 #[tokio::test]
 async fn dismissed_child_session_row_reads_ended() {
     let (parent_session, parent_dir) = mk_session();
@@ -1153,9 +1092,6 @@ async fn dismissed_child_session_row_reads_ended() {
     std::fs::remove_dir_all(&child_dir).ok();
 }
 
-// Issue #26's done-when, end to end: spawn a real child (its session row carries
-// the spawn edge), let it log a turn, dismiss it — then answer "what did the
-// child actually do?" from InspectSession alone, in the parent's context.
 #[tokio::test]
 async fn dismissed_child_is_answerable_from_inspect_session_alone() {
     let (parent_session, dir) = mk_session();
@@ -1202,7 +1138,6 @@ async fn dismissed_child_is_answerable_from_inspect_session_alone() {
     }
     drop(driver);
 
-    // Parent loop dismisses the child.
     let child_ctrl = child_host
         .attach(agent_who("parent"))
         .await
@@ -1265,8 +1200,6 @@ async fn dismissed_child_is_answerable_from_inspect_session_alone() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    // The tool alone answers what the child did: identity, provenance, final
-    // state, and the logged turns.
     let out = crate::coding::tools::inspect_session_run(
         &serde_json::json!({"mode": "inspect", "session": child_id}),
         &SessionStore::open(&db).unwrap(),
@@ -1286,7 +1219,6 @@ async fn dismissed_child_is_answerable_from_inspect_session_alone() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Dismissal is supervised-only: the return edge to your own spawner is refused.
 #[tokio::test]
 async fn dismiss_refuses_an_unsupervised_peer() {
     let (session, dir) = mk_session();
@@ -1334,7 +1266,6 @@ async fn dismiss_refuses_an_unsupervised_peer() {
         }
     }
 
-    // Refused — and the parent edge is still alive.
     let transcript = seen_messages.lock().unwrap().clone();
     assert!(
         transcript.iter().any(|m| m.content.iter().any(|b| matches!(
@@ -1356,7 +1287,6 @@ async fn dismiss_refuses_an_unsupervised_peer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A peerless session is unchanged: a user message on ui_rx drives one turn.
 #[tokio::test]
 async fn childless_session_still_drives_a_turn() {
     let (session, dir) = mk_session();
@@ -1394,11 +1324,6 @@ async fn childless_session_still_drives_a_turn() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// The return edge: an agent holding a `Controller` to a peer (obtained by the same
-// `attach` a human uses, but announcing `ClientKind::Agent`) drives that peer and
-// observes its reply — end-to-end through the peer's broker + loop. This is what
-// makes a spawned pair symmetric: the child reaches the parent exactly as the parent
-// reaches the child.
 #[tokio::test]
 async fn return_edge_peer_drives_the_agent_it_holds() {
     let (session, dir) = mk_session();
@@ -1412,7 +1337,6 @@ async fn return_edge_peer_drives_the_agent_it_holds() {
         crate::core::peer::PeerWiring::default(),
     );
 
-    // The "child" attaches to the parent as an agent — this is the return edge.
     let mut child_ctrl = parent.attach(agent_who("child-1")).await.unwrap();
 
     child_ctrl
@@ -1440,9 +1364,8 @@ async fn return_edge_peer_drives_the_agent_it_holds() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Guards against the mutual-attach amplification cascade: a peer's own Notice must
-// never be re-narrated (every re-narration is a Notice, so re-narrating them would
-// loop unboundedly under mutual attach), while genuine primary activity still is.
+// Every re-narration is itself a Notice, so re-narrating a peer's Notice would loop
+// unboundedly under mutual attach.
 #[test]
 fn peer_notice_does_not_renarrate_a_peer_notice() {
     assert_eq!(
@@ -1465,8 +1388,6 @@ fn peer_notice_does_not_renarrate_a_peer_notice() {
     );
 }
 
-// A broker-stamped agent sender folds into the transcript *named*, so the model
-// knows which peer spoke.
 #[tokio::test]
 async fn peer_message_is_attributed_in_the_transcript() {
     let (session, dir) = mk_session();
@@ -1505,8 +1426,7 @@ async fn peer_message_is_attributed_in_the_transcript() {
         other => panic!("expected the attributed user turn, got {other:?}"),
     }
 
-    // The log stores the other half of the invariant: clean text + the sender,
-    // so resume can re-derive exactly the attributed form the provider saw.
+    // The log keeps clean text + the sender, so resume re-derives the attributed form.
     let rows = logged_rows(&dir);
     let first: Value = serde_json::from_str(&rows[0].content).unwrap();
     assert_eq!(first["content"][0]["text"], "task done");
@@ -1520,7 +1440,6 @@ async fn peer_message_is_attributed_in_the_transcript() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A human sender's message enters the transcript bare — exactly today's behavior.
 #[tokio::test]
 async fn human_message_stays_bare_in_the_transcript() {
     let (session, dir) = mk_session();
@@ -1560,9 +1479,6 @@ async fn human_message_stays_bare_in_the_transcript() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// The model calls MessagePeer → the named peer's ui_rx receives the message (the
-// exact human input path on its side), and the ok tool_result lands in the caller's
-// transcript. The MessagePeer schema is only offered because a peer is held.
 #[tokio::test]
 async fn message_peer_tool_drives_the_named_peer() {
     let (session, dir) = mk_session();
@@ -1605,12 +1521,11 @@ async fn message_peer_tool_drives_the_named_peer() {
         }
     }
 
-    // The peer received the message on its human input path.
     match peer_ui.recv().await {
         Some(UiEvent::UserMessage { text }) => assert_eq!(text, "do X"),
         other => panic!("peer expected the driven message, got {other:?}"),
     }
-    // The schema was offered (a peer is held) and the ok result reached the model.
+    // The schema is only offered because a peer is held.
     assert!(seen_tools.lock().unwrap().contains(&"MessagePeer".into()));
     let transcript = seen_messages.lock().unwrap().clone();
     assert!(
@@ -1627,8 +1542,6 @@ async fn message_peer_tool_drives_the_named_peer() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Addressing a peer that doesn't exist returns an error tool_result carrying the
-// current roster, so the model can self-correct on its next step.
 #[tokio::test]
 async fn message_peer_unknown_name_lists_roster() {
     let (session, dir) = mk_session();
@@ -1686,8 +1599,7 @@ async fn message_peer_unknown_name_lists_roster() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A stub factory that hands out a pre-built synthetic peer, so the test controls
-// both far ends. The slot proves whether the factory ran (denial must not call it).
+// Running the factory empties the slot, so a test can tell whether it ran.
 fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> PeerFactory {
     Box::new(move |task, _self_handle| {
         let slot = slot.clone();
@@ -1711,10 +1623,6 @@ fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> P
     })
 }
 
-// The model calls Spawn → the human gates it → on approval the factory runs, the
-// child is registered (its later activity surfaces as a Notice), and the
-// tool_result records name/id/task in the caller's transcript — the durable
-// "who is child-X" record.
 #[tokio::test]
 async fn spawn_tool_gates_then_registers_the_child() {
     let (session, dir) = mk_session();
@@ -1757,7 +1665,6 @@ async fn spawn_tool_gates_then_registers_the_child() {
         .await
         .unwrap();
 
-    // Spawn gates: answer the permission round-trip, then run to TurnComplete.
     loop {
         match agent_rx.recv().await {
             Some(AgentEvent::PermissionRequest {
@@ -1776,8 +1683,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
         }
     }
 
-    // Both peer tools were offered (a factory exists), and the spawn record —
-    // name, session id, task — landed in the transcript.
+    // Both peer tools are offered because a factory exists, even with no peer held.
     let tools = seen_tools.lock().unwrap().clone();
     assert!(tools.contains(&"Spawn".into()) && tools.contains(&"MessagePeer".into()));
     let transcript = seen_messages.lock().unwrap().clone();
@@ -1791,7 +1697,6 @@ async fn spawn_tool_gates_then_registers_the_child() {
         "expected the spawn record in the transcript: {transcript:?}"
     );
 
-    // The child is genuinely registered: its activity now drives the loop.
     peer_ev
         .send(ControllerEvent::AssistantText {
             text: "child working".into(),
@@ -1810,8 +1715,6 @@ async fn spawn_tool_gates_then_registers_the_child() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Denying the Spawn permission must not run the factory; the model sees the
-// denial tool_result.
 #[tokio::test]
 async fn spawn_denial_does_not_run_the_factory() {
     let (session, dir) = mk_session();
@@ -1899,11 +1802,8 @@ async fn spawn_denial_does_not_run_the_factory() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// resume_messages derives attribution at build time from each entry's persisted
-// sender: an agent sender always gets the `[message from peer …]` prefix; a human is
-// named too when the transcript is multi-party (two or more distinct senders) and
-// stays bare in a solo transcript; a pre-sender entry (None — its text may carry an
-// already-baked prefix) passes through untouched.
+// An agent sender is always prefixed, a human only in a multi-party transcript, and a
+// sender-less entry (its text may carry a baked-in prefix) passes through untouched.
 #[test]
 fn resume_messages_applies_attribution_from_persisted_sender() {
     use crate::core::session::LoggedMessage;
@@ -1941,11 +1841,9 @@ fn resume_messages_applies_attribution_from_persisted_sender() {
         })
         .collect();
     assert_eq!(texts[0], "[message from peer child-x]\ndo it");
-    // Two distinct senders → a multi-party transcript, so the human is named too.
     assert_eq!(texts[1], "[message from alice]\nhello");
     assert_eq!(texts[2], "[message from peer old]\nlegacy");
 
-    // A solo transcript: the lone human stays bare.
     let solo = vec![
         LoggedMessage {
             message: user("just me"),
@@ -1963,8 +1861,6 @@ fn resume_messages_applies_attribution_from_persisted_sender() {
     }
 }
 
-// Each committed entry's message role, in order. An empty transcript (nothing
-// ever committed) reads as empty.
 fn logged_roles(dir: &std::path::Path) -> Vec<String> {
     logged_lines(dir)
         .iter()
@@ -1975,8 +1871,6 @@ fn logged_roles(dir: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-// The committed transcript of the test's (single) session, as the stored message
-// JSON strings, read back through a fresh store connection on the temp database.
 fn logged_lines(dir: &std::path::Path) -> Vec<String> {
     logged_rows(dir).into_iter().map(|r| r.content).collect()
 }
@@ -1999,10 +1893,8 @@ async fn drain_until(rx: &mut mpsc::Receiver<AgentEvent>, pred: impl Fn(&AgentEv
     panic!("event stream ended before the awaited event");
 }
 
-// A provider error mid-turn rolls the in-memory transcript back AND leaves nothing on
-// disk for that turn: the failed turn's user entry is never committed, so the JSONL
-// holds only the committed turns and a resume sees no phantom / no consecutive user
-// roles. The turn after the failure lands cleanly right behind the last good close.
+// The failed turn's user entry is never committed, so a resume sees no phantom entry
+// and no consecutive user roles.
 #[tokio::test]
 async fn provider_error_midturn_leaves_no_phantom_log_entry() {
     let (session, dir) = mk_session();
@@ -2021,14 +1913,13 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
         mk_io(ui_rx, agent_tx, PeerSet::default(), None),
     ));
 
-    // Turn 1 commits (call 1 succeeds).
     ui_tx
         .send((None, UiEvent::UserMessage { text: "hi".into() }))
         .await
         .unwrap();
     drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::TurnComplete)).await;
 
-    // Turn 2's provider call fails; its user entry must be rolled back, not logged.
+    // Provider call 2 fails.
     ui_tx
         .send((
             None,
@@ -2040,7 +1931,6 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
         .unwrap();
     drain_until(&mut agent_rx, |e| matches!(e, AgentEvent::Error { .. })).await;
 
-    // Turn 3 commits (call 3 succeeds) — it must follow turn 1's close directly.
     ui_tx
         .send((
             None,
@@ -2055,7 +1945,6 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
 
-    // On disk: only the two committed turns, no "again" phantom, no consecutive users.
     let lines = logged_lines(&dir);
     assert!(
         !lines.iter().any(|l| l.contains("again")),
@@ -2067,7 +1956,6 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
         "log holds exactly the committed turns"
     );
 
-    // A resume rebuilds the same clean, alternating transcript.
     let resumed = Session::open(
         &id,
         dir.clone(),
@@ -2085,9 +1973,7 @@ async fn provider_error_midturn_leaves_no_phantom_log_entry() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A steering inference that fails (provider error) is not retried: it escalates to the
-// human at once, whose answer reaches the peer, AND the staged check-in is rolled back
-// so nothing about it reaches the JSONL.
+// A failed steering inference is not retried: it escalates to the human at once.
 #[tokio::test]
 async fn steering_failure_leaves_no_checkin_in_the_log() {
     let (session, dir) = mk_session();
@@ -2117,8 +2003,6 @@ async fn steering_failure_leaves_no_checkin_in_the_log() {
         })
         .unwrap();
 
-    // The steering inference errors → escalated (with the reason), and the human's
-    // allow is what the peer receives.
     let (_, notices) = answer_escalation(&mut agent_rx, true).await;
     assert!(
         notices
@@ -2134,7 +2018,6 @@ async fn steering_failure_leaves_no_checkin_in_the_log() {
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
 
-    // The staged check-in was rolled back — it never reached disk.
     let lines = logged_lines(&dir);
     assert!(
         !lines.iter().any(|l| l.contains("check-in from peer")),
@@ -2144,9 +2027,6 @@ async fn steering_failure_leaves_no_checkin_in_the_log() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A successful multi-iteration turn (tool_use then end_turn) commits the exact same
-// entries eager logging produced: user, assistant(tool_use), user(tool_results),
-// assistant — proving deferral is a no-op on the committed path.
 #[tokio::test]
 async fn successful_multi_iteration_turn_persists_all_entries() {
     let (session, dir) = mk_session();
@@ -2190,8 +2070,6 @@ async fn successful_multi_iteration_turn_persists_all_entries() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// /peers reports the held roster (name, kind, supervision) as a Notice; with no
-// peers it says so rather than replying with an empty listing.
 #[tokio::test]
 async fn peers_command_reports_the_roster() {
     let (session, dir) = mk_session();
@@ -2268,9 +2146,6 @@ async fn peers_command_with_no_peers_says_so() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// The roster rides Capabilities and is re-advertised on peer change: a runtime
-// registration emits it with the new peer, and the peer's disconnect (reap) emits
-// it again, empty.
 #[tokio::test]
 async fn peer_change_reemits_capabilities_roster() {
     let (session, dir) = mk_session();
@@ -2290,7 +2165,7 @@ async fn peer_change_reemits_capabilities_roster() {
     reg_tx
         .send(PeerRegistration::new(peer_ctrl, agent_who("child-1")))
         .unwrap();
-    // Registration emits a connect Notice, then the Capabilities roster re-advertise.
+    // Registration emits a connect Notice before the Capabilities roster.
     let mut saw_roster = false;
     for _ in 0..4 {
         match agent_rx.recv().await {
@@ -2307,8 +2182,6 @@ async fn peer_change_reemits_capabilities_roster() {
     }
     assert!(saw_roster, "expected Capabilities after registration");
 
-    // The peer disconnects: the loop reaps it (a Notice narrates that) and
-    // re-advertises the now-empty roster.
     drop(peer_ev);
     let mut saw_empty_roster = false;
     for _ in 0..4 {
@@ -2332,9 +2205,6 @@ async fn peer_change_reemits_capabilities_roster() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// The model-facing roster block: None when peerless, else names each held peer and
-// distinguishes a spawned subagent from a connected peer, so the agent can address
-// one without guessing.
 #[test]
 fn roster_system_text_lists_held_peers() {
     use super::peer_tools::roster_system_text;
@@ -2359,9 +2229,7 @@ fn roster_system_text_lists_held_peers() {
     );
 }
 
-// Consecutive messages from the same sender, already queued when the turn starts, are
-// coalesced into ONE user turn (same info to the model, fewer round-trips), attributed
-// once. Pre-buffering both before spawning the loop makes the drain deterministic.
+// Both messages are queued before the loop spawns, so the coalescing drain is deterministic.
 #[tokio::test]
 async fn consecutive_same_sender_messages_coalesce_into_one_turn() {
     let (session, dir) = mk_session();
@@ -2422,8 +2290,6 @@ async fn consecutive_same_sender_messages_coalesce_into_one_turn() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Different senders are NOT coalesced: a second sender's message is stashed and becomes
-// its own turn, so cross-driver messages stay attributable.
 #[tokio::test]
 async fn different_sender_messages_are_not_coalesced() {
     let (session, dir) = mk_session();
@@ -2459,7 +2325,6 @@ async fn different_sender_messages_are_not_coalesced() {
         mk_io(ui_rx, agent_tx, PeerSet::default(), None),
     ));
 
-    // Two distinct turns complete (one per sender).
     let mut completed = 0;
     while let Some(ev) = agent_rx.recv().await {
         if matches!(ev, AgentEvent::TurnComplete) {
@@ -2470,7 +2335,6 @@ async fn different_sender_messages_are_not_coalesced() {
         }
     }
 
-    // The last recorded request holds both turns as separate user messages.
     let transcript = seen.lock().unwrap().clone();
     let user_texts: Vec<&str> = transcript
         .iter()
@@ -2497,10 +2361,8 @@ async fn different_sender_messages_are_not_coalesced() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// An UNSUPERVISED peer's activity is NOT narrated — its work belongs to its own
-// session; only its MessagePeer turns, errors, and lifecycle reach this one. The
-// peer's Error (always narrated) is the sentinel: events are processed in order, so
-// if the AssistantText had narrated, it would arrive before the error notice.
+// The peer's Error is always narrated and events are processed in order, so it is a
+// sentinel: had the AssistantText narrated, its Notice would arrive first.
 #[tokio::test]
 async fn unsupervised_peer_activity_is_not_narrated() {
     let (session, dir) = mk_session();
@@ -2557,9 +2419,6 @@ async fn unsupervised_peer_activity_is_not_narrated() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// End to end through a real SessionHost: once a second distinct human connects, a
-// human's message reaches the model NAMED — the multi-driver flag flips at the
-// broker and the loop derives the prefix at payload-build time.
 #[tokio::test]
 async fn second_connected_human_makes_messages_attributed() {
     use crate::core::PeerWiring;
@@ -2589,7 +2448,6 @@ async fn second_connected_human_makes_messages_attributed() {
         .send(UiEvent::UserMessage { text: "hi".into() })
         .await
         .unwrap();
-    // Wait for bob's turn to complete before reading the recorded request.
     let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match bob.events.recv().await {
@@ -2614,9 +2472,7 @@ async fn second_connected_human_makes_messages_attributed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A turn that exhausts max_iterations reports up the spawner edge as a UserMessage
-// (the path a MessagePeer takes), so the spawner's model is woken to send 'continue'
-// or re-scope — instead of the child stalling until a human notices.
+// Without the report, a maxed-out child stalls until a human notices.
 #[tokio::test]
 async fn maxed_out_turn_reports_up_the_spawner_edge() {
     let (session, dir) = mk_session();
@@ -2680,9 +2536,8 @@ async fn expect_notice(agent_rx: &mut mpsc::Receiver<AgentEvent>, needle: &str) 
     }
 }
 
-// With /auto on, Spawn runs without a permission prompt, and the auto-mode block rides
-// both the main turn and the steering turn that decides the child's check-in (that is
-// where the check-in policy is applied). Toggling off removes the block again.
+// The steering turn must carry the auto block too: that is where the check-in policy
+// is applied.
 #[tokio::test]
 async fn auto_mode_spawns_unprompted_and_steers_under_the_policy() {
     let (session, dir) = mk_session();
@@ -2797,8 +2652,6 @@ async fn auto_mode_spawns_unprompted_and_steers_under_the_policy() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A session that cannot spawn (a subagent) has no way to delegate, so /auto is refused
-// rather than silently doing nothing.
 #[tokio::test]
 async fn auto_mode_is_unavailable_without_a_spawn_factory() {
     let (session, dir) = mk_session();
@@ -2821,8 +2674,7 @@ async fn auto_mode_is_unavailable_without_a_spawn_factory() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// AgentIo for an auto-mode test: /auto needs a spawn factory. This one is never called
-// (its slot is empty, so a call would panic).
+// /auto needs a spawn factory; this one's slot is empty, so calling it would panic.
 fn auto_io(
     ui_rx: mpsc::Receiver<LoopInput>,
     agent_tx: mpsc::Sender<AgentEvent>,
@@ -2836,8 +2688,7 @@ fn auto_io(
     }
 }
 
-// Each /auto toggle re-emits SessionInfo right away, so headers flip their badge
-// without waiting for the next turn boundary.
+// Headers flip their badge without waiting for the next turn boundary.
 #[tokio::test]
 async fn auto_toggle_emits_session_info() {
     let (session, dir) = mk_session();
@@ -2868,9 +2719,8 @@ async fn auto_toggle_emits_session_info() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// In auto mode nothing prompts the human: the agent's own gated tool comes back as an
-// error result telling it to delegate (an error, not a denial — so the loop carries on
-// instead of parking for guidance), and DismissPeer runs ungated.
+// The gated tool comes back as an error (not a denial), so the loop carries on instead
+// of parking for guidance.
 #[tokio::test]
 async fn auto_mode_never_prompts_the_human() {
     let (session, dir) = mk_session();
@@ -2945,8 +2795,7 @@ async fn auto_mode_never_prompts_the_human() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// In auto mode a deny without a message still tells the child what to do — skip the
-// step and report it — since a denied child otherwise waits for guidance forever.
+// A denied child otherwise waits for guidance forever.
 #[tokio::test]
 async fn auto_mode_deny_without_message_tells_the_child_to_skip_and_report() {
     let (session, dir) = mk_session();
@@ -3000,8 +2849,7 @@ async fn auto_mode_deny_without_message_tells_the_child_to_skip_and_report() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// In auto mode escalate is not a verdict: two escalates leave the check-in unjudged,
-// which becomes a deny with the skip-and-report message — never a human prompt.
+// In auto mode escalate is not a verdict, so two escalates leave the check-in unjudged.
 #[tokio::test]
 async fn auto_mode_unjudged_check_in_is_skipped_not_escalated() {
     let (session, dir) = mk_session();
@@ -3089,8 +2937,6 @@ fn auto_mode_respond_to_peer_offers_no_escalate() {
     );
 }
 
-// /auto is saved on the session row, and a resumed session starts in auto mode: it
-// says so, and it behaves so (its own gated tool is refused without a prompt).
 #[tokio::test]
 async fn auto_mode_survives_resume() {
     let (session, dir) = mk_session();
@@ -3183,9 +3029,8 @@ fn web_search_hits() -> Value {
                         "title": "Tokio", "encrypted_content": "x"}])
 }
 
-// A server-side search that hits the API's own loop limit stops with pause_turn: the
-// loop sends the partial assistant turn straight back (no user message in between)
-// and the turn completes once, after the continuation.
+// pause_turn means a server-side tool hit the API's own loop limit; the partial turn is
+// sent straight back with no user message in between.
 #[tokio::test]
 async fn pause_turn_resumes_without_a_new_user_message() {
     let (session, dir) = mk_session();
@@ -3252,8 +3097,6 @@ async fn pause_turn_resumes_without_a_new_user_message() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Server tool blocks surface as tool cards (a search error as an error result) but are
-// never dispatched: the tool_results turn answers only the client-side tool_use.
 #[tokio::test]
 async fn server_tool_blocks_render_as_tool_events_without_dispatch() {
     let (session, dir) = mk_session();
@@ -3351,8 +3194,7 @@ fn web_fetch_blocks(id: &str, url: &str, content: Value) -> Vec<ContentBlock> {
     ]
 }
 
-// Fetch blocks render as WebFetch cards in place among the text (the summary,
-// never the page body) and, like search, are never dispatched.
+// A fetch card shows a summary, never the page body.
 #[tokio::test]
 async fn web_fetch_blocks_render_as_tool_events_without_dispatch() {
     let (session, dir) = mk_session();
@@ -3453,8 +3295,7 @@ async fn web_fetch_blocks_render_as_tool_events_without_dispatch() {
 }
 
 // The API reports the same clearing on every request while the old results stay in
-// history, so an identical notice shows once; a changed one shows again. Warnings
-// are unaffected.
+// history, so only a changed notice is shown again.
 #[tokio::test]
 async fn context_cleared_notice_shows_only_when_it_changes() {
     let (session, dir) = mk_session();
@@ -3503,7 +3344,6 @@ async fn context_cleared_notice_shows_only_when_it_changes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Plays a fixed sequence of responses, recording the `container` of every request.
 struct ContainerLogProvider {
     responses: std::sync::Mutex<Vec<Response>>,
     seen_containers: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
@@ -3548,9 +3388,8 @@ fn paused(content: Vec<ContentBlock>, container_id: Option<&str>) -> Response {
     }
 }
 
-// The container rides only on pause_turn continuations within the same turn: the
-// latest id is kept across a pause whose response doesn't repeat it, and it never
-// leaks into the next turn's first request or a later turn's continuation.
+// The container rides only on same-turn pause_turn continuations; the latest id
+// survives a pause whose response omits it.
 #[tokio::test]
 async fn pause_turn_continuations_carry_the_turns_container() {
     let (session, dir) = mk_session();
@@ -3599,8 +3438,7 @@ async fn pause_turn_continuations_carry_the_turns_container() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// Code execution (dynamic filtering) gets no tool card, only one notice per response,
-// so no card is ever left running without a result.
+// No tool card, so none is ever left running without a result.
 #[tokio::test]
 async fn code_execution_blocks_render_as_one_notice_without_cards() {
     let (session, dir) = mk_session();
@@ -3657,8 +3495,7 @@ async fn code_execution_blocks_render_as_one_notice_without_cards() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// A cited answer arrives as many text fragments (some empty); each run between
-// non-text blocks surfaces as one AssistantText so it renders as one message.
+// A cited answer arrives as many text fragments, some empty.
 #[tokio::test]
 async fn consecutive_text_blocks_emit_one_assistant_text_per_run() {
     let (session, dir) = mk_session();

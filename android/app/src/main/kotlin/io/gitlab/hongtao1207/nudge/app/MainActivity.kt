@@ -17,10 +17,8 @@ class MainActivity : ComponentActivity() {
     private val viewModel: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Draw edge-to-edge so the system applies the system-bar and IME insets exactly
-        // once; the screen's systemBarsPadding()/imePadding() then consume them. Without
-        // this the platform also resizes for the keyboard, double-counting the inset and
-        // shoving the transcript up off the input box.
+        // Without edge-to-edge the platform also resizes for the IME, double-counting the
+        // inset that systemBarsPadding()/imePadding() already consume.
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
@@ -34,9 +32,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Fires on launch and every return to the foreground — re-attach from the saved
-    // pairing if we're not already connected, so switching apps or relaunching doesn't
-    // require a re-scan.
+    // Every return to the foreground re-attaches from the saved pairing.
     override fun onStart() {
         super.onStart()
         viewModel.resume()

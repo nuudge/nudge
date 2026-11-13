@@ -1,12 +1,10 @@
-//! CommonMark → styled ratatui lines. pulldown-cmark handles parsing; this module
-//! owns only the event→Span mapping. Output is ready for the log paragraph —
-//! `render_log` adds the turn prefix, so nothing here knows about markers or width.
+//! CommonMark → styled ratatui lines. `render_log` adds the turn prefix, so nothing
+//! here knows about markers or width.
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-// Code accent, kept distinct from body text.
 const CODE_FG: Color = Color::Yellow;
 const HEADING_FG: Color = Color::Cyan;
 const QUOTE_FG: Color = Color::DarkGray;
@@ -91,7 +89,6 @@ impl Renderer {
         s
     }
 
-    // Emit the line's indent/quote-bar/marker before the first content span.
     // Idempotent: only fires when `cur` is empty.
     fn ensure_line_start(&mut self) {
         if !self.cur.is_empty() {
@@ -212,7 +209,6 @@ impl Renderer {
             }
             Tag::Item => {
                 self.flush_soft();
-                // Marker from the innermost list; advance the ordered counter.
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let m = format!("{n}. ");
@@ -327,8 +323,7 @@ impl Renderer {
         }
     }
 
-    // Columns sized to the widest cell; bold header + separator. Wide tables wrap
-    // rather than truncate (truncation loses more in a log view).
+    // Wide tables wrap rather than truncate: truncation loses more in a log view.
     fn render_table(&mut self, t: Table) {
         let cols = t
             .aligns
@@ -398,8 +393,7 @@ fn pad_cell(s: &str, width: usize, align: Alignment) -> String {
     }
 }
 
-// Same control-char defense as the TUI's sanitize_span_text — ratatui garbles a
-// literal tab/newline/control char on repaint.
+// ratatui garbles a literal tab/newline/control char on repaint.
 fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

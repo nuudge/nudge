@@ -6,10 +6,8 @@ pub mod anthropic;
 
 pub use anthropic::AnthropicProvider;
 
-// The conversation message model. This is the neutral shape the rest of the
-// agent works in; each provider is responsible for serializing it to and from
-// its own wire format. It happens to match the Anthropic wire shape today, but
-// nothing above the provider layer may assume that.
+// Provider-neutral; it matches the Anthropic wire shape, but nothing above the
+// provider layer may assume that.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     pub role: String,
@@ -22,15 +20,13 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
-    // Adaptive thinking response shape. `thinking` is the summarized reasoning
-    // (empty when display: "omitted"); `signature` is the opaque encrypted
-    // representation of the full thinking that must be round-tripped back to
-    // the API unmodified to preserve reasoning continuity across tool calls.
+    // `signature` must go back to the API unmodified to keep reasoning
+    // continuity across tool calls.
     Thinking {
         thinking: String,
         signature: String,
     },
-    // Safety-filtered thinking. Opaque `data` field; round-trip unmodified.
+    // Opaque; round-trip unmodified.
     RedactedThinking {
         data: String,
     },
@@ -44,9 +40,8 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
-    // Server-side tool call (web search or fetch, or the code execution that
-    // filters their results) that Anthropic already ran inside the request. Never dispatched
-    // locally; round-trip unmodified — `extra` keeps fields like `caller`.
+    // Already run by Anthropic inside the request; never dispatched locally.
+    // Round-trip unmodified — `extra` keeps fields like `caller`.
     ServerToolUse {
         id: String,
         name: String,
@@ -54,24 +49,20 @@ pub enum ContentBlock {
         #[serde(flatten)]
         extra: serde_json::Map<String, serde_json::Value>,
     },
-    // Opaque: either a list of results (with `encrypted_content` the API needs
-    // back verbatim) or an error object.
+    // Opaque: `encrypted_content` must go back verbatim.
     WebSearchToolResult {
         tool_use_id: String,
         content: serde_json::Value,
         #[serde(flatten)]
         extra: serde_json::Map<String, serde_json::Value>,
     },
-    // Opaque: the fetched document or an error object.
     WebFetchToolResult {
         tool_use_id: String,
         content: serde_json::Value,
         #[serde(flatten)]
         extra: serde_json::Map<String, serde_json::Value>,
     },
-    // Any other block type (code-execution results, future server tools), kept
-    // verbatim so a new type never fails the whole response. Also catches a
-    // malformed known block instead of erroring.
+    // Kept verbatim so an unknown or malformed block never fails the whole response.
     #[serde(untagged)]
     Other(serde_json::Value),
 }
@@ -80,18 +71,15 @@ pub const WEB_SEARCH_TOOL: &str = "web_search";
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
 pub const CODE_EXECUTION_NOTICE: &str = "ran code in Anthropic's sandbox";
 
-// The sandbox is provisioned for dynamic filtering, but the model may run any code
-// there; the tools are `code_execution`, `bash_code_execution`, `text_editor_code_execution`.
+// Matches `code_execution`, `bash_code_execution` and `text_editor_code_execution`.
 pub fn ran_code_execution(content: &[ContentBlock]) -> bool {
     content.iter().any(
         |b| matches!(b, ContentBlock::ServerToolUse { name, .. } if name.ends_with("code_execution")),
     )
 }
 
-// For display only: a cited answer arrives split into many text blocks (some
-// empty, some mid-sentence or mid-table), so each run of consecutive text
-// blocks is joined back into one; empty runs are dropped. The fragments carry
-// their own whitespace, hence no separator.
+// Display only: a cited answer arrives split into many text blocks. The
+// fragments carry their own whitespace, hence no separator.
 pub fn merge_text_runs(content: &[ContentBlock]) -> Vec<Cow<'_, ContentBlock>> {
     let mut out = Vec::new();
     let mut run = String::new();
@@ -121,7 +109,6 @@ pub fn web_search_query(input: &serde_json::Value) -> String {
         .to_string()
 }
 
-// One `title — url` line per result, or the error code with `is_error` set.
 pub fn web_search_results(content: &serde_json::Value) -> (String, bool) {
     match content.as_array() {
         Some(results) => (
@@ -156,8 +143,7 @@ pub fn web_fetch_url(input: &serde_json::Value) -> String {
         .to_string()
 }
 
-// The URL with the document's kind and size, never its body (a page can be
-// tens of thousands of tokens); or the error code with `is_error` set.
+// Never the body: a page can be tens of thousands of tokens.
 pub fn web_fetch_result(content: &serde_json::Value) -> (String, bool) {
     if content["type"] != "web_fetch_result" {
         return (
@@ -205,32 +191,23 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
 }
 
-// One block of system-prompt content. `cache` asks the provider to place a
-// prompt-cache breakpoint at this block; providers without prompt caching
-// ignore it. The caller decides which blocks are stable enough to cache.
+// Providers without prompt caching ignore `cache`.
 pub struct SystemBlock {
     pub text: String,
     pub cache: bool,
 }
 
-// A provider-neutral completion request. Caching is expressed as hints
-// (`SystemBlock.cache`, `tool_cache_boundary`) the provider may honor or
-// ignore; `thinking_display` is a reasoning-visibility hint and `web_search`
-// asks for the provider's server-side search and fetch, shaped to what the model
-// supports. Anything a provider can't express is its own concern, not the caller's.
 pub struct Request<'a> {
     pub model: &'a str,
     pub max_tokens: u32,
     pub thinking_display: &'a str,
     pub system: Vec<SystemBlock>,
     pub tools: Vec<serde_json::Value>,
-    // Index of the last tool belonging to the stable prefix; the provider may
-    // place a cache breakpoint there. None disables tool-level caching.
+    // Last tool of the stable prefix; None disables tool-level caching.
     pub tool_cache_boundary: Option<usize>,
     pub web_search: bool,
-    // The server-side execution container to resume; set only on a
-    // pause_turn continuation (the API rejects it on a request without
-    // pending code execution).
+    // Set only on a pause_turn continuation: the API rejects it on a request
+    // without pending code execution.
     pub container: Option<&'a str>,
     pub messages: &'a [Message],
 }
@@ -240,21 +217,13 @@ pub struct Response {
     pub stop_reason: String,
     pub usage: Usage,
     pub container_id: Option<String>,
-    // A provider-side degradation the user should know about (e.g. unknown
-    // model capabilities), surfaced once by the loop.
     pub warning: Option<String>,
-    // Old tool results the provider dropped from this request's context. It
-    // repeats on every request while they stay in history, so the loop shows
-    // it only when it changes.
+    // Repeats on every request while the cleared results stay in history.
     pub context_cleared: Option<String>,
 }
 
-// The seam every model backend implements. Kept deliberately thin — with one
-// provider today, a richer abstraction would just encode Anthropic's shape.
-// Expect this to change when a second provider lands.
-// Methods return `impl Future + Send` (not bare `async fn`) so the loop, which
-// is generic over the provider and spawned onto the tokio runtime, can prove
-// its future is Send. Implementors may still write `async fn`.
+// Methods return `impl Future + Send` so the generic, tokio-spawned loop can
+// prove its future is Send. Implementors may still write `async fn`.
 pub trait Provider {
     fn complete(
         &self,
@@ -264,8 +233,7 @@ pub trait Provider {
         &self,
         req: &Request<'_>,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
-    // The tool array as it would go on the wire (provider-added tools
-    // included), for `--print-prompt`.
+    // Includes provider-added tools, for `--print-prompt`.
     fn wire_tools(
         &self,
         req: &Request<'_>,

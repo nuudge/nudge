@@ -9,21 +9,15 @@ import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.util.concurrent.TimeUnit
 
-// The relay client — the Kotlin peer of Rust's transport::client over the WS path.
-// Dials the rendezvous room over a wss WebSocket, runs the attach handshake, and
-// seals/opens every frame with the pairing's E2E key so the relay only sees
-// ciphertext. One WS Binary message carries exactly one sealed frame — the same
-// one-frame-per-message rule the daemon's WsReader/WsWriter use (no newline framing).
+// One WS Binary message carries exactly one sealed frame (no newline framing), matching
+// the daemon's WsReader/WsWriter.
 class RelayClient(
     private val pairing: Pairing,
     private val listener: Listener,
-    // This client's identity, announced in the attach handshake so the daemon can
-    // attribute its turns. Defaulted for the smoke tool; the app supplies a device name.
     private val who: ClientIdentity = ClientIdentity.human("phone"),
     private val httpClient: OkHttpClient = defaultHttpClient,
 ) {
-    // Callbacks fire on OkHttp's WebSocket thread; an Android caller marshals to the
-    // main thread. Defaulted methods keep a listener that only cares about events terse.
+    // Callbacks fire on OkHttp's WebSocket thread; Android callers must marshal to main.
     interface Listener {
         fun onAttached() {}
         fun onBusy() {}
@@ -32,15 +26,14 @@ class RelayClient(
         fun onFailure(error: Throwable) {}
     }
 
-    // Highest seq seen so far — the resume cursor for a reconnect (Attach{after_seq}).
+    // Resume cursor for a reconnect (Attach{after_seq}).
     @Volatile
     var lastSeq: Long? = null
         private set
 
     private var webSocket: WebSocket? = null
 
-    // Open the connection and attach. afterSeq = null is a fresh attach (full replay);
-    // pass lastSeq to resume after a drop and replay only the events that were missed.
+    // afterSeq = null is a fresh attach (full replay).
     fun connect(afterSeq: Long? = null) {
         val request = Request.Builder().url(toHttpUrl(pairing.clientDialUrl())).build()
         webSocket = httpClient.newWebSocket(
@@ -78,17 +71,16 @@ class RelayClient(
         )
     }
 
-    // Send an application command (user message, model switch, permission answer, …).
     fun send(command: UiEvent) {
         webSocket?.let { sendFrame(it, ClientFrame.Command(command)) }
     }
 
-    // Yield the session without ending it — the loop keeps running headless.
+    // Yields the session without ending it; the loop keeps running headless.
     fun detach() {
         webSocket?.let { sendFrame(it, ClientFrame.Detach) }
     }
 
-    // Close the socket. The daemon treats a dropped socket as an implicit detach.
+    // The daemon treats a dropped socket as an implicit detach.
     fun close() {
         webSocket?.close(NORMAL_CLOSURE, "client closing")
     }
@@ -101,16 +93,14 @@ class RelayClient(
     companion object {
         private const val NORMAL_CLOSURE = 1000
 
-        // OkHttp wants an http/https URL and maps it to ws/wss internally; normalize so
-        // a wss:// dial URL (as the pairing carries) works unchanged.
+        // OkHttp only accepts http/https URLs and maps them to ws/wss internally.
         private fun toHttpUrl(url: String): String = when {
             url.startsWith("wss://") -> "https://" + url.removePrefix("wss://")
             url.startsWith("ws://") -> "http://" + url.removePrefix("ws://")
             else -> url
         }
 
-        // No read timeout — a WebSocket is long-lived and idle between events; the ping
-        // interval keeps the connection (and the relay's NAT mapping) from timing out.
+        // No read timeout: the socket idles between events; pings keep the relay's NAT mapping alive.
         val defaultHttpClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .pingInterval(20, TimeUnit.SECONDS)

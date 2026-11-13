@@ -69,7 +69,6 @@ pub(super) fn sanitize_span_text(s: &str) -> String {
     out
 }
 
-// First non-empty line of a block, trimmed.
 pub(super) fn first_content_line(content: &str) -> &str {
     content
         .lines()
@@ -115,9 +114,8 @@ pub(super) fn emit_expanded_thinking(out: &mut Vec<Line<'static>>, content: &str
     }
 }
 
-// Single `  ⎿ <preview>` row, hard-truncated so it never wraps. With preview=false,
-// multi-line output collapses to a bare line count (positional-noise tools); a
-// single-line output is always shown verbatim.
+// Hard-truncated so it never wraps. preview=false collapses multi-line output to a
+// line count; single-line output is always shown verbatim.
 pub(super) fn emit_collapsed_result(
     out: &mut Vec<Line<'static>>,
     content: &str,

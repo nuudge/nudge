@@ -113,8 +113,7 @@ pub async fn execute(input: &Value) -> Result<String> {
     run(input, &store, &cwd)
 }
 
-// Split from `execute` so tests inject a scratch store and cwd. Read-only: only
-// query methods of the store are called here.
+// Split from `execute` so tests can inject a scratch store and cwd.
 pub(crate) fn run(input: &Value, store: &SessionStore, cwd: &str) -> Result<String> {
     let input: Input =
         serde_json::from_value(input.clone()).context("InspectSession: invalid input shape")?;
@@ -281,7 +280,6 @@ fn render_entry(entry: &InspectRow) -> String {
                 out.push_str(&format!("  ({CODE_EXECUTION_NOTICE})\n"));
             }
         }
-        // A row that doesn't parse as a typed message still shows, raw.
         Err(_) => out.push_str(&format!(
             "  (unparsed) {}\n",
             truncate(&one_line(&entry.row.content), TEXT_CHARS)
@@ -357,7 +355,7 @@ fn search(
         }
         None => None,
     };
-    // A session filter fully pins the scope; the cwd filter applies otherwise.
+    // A session filter fully pins the scope.
     let scope = if all_projects || session_id.is_some() {
         None
     } else {
@@ -393,14 +391,8 @@ fn search(
     Ok(out)
 }
 
-// A one-line window of the entry's text centered on the (case-insensitive)
-// match when it's findable, else the text's prefix. The stored content is the
-// serialized message JSON; windowing that raw string leaked envelope syntax
-// ("role":…, tool_use ids) into snippets whenever the match landed near
-// structure — so extract the blocks' display text first, mirroring
-// `render_entry`'s conventions. A row that doesn't parse as a typed message
-// falls back to the raw string. A match that lived only
-// in JSON structure (not in any block's text) lands in the prefix fallback.
+// Windows the blocks' display text, not the stored JSON, so envelope syntax
+// (roles, tool_use ids) can't leak into snippets.
 fn snippet(content: &str, query: &str) -> String {
     let flat = match serde_json::from_str::<Message>(content) {
         Ok(msg) => one_line(&flat_text(&msg)),
@@ -409,10 +401,8 @@ fn snippet(content: &str, query: &str) -> String {
     let lowered = flat.to_lowercase();
     match lowered.find(&query.to_lowercase()) {
         Some(byte_pos) => {
-            // Count the prefix on `lowered`, where byte_pos is guaranteed a char
-            // boundary — lowercasing can change byte lengths (İ → i̇), so the
-            // offset must never index `flat` directly. The count may drift a
-            // char or two on such input; the window is fuzzy anyway.
+            // Lowercasing can change byte lengths (İ → i̇), so never index
+            // `flat` with an offset from `lowered`.
             let chars_before = lowered[..byte_pos].chars().count();
             let start = chars_before.saturating_sub(SNIPPET_CHARS / 2);
             let windowed: String = flat.chars().skip(start).take(SNIPPET_CHARS).collect();
@@ -428,8 +418,7 @@ fn snippet(content: &str, query: &str) -> String {
     }
 }
 
-// The blocks' display text in reading order, tagged like `render_entry` so tool
-// activity stays recognizable inside a snippet.
+// Tagged like `render_entry` so tool activity stays recognizable in a snippet.
 fn flat_text(msg: &Message) -> String {
     msg.content
         .iter()
@@ -548,7 +537,6 @@ mod tests {
         assert!(out.contains("spawned by: parent"), "{out}");
         assert!(out.contains("live turns: 2"), "{out}");
         assert!(out.contains("(from parent-1)"), "{out}");
-        // Truncation: the 500-char task renders capped at 200, the 400-char text at 300.
         assert!(
             out.contains(&format!("{}…", "t".repeat(TASK_CHARS))),
             "{out}"
@@ -577,7 +565,6 @@ mod tests {
         .unwrap();
         assert!(out.contains("session abc (my-work)"), "{out}");
 
-        // A name from another cwd is out of scope; an unknown ref errors cleanly.
         let err = run(
             &json!({"mode": "inspect", "session": "my-work"}),
             &s,
@@ -666,7 +653,6 @@ mod tests {
         let capped = run(&json!({"mode": "list", "limit": 1}), &s, "/proj").unwrap();
         assert_eq!(capped.lines().count(), 2, "{capped}");
         assert!(capped.starts_with("showing 1 of 2 sessions\n"), "{capped}");
-        // An uncut list carries no disclosure line.
         assert!(!scoped.contains("showing"), "{scoped}");
     }
 
@@ -729,7 +715,6 @@ mod tests {
         let out = run(&json!({"mode": "search", "query": "NEEDLE"}), &s, "/proj").unwrap();
         assert!(out.contains("NEEDLE"), "{out}");
         assert!(out.contains('…'), "windowed, not the whole row: {out}");
-        // The window is bounded — far-away prefix content is not included.
         assert!(out.lines().next().unwrap().len() < 400, "{out}");
     }
 
@@ -814,7 +799,7 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("entries around ordinal 15:"), "{out}");
-        // Window is [13, 17]: start = 15 - 5/2, five entries.
+        // start = 15 - 5/2, five entries.
         for i in 13..=17 {
             assert!(out.contains(&format!("msg{i}\n")), "{out}");
         }
@@ -834,7 +819,6 @@ mod tests {
             "{past_end}"
         );
 
-        // A window anchored before the start clamps to the transcript head.
         let at_start = run(
             &json!({"mode": "inspect", "session": "a", "around_ordinal": 0, "last_n": 4}),
             &s,
@@ -852,8 +836,6 @@ mod tests {
     fn search_snippet_shows_block_text_free_of_json_escapes() {
         let mut s = store();
         s.insert_session("a", "/proj", None, None).unwrap();
-        // Stored content is message JSON: the text's newline and quotes are
-        // escaped on disk (\n, \") and must not render that way in the snippet.
         s.append_message(
             "a",
             "user",
@@ -894,9 +876,7 @@ mod tests {
         assert!(!full.contains("showing"), "{full}");
     }
 
-    // Lowercasing can grow byte lengths (İ U+0130 → i + U+0307), so the match
-    // offset from the lowered string must never index the original — this input
-    // panicked on a mid-char slice before the fix.
+    // İ (U+0130) lowercases to two chars, growing the byte length.
     #[test]
     fn snippet_survives_case_folding_that_changes_byte_length() {
         let content = format!("{} NEEDLE after the dotted capital", "İ".repeat(40));
@@ -904,8 +884,6 @@ mod tests {
         assert!(out.contains("NEEDLE"), "{out}");
     }
 
-    // A hit inside a tool_use renders as the block's display text, not a window
-    // into the serialized envelope (no "role":/id leakage).
     #[test]
     fn snippet_renders_parsed_blocks_not_envelope_json() {
         let content = r#"{"role":"assistant","content":[{"type":"text","text":"running the suite"},{"type":"tool_use","id":"toolu_01AbCdEf","name":"Bash","input":{"command":"cargo test store::"}}]}"#;

@@ -5,24 +5,12 @@ use std::path::{Path, PathBuf};
 use crate::cli::Thinking;
 use crate::run::MAX_ITERATIONS;
 
-// The model when NUDGE_MODEL is absent everywhere. Fresh configs set it
-// explicitly (the template ships it uncommented), so this only covers configs
-// that predate the template or had the line removed.
+// Only for configs lacking NUDGE_MODEL; the template sets it explicitly.
 const FALLBACK_MODEL: &str = "claude-fable-5";
 
-/// Layer the .env files into the process environment. Side-effect only: this
-/// makes the files' contents visible to every later `env::var` read in the
-/// process (including the dynamic MCP `token_env`/`client_secret_env` vars
-/// named in `.mcp.json`), but requires and types nothing itself.
-///
-/// Precedence is "first load wins" — `dotenvy` never overrides a var already
-/// present in the environment — so the effective order is:
-/// real shell env > project `.env` > global `~/.nudge/config.env`.
-///
-/// First run also materializes the global file as a template (`cargo install`
-/// has no post-install hook, so this is where a fresh install learns what's
-/// configurable). Creation is best-effort: a read-only HOME must not stop the
-/// agent.
+/// Precedence: shell env > project `.env` > `~/.nudge/config.env` (dotenvy never
+/// overrides a set var). First run writes the global template: `cargo install` has
+/// no post-install hook.
 pub fn load_dotenv() {
     let _ = dotenvy::dotenv();
     if let Some(home) = env::var_os("HOME") {
@@ -34,12 +22,8 @@ pub fn load_dotenv() {
     }
 }
 
-// Write the template if (and only if) the global config file is missing — an
-// existing file is the user's and is never touched. Every entry is commented
-// out (documentation, not behavior) except NUDGE_RELAY, which defaults to the
-// maintainer's shared relay so phone handoff and remote peers work out of the
-// box; the relay is only dialed on explicit action (/background, --daemon,
-// /connect-peer), never ambiently.
+// An existing file is the user's and is never touched. The template's relay default
+// is dialed only on explicit action, never ambiently.
 fn ensure_global_config(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -51,31 +35,17 @@ fn ensure_global_config(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// The first-run template, vendored at the repo root so it's readable without
-// digging into source. The test below pins its values to the code constants.
+// The test below pins its values to the code constants.
 const TEMPLATE: &str = include_str!("../config.env.example");
 
-/// nudge's own configuration, read from the process environment after
-/// [`load_dotenv`] has layered the .env files in. This is the canonical list
-/// of config vars the agent reads directly; required-ness is encoded in the
-/// field types. (`NUDGE_THINKING` and `NUDGE_NAME` are read outside this
-/// struct — see [`resolve_thinking`] and `run::local_identity` — because the
-/// guest `--connect` path needs them without holding an API key.)
+/// `NUDGE_THINKING` and `NUDGE_NAME` are read outside this struct because the guest
+/// `--connect` path needs them without an API key.
 pub struct Config {
-    /// `ANTHROPIC_API_KEY` — required to talk to the API.
     pub anthropic_api_key: String,
-    /// `NUDGE_RELAY` — relay WebSocket URL for phone handoff. Optional: a plain
-    /// local session runs and backgrounds without it, just with no QR.
     pub relay: Option<String>,
-    /// `NUDGE_MODEL` — the model a new session starts on; falls back to the
-    /// built-in default. Not validated against the catalog: the catalog is
-    /// fetched at runtime, and /model accepts arbitrary ids too.
+    /// Not validated against the catalog: /model accepts arbitrary ids too.
     pub model: String,
-    /// `NUDGE_MAX_ITERATIONS` — model calls allowed per turn before the agent
-    /// pauses for guidance; falls back to the built-in default.
     pub max_iterations: usize,
-    /// `NUDGE_WEB_SEARCH` — `off` withholds Anthropic's server-side web search
-    /// (billed per search) and web fetch tools; on by default.
     pub web_search: bool,
 }
 
@@ -93,17 +63,12 @@ impl Config {
     }
 }
 
-/// The effective default model: `NUDGE_MODEL` > built-in fallback. A free
-/// function (like [`resolve_thinking`]) so the guest `--connect` path — which
-/// has no API key and thus no `Config` — resolves it identically.
+/// A free function so the keyless guest `--connect` path resolves it identically.
 pub fn default_model() -> String {
     nonempty_var("NUDGE_MODEL").unwrap_or_else(|| FALLBACK_MODEL.into())
 }
 
-/// The effective thinking display: explicit CLI flag > `NUDGE_THINKING` >
-/// "summarized". A free function (not a `Config` field) so the guest
-/// `--connect` path — which has no API key and thus no `Config` — resolves it
-/// identically.
+/// CLI flag > `NUDGE_THINKING` > "summarized".
 pub fn resolve_thinking(cli: Option<&Thinking>) -> Result<String> {
     if let Some(t) = cli {
         return Ok(t.as_display());
@@ -151,9 +116,7 @@ fn nonempty_var(key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // The maintainer's shared relay — a template default, not a code fallback
-    // (deleting the line from config.env disables it), so it lives here purely
-    // to pin the example file.
+    // A template default, not a code fallback; here only to pin the example file.
     const DEFAULT_RELAY: &str = "wss://35.244.115.57.sslip.io";
 
     #[test]
@@ -163,10 +126,7 @@ mod tests {
 
         ensure_global_config(&path).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
-        // The template ships these four as ACTIVE lines (a seamless default
-        // setup); everything else is commented-out documentation. The vendored
-        // example hardcodes its values, so pin them to the code constants —
-        // and to the validated thinking modes — so the two can't drift apart.
+        // Pin the template's active lines to the code constants so they can't drift.
         let active: Vec<&str> = written
             .lines()
             .map(str::trim)

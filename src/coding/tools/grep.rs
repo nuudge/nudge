@@ -120,8 +120,7 @@ pub async fn execute(input: &Value) -> Result<String> {
         args.push(format!("--type={t}"));
     }
 
-    // `--` separates flags from the pattern so a pattern starting with `-` isn't
-    // misparsed as an option.
+    // So a pattern starting with `-` isn't parsed as a flag.
     args.push("--".into());
     args.push(parsed.pattern.clone());
 
@@ -142,7 +141,7 @@ pub async fn execute(input: &Value) -> Result<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // rg exits 1 on "no matches" — that's a normal result for an agent, not an error.
+    // rg exits 1 on "no matches".
     if status == 1 && stderr.is_empty() {
         return Ok("(no matches)".into());
     }

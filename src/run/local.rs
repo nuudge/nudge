@@ -7,21 +7,10 @@ use crate::core::{self, ClientIdentity, PeerRegistration, SessionHandle, Session
 use crate::transport::{self, PairingScope, PeerAccept};
 use crate::tui;
 
-// Buffer for relay-dial status updates flowing from the handoff task to the TUI.
-// A handful of state flips at a time; the TUI drains it in its select loop.
 const HANDOFF_STATUS_CAP: usize = 8;
 
-// Local TUI driving the loop in-process. The TUI holds `&host` so it can
-// re-attach after /background; it owns the initial foreground controller.
-// When NUDGE_RELAY is set, /background fires the handoff hook to dial the
-// relay (lazy) so a phone can attach; wiring it here (not in `core`) keeps
-// `core` below the transport layer. The dial reports progress to the TUI over
-// `status_rx`. With no relay configured, /background just pauses in place.
-//
-// `peer_identity` + `peer_registrar` arm the agent-peer leg (#61): once /background
-// dials, an inbound `/connect-peer` dialer attaches through the agent room exactly
-// like a teammate through the watch room, plus the return edge registers into this
-// loop — so an armed interactive session is simultaneously human-driven and dialable.
+// The relay handoff hook is wired here, not in `core`, to keep `core` below the
+// transport layer.
 pub(super) async fn run(
     mut host: SessionHost,
     mut ui_cfg: tui::UiConfig,
@@ -31,13 +20,8 @@ pub(super) async fn run(
     peer_registrar: mpsc::UnboundedSender<PeerRegistration>,
 ) -> Result<()> {
     let handoff_rx = if let Some(base) = relay {
-        // Regenerate the pairings each launch (no persistence): the device re-scans
-        // after a restart. Three scoped codes are minted — full-access (your own phone),
-        // watch-only (a teammate who may observe but not drive), and agent-peer (a remote
-        // nudge session that dials in with /connect-peer) — each its own room + key so
-        // rights follow the room (same model as `--daemon --watch`/`--peer`). All go to
-        // the TUI, which shows one at a time (cycle with `w`); every leg dials only once
-        // backgrounded.
+        // Pairings are regenerated each launch (no persistence); each scope gets its
+        // own room + key so rights follow the room. Legs dial only once backgrounded.
         let full = transport::Pairing::generate(base.clone());
         let watch = transport::Pairing::generate_scoped(base.clone(), PairingScope::WatchOnly);
         let agent = transport::Pairing::generate_scoped(base, PairingScope::Agent);
@@ -53,17 +37,14 @@ pub(super) async fn run(
         let watch_cipher = watch.cipher;
         let agent_url = agent.host_dial_url();
         let agent_cipher = agent.cipher;
-        // The agent leg carries the reverse-edge accept: this session's announced
-        // identity plus the runtime registrar the return edge lands in (#52).
         let agent_accept = PeerAccept {
             identity: peer_identity,
             registrar: peer_registrar,
         };
         let broker = host.broker_handle();
         let (status_tx, status_rx) = mpsc::channel::<core::HandoffStatus>(HANDOFF_STATUS_CAP);
-        // Dedupe re-dials: while one dial is live this is a no-op, so re-entering
-        // /background does nothing; once a failed dial clears it, the next
-        // /background fires a fresh one (the user's way to retry).
+        // Dedupes re-dials while one is live; a failed dial clears it so the next
+        // /background retries.
         let dialing = Arc::new(AtomicBool::new(false));
         host.set_handoff_hook(move || {
             if dialing.swap(true, Ordering::SeqCst) {
@@ -80,10 +61,7 @@ pub(super) async fn run(
             let broker = broker.clone();
             let status_tx = status_tx.clone();
             tokio::spawn(async move {
-                // All legs dial the same relay, so they share one status channel:
-                // status is relay reachability, not per-leg. Last-writer-wins is fine —
-                // a leg failing after another connected would be a real divergence
-                // (same relay) worth surfacing.
+                // All legs dial the same relay, so they share one status channel.
                 tokio::join!(
                     transport::serve_relay_handoff(
                         full_url,
@@ -123,7 +101,7 @@ pub(super) async fn run(
         .await
         .expect("initial attach on a fresh session cannot be busy");
     let tui_result = tui::run(&host, ui_cfg, who, controller, handoff_rx).await;
-    // TUI exited → end the session explicitly (loop outlives the front-end).
+    // The loop outlives the front-end, so end the session explicitly.
     let _ = host.shutdown().await;
     tui_result
 }

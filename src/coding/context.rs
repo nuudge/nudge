@@ -1,12 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-// Project instructions from AGENTS.md files in cwd and its ancestors.
-// Outermost file first, so the file nearest cwd lands last and wins on
-// conflict — instructions later in the prompt take precedence, and the most
-// specific file should be the one that does. Returns None when no non-empty
-// AGENTS.md exists, so the request omits the block instead of sending an
-// empty system entry.
+// Outermost file first, so the file nearest cwd lands last and wins on conflict.
 pub fn agents_md_block(cwd: &Path) -> Option<String> {
     let mut sections: Vec<String> = cwd
         .ancestors()
@@ -39,9 +34,7 @@ pub fn stable_env_block(cwd: &Path) -> String {
         "<environment-stable>\nWorking directory: {}\nPlatform: {platform}",
         cwd.display()
     );
-    // Repo identity only — branch/upstream rarely change mid-session, so they
-    // belong in the cached prefix. Mutable state (HEAD, status, commits) lives
-    // in the volatile block so it stays fresh as the agent works.
+    // Only rarely-changing repo identity here; mutable git state goes in the volatile block.
     match collect_git_info(cwd) {
         Some(g) => {
             out.push_str(&format!("\nGit repo: yes\nBranch: {}", g.branch));
@@ -85,8 +78,7 @@ fn list_top_level(cwd: &Path) -> String {
             (name, is_dir)
         })
         .collect();
-    // Sort is load-bearing for cache stability — read_dir order is filesystem-
-    // dependent, so we sort to keep the output bytes deterministic across runs.
+    // read_dir order is filesystem-dependent; sorting keeps the cached bytes deterministic.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     let total = entries.len();
     let mut out: Vec<String> = entries
@@ -103,12 +95,8 @@ fn list_top_level(cwd: &Path) -> String {
     out.join("\n")
 }
 
-// Snapshot of the repository state, gathered by shelling out to `git`. Returns
-// None when cwd isn't inside a work tree (or git is absent). Consumers pick the
-// fields they need — the TUI shows only `branch`. Working-tree status is
-// deliberately excluded: it changes almost every turn the agent edits, and the
-// env block sits ahead of the chat history in the cache prefix, so including it
-// would bust the history cache each turn. Read it on demand via `git status`.
+// Working-tree status is excluded: it changes almost every turn and would bust
+// the history cache that sits after the env block.
 pub struct GitInfo {
     pub branch: String,
     pub head: String,
@@ -117,15 +105,13 @@ pub struct GitInfo {
 }
 
 pub fn collect_git_info(cwd: &Path) -> Option<GitInfo> {
-    // Authoritative repo probe; also short-circuits when git isn't installed.
     if git(cwd, &["rev-parse", "--is-inside-work-tree"])?.trim() != "true" {
         return None;
     }
     let head = git(cwd, &["rev-parse", "--short", "HEAD"])
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    // symbolic-ref resolves the branch even on an unborn HEAD (fresh repo, no
-    // commits); it fails on a detached HEAD, which we render via the sha.
+    // symbolic-ref works on an unborn HEAD but fails when detached.
     let branch = match git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
         Some(b) if !b.trim().is_empty() => b.trim().to_string(),
         _ => format!("(detached at {head})"),

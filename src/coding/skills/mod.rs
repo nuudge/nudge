@@ -1,21 +1,6 @@
-//! Skills (Phase 9) — progressive-disclosure capability packaging.
-//!
-//! A Skill is a folder: `SKILL.md` (YAML frontmatter + markdown body) plus
-//! optional bundled reference files and scripts. Skills let the agent load
-//! packaged expertise **on demand** instead of carrying it in the prompt:
-//!
-//! - **Level 1 (metadata)** — each skill's `name` + `description` are baked into
-//!   the [`use_skill`](USE_SKILL_NAME) meta-tool's description (the `load_tool`
-//!   pattern), so they sit in the cached tool prefix for ~free.
-//! - **Level 2 (body)** — when the model calls `use_skill{skill}`, the SKILL.md
-//!   body is returned as the tool_result, entering conversation history (not the
-//!   system prompt, which would bust the system cache prefix).
-//! - **Level 3 (bundled files/scripts)** — the body points at sibling files; the
-//!   model reads them with `Read` and runs scripts with `Bash`. No new machinery.
-//!
-//! Unlike [`mcp`](super::mcp) there is no connection, subprocess, or lifecycle —
-//! a skill's capability is just text, so the registry is immutable after
-//! startup discovery and "loading" is just reading a file.
+//! Skills: name + description sit in the cached `use_skill` schema; the body is
+//! returned as a tool_result (not the system prompt, which would bust its
+//! cache); bundled files are reached with Read and Bash.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,24 +9,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-/// Name of the foundational meta-tool the model calls to load a skill's body.
 pub const USE_SKILL_NAME: &str = "use_skill";
 
-/// Directory under each root that holds skills, one subfolder per skill.
 const SKILLS_SUBDIR: &str = ".nudge/skills";
 
 struct Skill {
     name: String,
     description: String,
-    /// The skill's folder — given to the model so it can resolve bundled-file
-    /// paths (Level 3) against an absolute base.
     dir: PathBuf,
-    /// `<dir>/SKILL.md`, re-read on load so edits are picked up mid-session.
+    /// Re-read on load so edits are picked up mid-session.
     body_path: PathBuf,
 }
 
-/// Required SKILL.md frontmatter. Extra fields (e.g. `allowed-tools`) are
-/// ignored, matching Anthropic's skill format.
+/// Extra fields (e.g. `allowed-tools`) are ignored, matching Anthropic's format.
 #[derive(Deserialize)]
 struct Frontmatter {
     name: String,
@@ -49,25 +29,20 @@ struct Frontmatter {
 }
 
 pub struct SkillRegistry {
-    /// skill name -> skill. `BTreeMap` keeps the catalog in sorted order so the
-    /// `use_skill` description is byte-stable across the session (a cache hit).
+    /// Sorted so the `use_skill` description is byte-stable for caching.
     skills: BTreeMap<String, Skill>,
-    /// Human-readable discovery outcomes, printed by the caller before the TUI
-    /// takes the screen — so a malformed SKILL.md fails loudly, not silently.
+    /// Printed before the TUI starts so a malformed SKILL.md fails loudly.
     pub discovery_log: Vec<String>,
 }
 
 impl SkillRegistry {
-    /// Discover skills under the personal (`~/.nudge/skills/`) and project
-    /// (`<cwd>/.nudge/skills/`) roots. A missing root is not an error. On a
-    /// name collision, project wins over personal (closer to the work, matching
-    /// AGENTS.md precedence). Invalid skills are skipped and logged.
+    /// On a name collision, project wins over personal, matching AGENTS.md precedence.
     pub fn discover(cwd: &Path, home: Option<&Path>) -> Self {
         let mut reg = Self {
             skills: BTreeMap::new(),
             discovery_log: Vec::new(),
         };
-        // Personal first, then project — project's `insert` overwrites, so it wins.
+        // Project scans last so its `insert` overwrites.
         if let Some(home) = home {
             reg.scan_root(&home.join(SKILLS_SUBDIR), "personal");
         }
@@ -78,7 +53,7 @@ impl SkillRegistry {
     fn scan_root(&mut self, root: &Path, origin: &str) {
         let entries = match std::fs::read_dir(root) {
             Ok(e) => e,
-            Err(_) => return, // root absent — no skills of this origin
+            Err(_) => return,
         };
         for entry in entries.flatten() {
             let dir = entry.path();
@@ -88,7 +63,7 @@ impl SkillRegistry {
             let body_path = dir.join("SKILL.md");
             let text = match std::fs::read_to_string(&body_path) {
                 Ok(t) => t,
-                Err(_) => continue, // a subdir without SKILL.md just isn't a skill
+                Err(_) => continue,
             };
             match parse_skill(&dir, &body_path, &text) {
                 Ok(skill) => {
@@ -103,11 +78,7 @@ impl SkillRegistry {
         }
     }
 
-    /// Schema for the `use_skill` meta-tool. The catalog (name + description) is
-    /// baked into the description so the model knows what's available without a
-    /// discovery round-trip — the same shape as `McpRegistry::load_tool_schema`.
-    /// Byte-stable across the session (discovery is startup-only), so it stays a
-    /// foundational, cached tool. `None` when no skills were found.
+    /// Byte-stable across the session (discovery is startup-only), so it stays cached.
     pub fn use_skill_schema(&self) -> Option<Value> {
         if self.skills.is_empty() {
             return None;
@@ -141,9 +112,6 @@ impl SkillRegistry {
         }))
     }
 
-    /// Level-2 load: read the named skill's SKILL.md body (frontmatter stripped)
-    /// and return it for the tool_result, prefixed with the skill's absolute
-    /// directory so the model can resolve bundled-file paths.
     pub fn load_body(&self, name: &str) -> Result<String> {
         let skill = self
             .skills
@@ -206,19 +174,14 @@ fn validate_description(description: &str) -> Result<()> {
     Ok(())
 }
 
-/// Split a `---`-fenced YAML frontmatter header from the markdown body. Returns
-/// `(frontmatter, body)` or `None` when the text doesn't open with a `---` line
-/// closed by another `---` line. Both returned slices borrow from `text`, so the
-/// original line endings are preserved.
 fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
-    // Find a line that is exactly `---`, scanning newline-anchored so a `---`
-    // mid-line (e.g. a horizontal rule with trailing text) doesn't false-match.
+    // Newline-anchored so a `---` mid-line doesn't false-match.
     let mut search_from = 0;
     while let Some(rel) = rest[search_from..].find("\n---") {
-        let close = search_from + rel + 1; // index of the `---`
+        let close = search_from + rel + 1;
         let after = &rest[close + 3..];
         if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
             let frontmatter = &rest[..close];

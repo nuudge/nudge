@@ -67,15 +67,12 @@ fun ChatScreen(viewModel: ChatViewModel) {
     val state by viewModel.state.collectAsState()
     val listState = rememberLazyListState()
 
-    // Follow the tail as new events stream in.
     androidx.compose.runtime.LaunchedEffect(state.lines.size) {
         if (state.lines.isNotEmpty()) listState.animateScrollToItem(state.lines.lastIndex)
     }
 
-    // Pad only the top system bar here; the bottom inset (nav bar when the keyboard is
-    // down, IME when it's up) is applied once on the input bar below as max(navBar, ime).
-    // Chaining systemBarsPadding()+imePadding() here double-counted the nav-bar region
-    // (the IME inset already spans it), floating the input far above the keyboard.
+    // Only the top bar here; the bottom inset is applied once on the input bar, since
+    // chaining systemBarsPadding()+imePadding() double-counts the nav-bar region.
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -88,15 +85,11 @@ fun ChatScreen(viewModel: ChatViewModel) {
             onReattach = viewModel::reattach,
         )
 
-        // Session context (from the daemon's SessionInfo event). Cleared on disconnect,
-        // so it never shows on the pairing screen; kept while detached. The model is a
-        // picker rendered from the daemon's Capabilities (not a compiled-in list).
         state.sessionInfo?.let {
             ContextBar(it, state.capabilities, viewModel::selectModel)
         }
 
-        // The scanner/paste screen is only for the *unbound* states; a detached (bound)
-        // session reattaches to the same daemon via the status-bar Reattach button.
+        // A detached session is still bound and reattaches via the status bar, not here.
         if (state.connection == Connection.Disconnected || state.connection == Connection.Error) {
             PairingRow(onConnect = viewModel::connect)
         }
@@ -157,9 +150,6 @@ private fun StatusBar(
                 style = MaterialTheme.typography.labelLarge,
                 modifier = Modifier.weight(1f),
             )
-            // Attached/connecting → Detach (pause, stay bound) or Disconnect (unbind).
-            // Detached/busy → Reattach (same daemon) or Disconnect. Disconnected/Error use
-            // the pairing screen, so no status-bar action there.
             when (state.connection) {
                 Connection.Attached, Connection.Connecting -> {
                     TextButton(onClick = onDetach) { Text("Detach") }
@@ -175,9 +165,6 @@ private fun StatusBar(
     }
 }
 
-// A spinner while a connection is in flight (covers both first connect and reconnect,
-// which both sit in Connecting); otherwise a small status-colored dot so the connection
-// state reads at a glance without parsing the label.
 @Composable
 private fun StatusIndicator(connection: Connection) {
     if (connection == Connection.Connecting) {
@@ -188,16 +175,12 @@ private fun StatusIndicator(connection: Connection) {
         Connection.Attached -> MaterialTheme.colorScheme.primary
         Connection.Busy -> MaterialTheme.colorScheme.tertiary
         Connection.Error -> MaterialTheme.colorScheme.error
-        else -> MaterialTheme.colorScheme.outline // Detached / Disconnected
+        else -> MaterialTheme.colorScheme.outline
     }
     Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(dot))
 }
 
-// Collapsible session context. The glance line (model picker · branch) is always
-// shown and costs one thin line; tapping the chevron reveals the full cwd + session
-// label (with copy). The model is a dropdown rendered from the daemon's Capabilities,
-// so switching models uses the same command surface as the TUI. The label is the
-// human name once renamed, else the uuid — both are valid `--resume` references.
+// The session label is the name once renamed, else the uuid; both work with `--resume`.
 @Composable
 private fun ContextBar(
     info: SessionContext,
@@ -277,9 +260,6 @@ private fun ContextBar(
     }
 }
 
-// The model as a dropdown anchor. Tapping it lists the daemon's models (from
-// Capabilities) and sends `/model <id>` on selection; with no catalog yet it's inert
-// plain text. The `▾` only shows when there's a menu to open.
 @Composable
 private fun ModelPicker(
     current: String,
@@ -314,7 +294,7 @@ private fun ModelPicker(
 @Composable
 private fun PairingRow(onConnect: (String) -> Unit) {
     val context = LocalContext.current
-    // The scanner client is cheap to hold; restrict to QR so 1-D barcodes don't misread.
+    // QR only, so 1-D barcodes don't misread.
     val scanner = remember {
         GmsBarcodeScanning.getClient(
             context,
@@ -335,7 +315,6 @@ private fun PairingRow(onConnect: (String) -> Unit) {
             onClick = {
                 scanError = null
                 scanner.startScan()
-                    // rawValue is the decoded "nudge:…" string; connect() validates it.
                     .addOnSuccessListener { barcode -> barcode.rawValue?.let { onConnect(it.trim()) } }
                     .addOnCanceledListener { /* user backed out — no-op */ }
                     .addOnFailureListener { e -> scanError = e.message ?: "scan unavailable" }
@@ -385,8 +364,7 @@ private fun PermissionPrompt(pending: PendingPermission, onAllow: () -> Unit, on
         Column(modifier = Modifier.padding(12.dp)) {
             Text("Allow tool: ${pending.toolName}?", style = MaterialTheme.typography.titleSmall)
             if (pending.summary.isNotBlank()) {
-                // Bound the summary so a long command (e.g. a big bash invocation) scrolls
-                // within the card instead of pushing the Allow/Deny buttons off-screen.
+                // Bounded so a long command scrolls instead of pushing Allow/Deny off-screen.
                 MarkdownText(
                     text = pending.summary,
                     style = MaterialTheme.typography.bodyMedium,
@@ -415,9 +393,7 @@ private fun MessageInput(enabled: Boolean, onSend: (String) -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            // Single bottom inset: nav bar when the keyboard is down, IME height when up.
-            // The transcript (weight 1f) shrinks to make room; the input sits right on the
-            // keyboard with no extra gap.
+            // The IME inset already spans the nav bar, so union them rather than add.
             .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
             .padding(8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -462,7 +438,6 @@ private fun ChatRow(line: ChatLine) {
 
         Role.User -> Bubble(alignEnd = true, container = MaterialTheme.colorScheme.primaryContainer) {
             if (line.sender != null) {
-                // Another party's turn in a shared session — label it with their name.
                 Column(modifier = Modifier.padding(10.dp)) {
                     Text(
                         text = line.sender,
@@ -528,8 +503,6 @@ private fun ToolCard(line: ChatLine) {
     }
 }
 
-// Tool output is often long; show a few lines and let the user expand. Horizontally
-// scrollable so wide lines (paths, JSON) don't wrap into noise.
 @Composable
 private fun CollapsibleMono(text: String) {
     val lines = remember(text) { text.split("\n") }

@@ -7,12 +7,7 @@ use crate::llm::{ContentBlock, Message};
 
 use super::{Backend, peer_tools};
 
-// Orchestrate the assistant turn's tool calls: emit start/result events, gate on
-// permission (one prompt at a time), short-circuit the batch after a denial, and
-// return one ToolResult per call (the API requires it). Execution is the Backend's —
-// except the loop-level peer tools (`peer_tools`), which the loop owns because they
-// act on its `PeerSet` (and, for Spawn, its factory + own broker handle); those are
-// recognized here and never reach the backend.
+// Peer tools are executed here, never by the backend: they act on the loop's `PeerSet`.
 pub(super) async fn dispatch_tools<B: Backend>(
     assistant_msg: &Message,
     agent_tx: &mpsc::Sender<AgentEvent>,
@@ -44,8 +39,7 @@ pub(super) async fn dispatch_tools<B: Backend>(
             .await;
 
         if denied {
-            // Still return a tool_result per cancelled call (the API requires one per
-            // tool_use_id), and mirror it as an event so the TUI's entry leaves "running".
+            // The API requires a tool_result per tool_use_id.
             let content =
                 "Cancelled: a prior tool call in this turn was denied by the user.".to_string();
             let _ = agent_tx
@@ -63,8 +57,6 @@ pub(super) async fn dispatch_tools<B: Backend>(
             continue;
         }
 
-        // Spawn gates (autonomous token-spend), MessagePeer auto-allows (conversation;
-        // the peer's own gates apply). Backend tools keep their own classification.
         let needs_permission = if is_peer_tool {
             peer_tools::requires_permission(name, auto)
         } else {
@@ -109,8 +101,7 @@ pub(super) async fn dispatch_tools<B: Backend>(
                 }
             } else {
                 denied = true;
-                // Neutral on purpose: the answer may come from a human or, for a
-                // subagent, from its supervising agent — the loop can't tell which.
+                // Neutral wording: the denier may be a human or a supervising agent.
                 ("Permission to run this tool was denied.".into(), true)
             }
         };
