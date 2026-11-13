@@ -675,20 +675,20 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 .await;
         }
         // Spawned so the dial never blocks the loop; the edge arrives via `peer_register_rx`.
-        Command::ConnectPeer(code) => {
-            if code.trim().is_empty() {
+        Command::ConnectPeer(target) => {
+            if target.trim().is_empty() {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
-                        text: "usage: /connect-peer <pairing-code>".into(),
+                        text: "usage: /connect-peer <session id|name|pairing-code>".into(),
                     })
                     .await;
             } else if let Some(dialer) = peer_dialer {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
-                        text: "connecting to peer over the relay…".into(),
+                        text: "connecting to peer…".into(),
                     })
                     .await;
-                let fut = dialer(code, self_handle.clone());
+                let fut = dialer(target, self_handle.clone());
                 let agent_tx = agent_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = fut.await {

@@ -75,7 +75,8 @@ pub fn command_catalog() -> Vec<CommandInfo> {
         },
         CommandInfo {
             name: "/connect-peer".into(),
-            usage: "/connect-peer <pairing-code> — dial a remote peer agent over the relay".into(),
+            usage: "/connect-peer <session id|name|pairing-code> — make another session a peer"
+                .into(),
         },
         CommandInfo {
             name: "/auto".into(),
