@@ -1,22 +1,26 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::core::SessionHost;
 use crate::transport::{self, PairingScope};
 
+// The caller serves `socket`; with `socket_only` (`--socket`) there are no relay legs.
 pub(super) async fn run(
     host: SessionHost,
-    socket: Option<PathBuf>,
+    socket: &Path,
+    socket_only: bool,
     relay: Option<String>,
     watch: bool,
     peer_accept: Option<transport::PeerAccept>,
 ) -> Result<()> {
     let broker = host.broker_handle();
+    eprintln!("[daemon] listening on {}", socket.display());
     // A controller leaving never ends the daemon; only a process signal does.
     let run = async move {
-        if let Some(path) = socket {
-            let listener = transport::bind_listener(&path)?;
-            transport::run_daemon(listener, path, broker).await
+        if socket_only {
+            broker.closed().await;
+            eprintln!("[daemon] session ended; shutting down");
+            Ok(())
         } else {
             // Dial OUT to the relay: the only direction that crosses NAT. Each scope
             // (full, watch, agent) gets its own room + key.

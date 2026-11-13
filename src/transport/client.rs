@@ -81,6 +81,27 @@ impl SocketClient {
             ui_tx,
         }))
     }
+
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub async fn dial_peer(
+        &self,
+        self_broker: BrokerHandle,
+        registrar: mpsc::UnboundedSender<PeerRegistration>,
+        who: ClientIdentity,
+    ) -> Result<()> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .with_context(|| format!("connecting to session at {}", self.socket_path.display()))?;
+        let (read_half, write_half) = stream.into_split();
+        peer_handshake(
+            LineReader(BufReader::new(read_half)),
+            LineWriter(write_half),
+            self_broker,
+            registrar,
+            who,
+        )
+        .await
+    }
 }
 
 impl SessionHandle for SocketClient {
@@ -167,8 +188,7 @@ impl RelayClient {
     }
 
     // Both directed edges of the mutual peer pair ride this one socket; `self_broker`
-    // is the dialer's own broker, exposed to the far side. Returns once the pump is
-    // spawned so the caller's loop never blocks on network I/O.
+    // is the dialer's own broker, exposed to the far side.
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
@@ -179,52 +199,14 @@ impl RelayClient {
             .await
             .with_context(|| format!("dialing peer relay at {}", self.relay_url))?;
         let (sink, stream) = ws.split();
-        let mut writer = WsWriter::new(sink, self.cipher.clone());
-        let mut reader = WsReader::new(stream, self.cipher.clone());
-
-        writer
-            .send(&ClientFrame::Attach {
-                after_seq: None,
-                who,
-                reverse_offer: true,
-            })
-            .await?;
-        match reader.recv().await? {
-            Some(ServerFrame::Attached) => {}
-            Some(ServerFrame::Busy) => anyhow::bail!("the peer session has ended"),
-            other => anyhow::bail!("unexpected handshake response: {other:?}"),
-        }
-        let peer_who = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
-            Ok(Ok(Some(ServerFrame::ReverseAttach { who }))) => who,
-            _ => anyhow::bail!(
-                "the far side offered no return edge — the target must be a `--daemon --peer` session"
-            ),
-        };
-
-        let (fwd_ev_tx, fwd_ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
-        let (fwd_ui_tx, fwd_ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
-        let forward = Controller {
-            events: fwd_ev_rx,
-            ui_tx: fwd_ui_tx,
-        };
-        if registrar
-            .send(PeerRegistration::new(forward, peer_who.clone()))
-            .is_err()
-        {
-            anyhow::bail!("the dialer's loop is gone");
-        }
-
-        // The reverse grant is implied by the user running /connect-peer.
-        let ac = match self_broker
-            .attach_as(peer_who, ClientProfile::agent())
-            .await
-        {
-            Some(c) => c,
-            None => anyhow::bail!("the dialer's broker is gone"),
-        };
-
-        tokio::spawn(dial_pump(reader, writer, fwd_ev_tx, fwd_ui_rx, ac));
-        Ok(())
+        peer_handshake(
+            WsReader::new(stream, self.cipher.clone()),
+            WsWriter::new(sink, self.cipher.clone()),
+            self_broker,
+            registrar,
+            who,
+        )
+        .await
     }
 }
 
@@ -236,6 +218,63 @@ impl SessionHandle for RelayClient {
 
     // Dropping the `Controller` detaches and stops any redial in `stay_attached`.
     fn detach(&self) {}
+}
+
+// Returns once the pump is spawned so the caller's loop never blocks on I/O.
+async fn peer_handshake<R, W>(
+    mut reader: R,
+    mut writer: W,
+    self_broker: BrokerHandle,
+    registrar: mpsc::UnboundedSender<PeerRegistration>,
+    who: ClientIdentity,
+) -> Result<()>
+where
+    R: FrameReader<ServerFrame> + 'static,
+    W: FrameWriter<ClientFrame> + 'static,
+{
+    writer
+        .send(&ClientFrame::Attach {
+            after_seq: None,
+            who,
+            reverse_offer: true,
+        })
+        .await?;
+    match reader.recv().await? {
+        Some(ServerFrame::Attached) => {}
+        Some(ServerFrame::Busy) => anyhow::bail!("the peer session has ended"),
+        other => anyhow::bail!("unexpected handshake response: {other:?}"),
+    }
+    let peer_who = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
+        Ok(Ok(Some(ServerFrame::ReverseAttach { who }))) => who,
+        _ => anyhow::bail!(
+            "the far side offered no return edge — the target must be a `--daemon --peer` session"
+        ),
+    };
+
+    let (fwd_ev_tx, fwd_ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
+    let (fwd_ui_tx, fwd_ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
+    let forward = Controller {
+        events: fwd_ev_rx,
+        ui_tx: fwd_ui_tx,
+    };
+    if registrar
+        .send(PeerRegistration::new(forward, peer_who.clone()))
+        .is_err()
+    {
+        anyhow::bail!("the dialer's loop is gone");
+    }
+
+    // The reverse grant is implied by the user running /connect-peer.
+    let ac = match self_broker
+        .attach_as(peer_who, ClientProfile::agent())
+        .await
+    {
+        Some(c) => c,
+        None => anyhow::bail!("the dialer's broker is gone"),
+    };
+
+    tokio::spawn(dial_pump(reader, writer, fwd_ev_tx, fwd_ui_rx, ac));
+    Ok(())
 }
 
 async fn pump_reads<R: FrameReader<ServerFrame> + 'static>(

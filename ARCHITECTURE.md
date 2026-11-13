@@ -144,9 +144,13 @@ hook dials OUT to the relay so a phone can attach, reporting its progress
 pairing code are surfaced once connected. The hook dedupes its own re-dialing, so
 firing each time just lets a failed dial be retried by backgrounding again. With
 no relay configured, `/background` still pauses the session — it just shows no QR.
-Local Unix-socket handoff is no longer co-located with a session; the socket
-transport survives only as the standalone `--daemon --socket` / `--connect --socket`
-debug path.
+
+Every host (TUI or `--daemon`) also listens on a Unix socket at
+`~/.nudge/run/<session-id>.sock` (mode 0600, so the trust boundary is the OS user)
+and unlinks it on exit. It serves clients concurrently and accepts reverse-edge peer
+offers, so a dialer over the socket forms the same unsupervised mutual peer edge as
+over an agent-peer relay room. A second host resuming the same session is refused
+because the socket is live.
 
 ## Run modes (selected in `main.rs`)
 
@@ -155,7 +159,7 @@ debug path.
 | `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and arms three scoped pairing legs — full-access, watch-only, agent-peer (`w` cycles the QR). |
 | `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR. `--watch` / `--peer` mint and park the watch-only / agent-peer scopes too.    |
 | `nudge --connect --pair-code <code>`         | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
-| `nudge --daemon --socket <path>`             | Headless host bound to a local Unix socket (debugging the transport without a relay).             |
+| `nudge --daemon --socket <path>`             | Headless host on a local Unix socket at `<path>` instead of the session socket, with no relay legs. |
 | `nudge --connect --socket <path>`            | Front-end only (`SocketClient`) over a local Unix socket (debug).                                 |
 | `nudge --print-prompt`                       | Standalone one-shot action, then exit.                                                            |
 

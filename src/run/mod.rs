@@ -2,7 +2,9 @@ pub mod connect;
 mod daemon;
 mod local;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 
 use crate::cli::Cli;
 use crate::coding;
@@ -103,6 +105,12 @@ pub async fn host(cli: Cli) -> Result<()> {
             .await;
     }
 
+    let socket_path = match cli.socket.clone().filter(|_| cli.daemon) {
+        Some(path) => path,
+        None => session_socket_path(&session.id)?,
+    };
+    let listener = transport::bind_listener(&socket_path)?;
+
     let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
 
     // Front-ends rebuild history purely from the replayed event stream; the
@@ -182,14 +190,46 @@ pub async fn host(cli: Cli) -> Result<()> {
     );
 
     let relay = config.relay;
+    let serving = tokio::spawn(transport::serve_socket(
+        listener,
+        host.broker_handle(),
+        transport::PeerAccept {
+            identity: peer_identity.clone(),
+            registrar: peer_reg_tx.clone(),
+        },
+    ));
 
-    if cli.daemon {
+    let result = if cli.daemon {
         let peer_accept = cli.peer.then(|| transport::PeerAccept {
             identity: peer_identity,
             registrar: peer_reg_tx,
         });
-        daemon::run(host, cli.socket, relay, cli.watch, peer_accept).await
+        let socket_only = cli.socket.is_some();
+        daemon::run(
+            host,
+            &socket_path,
+            socket_only,
+            relay,
+            cli.watch,
+            peer_accept,
+        )
+        .await
     } else {
         local::run(host, ui_cfg, who, relay, peer_identity, peer_reg_tx).await
-    }
+    };
+    serving.abort();
+    // The listener doesn't unlink the socket file on drop.
+    let _ = std::fs::remove_file(&socket_path);
+    result
+}
+
+fn session_socket_path(session_id: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    let dir = PathBuf::from(home).join(".nudge").join("run");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir.join(format!("{session_id}.sock")))
 }
