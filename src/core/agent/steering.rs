@@ -21,26 +21,11 @@ const UNJUDGED_SKIP_AND_REPORT: &str = "Your supervisor could not judge that cal
     that step, continue with the rest of the task, and list the skipped step under \"Needs \
     you\" in your final report.";
 
-// A supervised peer's check-in, decided by one inference in this agent's OWN loop:
-// the check-in (plus the peer's capped activity digest) is appended to the real
-// `messages` with an instruction to answer via `RespondToPeer`, and the exchange is
-// recorded as it happened (check-in, the RespondToPeer call, its result, a one-line
-// close) — which is both why the verdict is informed by full context and how the
-// agent stays aware of its peer on later turns. The request is a normal turn (same
-// tools, thinking on), so it shares the prompt cache. The verdict tool is requested
-// in the prompt rather than forced via `tool_choice`: newer models reject forced
-// tool choice outright.
-//
-// Verdicts: approve → allow; deny → block, and any `message` is delivered as the
-// peer's next instruction (the peer paused on denial, so deny→redirect is one round
-// trip); escalate → the request surfaces on this agent's own broker, named, and the
-// human's answer is routed down. No verdict (provider failure, or none after
-// VERDICT_ATTEMPTS) → escalate as well, with the check-in rolled back.
-//
-// In auto mode nothing waits on the absent human: there is no escalate verdict, a deny
-// always carries a message (a denied peer otherwise waits for guidance that never
-// comes), and an unjudged check-in becomes a deny telling the peer to skip the step
-// and report it.
+// The check-in is decided by a normal turn in this agent's own `messages` (sharing the
+// prompt cache) and recorded there. The verdict tool is asked for in the prompt, not
+// forced via `tool_choice`: newer models reject forced tool choice.
+// No verdict escalates to the human; in auto mode nothing may wait on the absent human,
+// so escalate isn't offered and a deny always carries a message.
 #[allow(clippy::too_many_arguments)] // internal seam; mirrors the loop's own state
 pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     cfg: &AgentConfig,
@@ -176,8 +161,8 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         }
     };
 
-    // Answer the blocked peer first; a deny's redirect message rides right behind it
-    // (the peer paused on denial and takes the message as its fresh instruction).
+    // The peer paused on denial, so a redirect message sent right after becomes its
+    // next instruction.
     peers
         .drive(
             checkin.pid,
@@ -193,13 +178,8 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
             .await;
     }
 
-    // Record the exchange as it actually happened: the check-in (already pushed), the
-    // model's real RespondToPeer call, its tool_result, and a one-line close that rests
-    // the transcript on an assistant turn. Faithfulness is load-bearing here, not
-    // tidiness: a check-in recorded as answered by plain text teaches the model, by
-    // example, to answer the next check-in with plain text instead of the tool —
-    // measured on a live transcript, 0/10 verdicts with a few text-only closes in
-    // context vs 10/10 with the real call recorded. Session-logged for faithful resume.
+    // Record the real RespondToPeer call, not a plain-text answer: text-only closes in
+    // context teach the model to skip the tool on the next check-in.
     let call_id = call.id.clone();
     for msg in [
         Message {
@@ -241,7 +221,6 @@ enum Verdict {
     Escalate,
 }
 
-// The model's RespondToPeer call, kept so the transcript can record it verbatim.
 struct VerdictCall {
     id: String,
     input: Value,
@@ -293,12 +272,9 @@ async fn ask_human(agent_tx: &mpsc::Sender<AgentEvent>, checkin: &CheckIn, name:
     rx.await.unwrap_or(false)
 }
 
-// Steering could not produce a verdict. Failing to decide is not a "no": denying here
-// would hand the peer an unexplained refusal while this agent's transcript keeps no
-// trace of it, so the call goes to the human exactly like an explicit escalate. In auto
-// mode there is no human to ask, so the peer is denied with an explicit skip-and-report
-// instruction instead and the human's session gets a Notice. Either way the check-in is
-// rolled back so the next real turn lands on a valid boundary.
+// Failing to decide is not a "no": a silent deny would leave no trace in this transcript,
+// so it goes to the human (or, in auto mode, a skip-and-report deny). The check-in is
+// rolled back so the next turn lands on a valid boundary.
 #[allow(clippy::too_many_arguments)] // internal seam; mirrors run_steering_turn's state
 async fn settle_unjudged(
     session: &mut Session,

@@ -16,18 +16,10 @@ import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
-// The Kotlin peer of the Rust wire protocol (core::events + transport::wire). These
-// types must serialize byte-compatibly with serde's *external* tagging, which is NOT
-// what kotlinx.serialization produces for sealed classes by default (it uses an
-// internal "type" discriminator). So each enum carries a hand-written serializer:
-//   - unit variant      -> the bare string  "Detach"
-//   - struct variant     -> {"Attach": {"after_seq": 7}}
-//   - newtype variant    -> {"Command": <inner>}   (inner serialized on its own)
-// Snake_case field names match Rust via @SerialName; u64 maps to Long, Option<u64>
-// to a nullable Long (serde emits the field as null when None).
+// Must match serde's *external* enum tagging ("Detach", {"Attach": {...}}), not
+// kotlinx's default internal "type" discriminator, hence the hand-written serializers.
 
-// The compact JSON codec for frames — matches serde_json::to_vec (no whitespace).
-// encodeDefaults so any field with a default still goes on the wire, as serde does.
+// encodeDefaults so defaulted fields still go on the wire, as serde does.
 val WireJson: Json = Json {
     ignoreUnknownKeys = true
     encodeDefaults = true
@@ -42,8 +34,6 @@ private fun <T> emitTagged(encoder: JsonEncoder, tag: String, ser: Serialization
     encoder.encodeJsonElement(JsonObject(mapOf(tag to encoder.json.encodeToJsonElement(ser, value))))
 }
 
-// Split an externally-tagged value into (variant tag, inner element-or-null). A bare
-// string is a unit variant (null inner); a single-key object is a data variant.
 private fun splitTagged(decoder: JsonDecoder): Pair<String, JsonElement?> =
     when (val el = decoder.decodeJsonElement()) {
         is JsonPrimitive -> {
@@ -59,8 +49,7 @@ private fun splitTagged(decoder: JsonDecoder): Pair<String, JsonElement?> =
     }
 
 // ── ControllerEvent (core -> client) ─────────────────────────────────────────
-// The daemon's capability surface, carried in ControllerEvent.Capabilities. Field
-// order mirrors the Rust serde structs exactly (byte-pinned in FramesTest).
+// Field order mirrors the Rust serde structs exactly (byte-pinned in FramesTest).
 @Serializable
 data class ModelInfo(val id: String, val label: String)
 
@@ -70,8 +59,6 @@ data class CommandInfo(val name: String, val usage: String)
 @Serializable
 data class McpServerInfo(val name: String, val description: String?, val loaded: Boolean)
 
-// One held peer edge (name, kind, direction of creation, provenance). Mirrors the
-// Rust PeerInfo field order exactly.
 @Serializable
 data class PeerInfo(
     val name: String,
@@ -89,17 +76,12 @@ sealed class ControllerEvent {
         val cwd: String,
         @SerialName("git_branch") val gitBranch: String?,
         @SerialName("session_id") val sessionId: String,
-        // Human label set via rename, null when the session is nameless. Defaulted so
-        // a daemon that predates the field still decodes. The header prefers it over
-        // the uuid. serde emits it as null (not absent) when None, so it's normally present.
+        // Defaulted so an older daemon without these fields still decodes.
         @SerialName("session_name") val sessionName: String? = null,
-        // Defaulted so a daemon that predates auto mode still decodes.
         val auto: Boolean = false,
     ) : ControllerEvent()
 
-    // The daemon's capabilities: command grammar, model catalog, MCP catalog, peer
-    // roster. Seeded next to SessionInfo and re-emitted on surface change; menus
-    // render from it. `peers` is defaulted so a daemon that predates it still decodes.
+    // `peers` is defaulted so an older daemon without it still decodes.
     @Serializable
     data class Capabilities(
         val commands: List<CommandInfo>,
@@ -145,8 +127,7 @@ sealed class ControllerEvent {
         @SerialName("is_error") val isError: Boolean,
     ) : ControllerEvent()
 
-    // `sender` is the display name of whoever sent it (the daemon stamps it from that
-    // controller's identity), so a shared session can attribute each turn.
+    // `sender` is stamped by the daemon from the sending controller's identity.
     @Serializable
     data class UserMessage(val text: String, val sender: String) : ControllerEvent()
 
@@ -219,10 +200,7 @@ sealed class UiEvent {
     @Serializable
     data class UserMessage(val text: String) : UiEvent()
 
-    // A raw slash-command line (`/model …`, `/mcp …`, `/session-rename …`). The
-    // daemon parses and executes it; results return as Notice/SessionInfo/Capabilities
-    // events. One surface for every front-end — the phone gets every command by
-    // sending the line it typed, with no per-command app code.
+    // The daemon parses the raw slash-command line, so the app needs no per-command code.
     @Serializable
     data class Command(val line: String) : UiEvent()
 
@@ -263,10 +241,8 @@ object UiEventSerializer : KSerializer<UiEvent> {
 }
 
 // ── ClientIdentity (attach handshake) ────────────────────────────────────────
-// Announced by every client in ClientFrame.Attach; the daemon records it and
-// attributes the session's turns. Mirrors Rust core::identity::ClientIdentity. serde
-// serializes a fieldless enum variant as a bare string ("Human"), which is exactly
-// what a kotlinx @Serializable enum produces — so no custom serializer is needed.
+// serde writes a fieldless enum variant as a bare string, same as a kotlinx enum,
+// so no custom serializer is needed.
 @Serializable
 enum class ClientKind { Human, Agent }
 
@@ -274,8 +250,7 @@ enum class ClientKind { Human, Agent }
 data class ClientIdentity(
     val kind: ClientKind,
     val name: String,
-    // Populated for a spawned agent; a human leaves these null. serde emits them as
-    // null (not absent), and encodeDefaults keeps them on the wire in that order.
+    // serde emits these as null (not absent); encodeDefaults keeps them on the wire.
     @SerialName("session_id") val sessionId: String? = null,
     val task: String? = null,
 ) {
@@ -287,7 +262,6 @@ data class ClientIdentity(
 // ── ClientFrame (client -> daemon) ───────────────────────────────────────────
 @Serializable(with = ClientFrameSerializer::class)
 sealed class ClientFrame {
-    // `who` is this client's identity — the attach frame is the handshake.
     @Serializable
     data class Attach(
         @SerialName("after_seq") val afterSeq: Long?,

@@ -20,17 +20,9 @@ pub mod tools;
 
 pub use backend::{CodingBackend, print_preamble};
 
-// Translate a resumed transcript into the `ControllerEvent`s the loop would have
-// emitted live, so the broker can seed its replay buffer with the full history.
-// This lives in `coding` (not `core`) because it needs `tools::summarize`, a
-// coding-agent concern; `core` stays UI/tool-agnostic. Emits *flat* events
-// (ToolUseStart then ToolResult as separate entries) — the controller's live
-// merge reassembles them by id, exactly as for live events, so one render path
-// serves both live and replay. Usage / permission outcomes aren't in the JSONL
-// (they're runtime-only), so they're absent here, matching the old seed_replay.
-// User turns are attributed from each entry's persisted sender; entries from
-// pre-sender logs carry none and replay unattributed (empty sender), which
-// renderers show as a plain own-style turn.
+// Emits flat events (ToolUseStart, ToolResult separately) so the controller's
+// live merge reassembles them and one render path serves live and replay.
+// Lives in `coding` because it needs `tools::summarize`.
 pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<ControllerEvent> {
     let mut out = Vec::new();
     if dropped > 0 {
@@ -154,28 +146,21 @@ pub fn replay_events(entries: &[LoggedMessage], dropped: usize) -> Vec<Controlle
             _ => {}
         }
     }
-    // A saved transcript is always at a turn boundary, so close the replay with
-    // TurnComplete: it resets the status line to idle (the tool events above
-    // leave it on "running"/"thinking") and re-detects git. If the daemon's loop
-    // is actually mid-turn, the live events that follow re-set the status.
+    // A saved transcript ends at a turn boundary; TurnComplete resets the
+    // status line, and live events re-set it if the daemon is mid-turn.
     if !out.is_empty() {
         out.push(ControllerEvent::TurnComplete);
     }
     out
 }
 
-// Session storage policy: one shared SQLite database at ~/.nudge/nudge.db. The
-// core session/store mechanism is agnostic to this; the single-db-in-home layout
-// is a coding-agent convention (a different agent type could store elsewhere).
 fn db_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
     Ok(PathBuf::from(home).join(".nudge").join("nudge.db"))
 }
 
-// Every session entry point (new, resume, list) funnels through here: open the
-// shared store and, on first contact, migrate the legacy JSONL layout into it.
-// The marker is set only after a fully successful import, so a crash mid-import
-// retries on the next open (idempotently — imported ids are skipped).
+// The marker is set only after a fully successful import, so a crash
+// mid-import retries on the next open.
 fn open_store() -> Result<SessionStore> {
     let mut store = SessionStore::open(&db_path()?)?;
     if !store.legacy_import_done()? {
@@ -191,16 +176,13 @@ pub fn open_new() -> Result<Session> {
     Session::create(cwd, store)
 }
 
-// A spawned child's session: same storage policy, plus the provenance edge
-// (spawned_by = the parent's session id, spawn_task = what it was asked to do).
 pub fn open_new_spawned(spawned_by: &str, spawn_task: &str) -> Result<Session> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
     Session::create_spawned(cwd, store, spawned_by, spawn_task)
 }
 
-// Resume by either a session uuid or a human name: a name is resolved to its id
-// against this cwd's sessions before opening (see `store::resolve_reference`).
+// `reference` is a session uuid or a name, resolved against this cwd's sessions.
 pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
@@ -208,12 +190,8 @@ pub fn open_resume(reference: &str) -> Result<Resumed> {
     Session::open(&id, cwd, store)
 }
 
-// One row for `nudge --list`: a session in the current project, with its name if
-// it's been renamed. `last_activity` (the store row's commit-touched timestamp)
-// sorts most-recent-first so the list reads like a recency-ordered history.
-// `turns` is the live (non-superseded) message count, a proxy for how much
-// history the session holds. `state` is honest-best-effort: 'ended' is written
-// on graceful teardown, so a crashed session still reads 'running'.
+// `state` is best-effort: 'ended' is written only on graceful teardown, so a
+// crashed session still reads 'running'.
 pub struct SessionListing {
     pub id: String,
     pub name: Option<String>,
@@ -223,8 +201,6 @@ pub struct SessionListing {
     pub turns: i64,
 }
 
-// Enumerate the current project's sessions from the store, most recently active
-// first. A fresh database yields an empty list (no sessions here yet).
 pub fn list_sessions() -> Result<Vec<SessionListing>> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
@@ -253,8 +229,6 @@ mod tests {
     use crate::core::ClientIdentity;
     use crate::llm::Message;
 
-    // Replayed user turns are attributed from each entry's persisted sender; a
-    // pre-sender entry replays with an empty sender (rendered unattributed).
     #[test]
     fn replay_seeds_sender_from_entry_metadata() {
         let user = |text: &str| Message {

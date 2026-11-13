@@ -1,6 +1,5 @@
-// 8.4-b Android client: a Compose chat UI on top of the :protocol kit (8.4-a).
-// AGP 9.x ships built-in Kotlin (KGP 2.2.10), so no kotlin-android plugin is applied
-// here; only the Compose compiler plugin (its version must match the built-in Kotlin).
+// AGP 9.x ships built-in Kotlin (2.2.10), so no kotlin-android plugin; the Compose
+// compiler plugin version must match that built-in Kotlin.
 import java.util.Properties
 
 plugins {
@@ -8,9 +7,7 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.2.10"
 }
 
-// Release signing is driven by an untracked keystore.properties at the android/ root
-// (storeFile, storePassword, keyAlias, keyPassword). Absent it, release builds stay
-// unsigned — so debug builds and fresh checkouts work with no setup.
+// Untracked keystore.properties at the android/ root; absent it, release builds stay unsigned.
 val keystorePropsFile = rootProject.file("keystore.properties")
 val keystoreProps = Properties().apply {
     if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
@@ -24,8 +21,7 @@ android {
         applicationId = "io.gitlab.hongtao1207.nudge"
         minSdk = 26
         targetSdk = 36
-        // CI injects VERSION_CODE/VERSION_NAME derived from the release tag; the
-        // fallbacks keep local and fresh-checkout builds working with no setup.
+        // CI injects these from the release tag.
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("VERSION_NAME") ?: "0.1"
     }
@@ -70,8 +66,7 @@ kotlin {
 }
 
 dependencies {
-    // The protocol kit. Exclude its desktop libsodium binding (JNA-loaded, no Android
-    // .so) and substitute the Android variant — identical crypto_secretbox wire format.
+    // Swap the desktop libsodium binding (JNA-loaded, no Android .so) for the Android one.
     implementation(project(":protocol")) {
         exclude(group = "com.goterl", module = "lazysodium-java")
         exclude(group = "net.java.dev.jna", module = "jna")
@@ -79,9 +74,6 @@ dependencies {
     implementation("com.goterl:lazysodium-android:5.1.0@aar")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
-    // Compose. The BOM pins mutually-compatible Compose artifact versions; Android
-    // Studio will offer newer BOMs on sync — bump freely, the compiler plugin is
-    // decoupled from the runtime now.
     val composeBom = platform("androidx.compose:compose-bom:2024.10.01")
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
@@ -91,16 +83,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.core:core-ktx:1.13.1")
 
-    // QR pairing (8.4-c). Google's code scanner (ML Kit under the hood) runs the camera
-    // + scan UI inside a Play Services process, so the app needs no CAMERA permission and
-    // no CameraX preview wiring. Requires Google Play Services on the device; the paste
-    // field stays as the fallback for non-GMS devices / the bare emulator.
+    // Scans inside Play Services, so no CAMERA permission; non-GMS devices fall back to paste.
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 
-    // Markdown rendering for assistant text (8.5). Markwon is the battle-tested Android
-    // markdown lib; it renders into a TextView (wrapped in an AndroidView). core covers
-    // CommonMark; the ext-* plugins add GFM tables, strikethrough, and task lists, and
-    // linkify autolinks bare URLs.
     implementation("io.noties.markwon:core:4.6.2")
     implementation("io.noties.markwon:ext-tables:4.6.2")
     implementation("io.noties.markwon:ext-strikethrough:4.6.2")

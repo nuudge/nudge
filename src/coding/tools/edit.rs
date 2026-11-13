@@ -65,8 +65,7 @@ pub async fn execute(input: &Value, file_state: &Arc<Mutex<FileState>>) -> Resul
         bail!("Edit: file does not exist: {file_path}. Use CreateNew to create a new file.");
     }
 
-    // Read-before-Edit + external-modification check. Runs after the existence
-    // check so a missing-file error fires with its more specific message.
+    // After the existence check so a missing file gets the more specific error.
     file_state.lock().await.check_edit(path)?;
 
     match mode {
@@ -97,13 +96,8 @@ pub async fn execute(input: &Value, file_state: &Arc<Mutex<FileState>>) -> Resul
             Ok(format!("Edited {file_path}"))
         }
         "append" => {
-            // Direct append via OpenOptions rather than read+concat+atomic-rename:
-            // the rename path would require reading the entire file into memory
-            // just to glue bytes on the end, which is wasteful on large files
-            // (logs are the prime use case). Trade-off: a process kill mid-write
-            // can leave a partial tail rather than the all-or-nothing guarantee
-            // modify mode has. Acceptable — the conventional shape (>>, tee -a,
-            // log writers) all do the same.
+            // Not atomic like modify (a kill can leave a partial tail), but avoids
+            // reading a large file into memory just to append.
             use tokio::io::AsyncWriteExt;
             let mut file = tokio::fs::OpenOptions::new()
                 .append(true)

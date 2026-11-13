@@ -14,10 +14,7 @@ mod inspect_session;
 mod read;
 mod todo_write;
 
-// Test-only seam: the integration test in core::agent::tests drives the tool's
-// `run` against an injected scratch store (production goes through `dispatch` →
-// `execute`, which opens the real one). Gated so the reach-in exists only in
-// test builds.
+// Lets a core::agent test drive `run` against a scratch store instead of the real one.
 #[cfg(test)]
 pub(crate) use inspect_session::run as inspect_session_run;
 
@@ -40,8 +37,6 @@ pub async fn dispatch(
 }
 
 pub fn requires_permission(name: &str) -> bool {
-    // Stateless / read-only tools auto-allow; everything that touches the
-    // filesystem or runs commands gates on the per-call permission prompt.
     !matches!(
         name,
         "Read" | "Grep" | "Glob" | "TodoWrite" | "InspectSession"
@@ -61,9 +56,7 @@ pub fn schemas() -> Vec<Value> {
     ]
 }
 
-// One-line roster injected into the system prompt. The full mechanics for each
-// tool live in its schema description; these snippets only orient. Kept beside
-// `schemas()` so the two tool lists stay in lockstep.
+// Keep in lockstep with `schemas()`; full mechanics live in each schema description.
 pub fn roster(web_search: bool) -> String {
     let mut entries = vec![
         (
@@ -127,10 +120,8 @@ pub fn summarize(name: &str, input: &Value) -> String {
     }
 }
 
-// What the permission modal shows. For Bash the display summary is the
-// model-stated *intent*, but a permission decision must be made against the
-// actual command — an intent like "list files" says nothing about what the
-// command really does. Other tools' summaries already are their inputs.
+// Bash's display summary is the model-stated intent, but approval must be
+// judged against the actual command.
 pub fn permission_summary(name: &str, input: &Value) -> String {
     match name {
         "Bash" => bash::permission_summary(input),
@@ -138,27 +129,18 @@ pub fn permission_summary(name: &str, input: &Value) -> String {
     }
 }
 
-// Whether the collapsed TUI row should preview the first line of output.
-// Read/Grep/Glob output is positional noise out of context (line-numbered
-// file content, a lone match, a path list) — a line count tells the user
-// more. Bash/Edit/CreateNew/TodoWrite output is a *message* (exit status,
-// error text, confirmation), which is worth previewing.
+// Read/Grep/Glob output is positional noise out of context; a line count says more.
 pub fn preview_output(name: &str) -> bool {
     !matches!(name, "Read" | "Grep" | "Glob")
 }
 
-// Whether the tool's result should always render fully expanded, ignoring the
-// global collapse toggle (Ctrl-O). TodoWrite's output *is* the surfaced plan —
-// the whole point is for the user to see it — and the list is short, so it
-// should never hide behind the collapsed line-count view.
+// TodoWrite's output is the surfaced plan, so it ignores the collapse toggle.
 pub fn always_expand(name: &str) -> bool {
     matches!(name, "TodoWrite")
 }
 
-// Display-side path shortening: the schemas require absolute paths, but in
-// collapsed headers an absolute path makes every entry start with the same
-// long cwd prefix — and right-truncation then cuts off exactly the part
-// that differs. Relativize for display only; paths outside cwd stay absolute.
+// Display only: a shared absolute cwd prefix would get the differing tail
+// truncated away in collapsed headers.
 pub fn display_path(path: &str) -> String {
     let Ok(cwd) = std::env::current_dir() else {
         return path.to_string();

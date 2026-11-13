@@ -1,12 +1,10 @@
 use crate::core::session::Session;
 use crate::llm::{ContentBlock, Message, Response};
 
-// First 8 chars of the uuid; guarded against a short id.
 pub(super) fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-// Tier-3 fallback: the cwd's own name, else a short id.
 pub(super) fn fallback_name(session: &Session) -> String {
     session
         .cwd
@@ -18,8 +16,6 @@ pub(super) fn fallback_name(session: &Session) -> String {
         .unwrap_or_else(|| short_id(&session.id).to_string())
 }
 
-// Tier-3 title request prompt. None when nothing has been said yet (the caller
-// then falls back).
 pub(super) fn title_prompt(messages: &[Message]) -> Option<String> {
     let digest = conversation_digest(messages)?;
     Some(format!(
@@ -27,7 +23,6 @@ pub(super) fn title_prompt(messages: &[Message]) -> Option<String> {
     ))
 }
 
-// First non-empty text block of the response, normalized.
 pub(super) fn title_from_response(resp: &Response) -> Option<String> {
     let raw = resp.content.iter().find_map(|b| match b {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
@@ -37,7 +32,6 @@ pub(super) fn title_from_response(resp: &Response) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-// Bounded plain-text digest of the conversation start, capped to stay cheap.
 fn conversation_digest(messages: &[Message]) -> Option<String> {
     const CAP: usize = 1500;
     let mut out = String::new();
@@ -62,8 +56,6 @@ fn conversation_digest(messages: &[Message]) -> Option<String> {
     }
 }
 
-// Normalize arbitrary text into a kebab-case label (lowercase alphanumerics,
-// other runs collapsed to one hyphen, length-capped).
 fn sanitize_title(raw: &str) -> String {
     const MAX_LEN: usize = 60;
     let mut out = String::new();
@@ -79,7 +71,7 @@ fn sanitize_title(raw: &str) -> String {
             pending_hyphen = true;
         }
     }
-    // All ASCII, so a byte truncation is char-safe; trim any dangling hyphen.
+    // All ASCII, so a byte truncation is char-safe.
     out.truncate(MAX_LEN);
     out.trim_end_matches('-').to_string()
 }

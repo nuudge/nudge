@@ -3,8 +3,6 @@ use crate::core::HandoffStatus;
 // Stored semantically (not pre-rendered) so the Ctrl-O expand toggle can re-format.
 pub(super) enum LogEntry {
     Blank,
-    // `sender` is the display name of whoever sent it; the renderer shows the local
-    // user's own turns as "> " and others prefixed by their name.
     User {
         text: String,
         sender: String,
@@ -40,7 +38,7 @@ pub(super) struct PendingPermission {
     pub(super) tool_use_id: String,
     pub(super) tool_name: String,
     pub(super) summary: String,
-    // Vertical scroll offset into the popup body; clamped to content height at render.
+    // Clamped to content height at render.
     pub(super) scroll: u16,
 }
 
@@ -74,17 +72,13 @@ pub(super) struct App {
     pub(super) expanded: bool,
     pub(super) spinner_frame: usize,
     pub(super) pending: Option<PendingPermission>,
-    // (display label, API model id), fetched at startup where possible. Index
-    // into this while the picker is open.
+    // (display label, API model id)
     pub(super) models: Vec<(String, String)>,
     pub(super) model_picker: Option<usize>,
     pub(super) mode: Mode,
     // Set by handlers, applied by the run loop (which holds the host handle).
     pub(super) pending_transition: Option<Mode>,
-    // Present only on the owner TUI with NUDGE_RELAY set; drives the /background QR.
-    // `_watch` is a watch-only pairing (observe, cannot drive); `_agent` is an
-    // agent-peer pairing (a remote nudge dials it with /connect-peer). `pair_scope`
-    // selects which of the (up to three) codes the background screen renders.
+    // Present only on the owner TUI with NUDGE_RELAY set.
     pub(super) pairing_qr: Option<String>,
     pub(super) pairing_code: Option<String>,
     pub(super) pairing_qr_watch: Option<String>,
@@ -92,14 +86,9 @@ pub(super) struct App {
     pub(super) pairing_qr_agent: Option<String>,
     pub(super) pairing_code_agent: Option<String>,
     pub(super) pair_scope: PairScope,
-    // Relay-dial progress; None until the first update.
     pub(super) handoff_status: Option<HandoffStatus>,
-    // Cosmetic only: owner = this process hosts the loop (and may show a pairing QR);
-    // guest = --connect. Drives the header badges in render.rs. There is no reclaim
-    // capability — the broker is multi-attach, so clients coexist.
+    // Cosmetic only: the broker is multi-attach, so a guest can't reclaim anything.
     pub(super) is_owner: bool,
-    // This client's own display name, used to render its own user turns as "> "
-    // (others show the sender's name). From the attach identity.
     pub(super) self_name: String,
     pub(super) quit: bool,
 }
@@ -122,10 +111,7 @@ pub struct UiConfig {
     pub models: Vec<(String, String)>,
 }
 
-// Which pairing the /background screen currently shows. Full is always present when
-// any pairing is (the owner always mints it); watch/agent may be absent (a guest or a
-// --connect client has none). The `w` key cycles Full → Watch → Agent, skipping absent
-// scopes (see `next_pairing_scope`).
+// Full is always minted when any pairing is; watch/agent may be absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PairScope {
     Full,
@@ -134,7 +120,6 @@ pub(super) enum PairScope {
 }
 
 impl PairScope {
-    // Short label for the footer toggle hint.
     pub(super) fn label(self) -> &'static str {
         match self {
             PairScope::Full => "full-access",
@@ -203,7 +188,6 @@ impl App {
         self.log.push(entry);
     }
 
-    // The QR for a given scope, if that pairing exists.
     fn scope_qr(&self, scope: PairScope) -> Option<&String> {
         match scope {
             PairScope::Full => self.pairing_qr.as_ref(),
@@ -212,9 +196,6 @@ impl App {
         }
     }
 
-    // The next present pairing scope after the current one, cycling Full → Watch →
-    // Agent → (wrap), skipping absent scopes and the current scope itself. `None` when
-    // no other scope has a code (only one pairing, or none) — then `w` is a no-op.
     pub(super) fn next_pairing_scope(&self) -> Option<PairScope> {
         const ORDER: [PairScope; 3] = [PairScope::Full, PairScope::Watch, PairScope::Agent];
         let cur = ORDER.iter().position(|s| *s == self.pair_scope).unwrap();
@@ -223,15 +204,12 @@ impl App {
             .find(|s| self.scope_qr(*s).is_some())
     }
 
-    // Advance the background screen to the next present pairing scope; a no-op when
-    // there is no other scope to show.
     pub(super) fn cycle_pairing(&mut self) {
         if let Some(next) = self.next_pairing_scope() {
             self.pair_scope = next;
         }
     }
 
-    // The QR/code the background screen currently shows, per `pair_scope`.
     pub(super) fn visible_pairing_qr(&self) -> Option<&String> {
         self.scope_qr(self.pair_scope)
     }

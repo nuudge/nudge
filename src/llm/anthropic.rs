@@ -11,23 +11,18 @@ const COUNT_TOKENS_URL: &str = "https://api.anthropic.com/v1/messages/count_toke
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
 
-// What a model supports, from the Models API `capabilities` object. Parsed in
-// one place (`parse_caps`) so a new capability is one field plus one line.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelCaps {
     pub web_search: bool,
-    // Code execution can call the request's other tools — what dynamic
-    // filtering of search results needs.
+    // Code execution can call the request's other tools, which dynamic filtering needs.
     pub programmatic_tools: bool,
     // Models without it (e.g. the 4.5 family) take only manual extended thinking.
     pub adaptive_thinking: bool,
-    // Server-side clearing of old tool results (context editing, beta).
     pub clear_tool_uses: bool,
 }
 
-// Direct-only search works on every web-search-capable model, so it is the
-// safe guess when the Models API can't say; adaptive thinking matches every
-// current model. A beta feature is never assumed.
+// Direct-only search works on every web-search-capable model, so it's the safe
+// guess; a beta feature is never assumed.
 const UNKNOWN_CAPS: ModelCaps = ModelCaps {
     web_search: true,
     programmatic_tools: false,
@@ -35,7 +30,6 @@ const UNKNOWN_CAPS: ModelCaps = ModelCaps {
     clear_tool_uses: false,
 };
 
-// The request pieces shaped from one capability lookup.
 struct WireParts {
     system: Vec<serde_json::Value>,
     tools: Vec<serde_json::Value>,
@@ -60,9 +54,7 @@ impl AnthropicProvider {
         }
     }
 
-    // (display label, model id), newest first - whatever the API is currently
-    // serving. Also pre-fills the capability cache, since every model's
-    // capabilities ride along.
+    // (display label, model id), newest first. Also pre-fills the capability cache.
     pub async fn list_models(&self) -> Result<Vec<(String, String)>> {
         let resp = self
             .client
@@ -90,9 +82,7 @@ impl AnthropicProvider {
             .collect())
     }
 
-    // Fetched once per model id and cached for the process; an unknown model
-    // falls back to UNKNOWN_CAPS, and only the call that resolved it carries
-    // the warning, so the user sees it once.
+    // Only the call that resolves a model carries the warning, so the user sees it once.
     async fn model_caps(&self, model: &str) -> (ModelCaps, Option<String>) {
         let cached = self.caps.lock().unwrap().get(model).copied();
         if let Some(caps) = cached {
@@ -135,12 +125,8 @@ impl AnthropicProvider {
             .context("failed to parse model response")
     }
 
-    // Shared wire shaping: serialize system blocks with `cache_control` on the
-    // cache-flagged ones, resolve the tool array (server tools included) with
-    // the tool cache marker at its boundary, and the floating history
-    // breakpoint on the messages. Both `complete` and `count_tokens` build on
-    // this; the per-call fields (max_tokens, thinking) differ because the
-    // count_tokens endpoint rejects `max_tokens`.
+    // Shared by `complete` and `count_tokens`; per-call fields stay out because
+    // count_tokens rejects `max_tokens`.
     async fn wire_parts(&self, req: &Request<'_>) -> WireParts {
         let system: Vec<serde_json::Value> = req
             .system
@@ -175,9 +161,8 @@ impl AnthropicProvider {
     }
 }
 
-// The caller's tools plus any provider-side server tools the request asks for.
-// The server tools go first so the caller's stable prefix keeps its order;
-// the cache boundary shifts with them.
+// Server tools go first so the caller's stable prefix keeps its order; the
+// cache boundary shifts with them.
 fn tools_for(req: &Request<'_>, caps: ModelCaps) -> (Vec<serde_json::Value>, Option<usize>) {
     let mut tools = req.tools.clone();
     let mut boundary = req.tool_cache_boundary;
@@ -196,9 +181,8 @@ fn thinking(caps: ModelCaps, max_tokens: u32, display: &str) -> Option<serde_jso
     if caps.adaptive_thinking {
         return Some(json!({ "type": "adaptive", "display": display }));
     }
-    // Manual thinking needs 1024 <= budget_tokens < max_tokens; half the
-    // output budget leaves the other half for the answer. Below that floor
-    // there is no valid budget, so the request goes without thinking.
+    // Manual thinking needs 1024 <= budget_tokens < max_tokens; below that
+    // floor there is no valid budget, so the request goes without thinking.
     let budget = max_tokens / 2;
     (budget >= 1024)
         .then(|| json!({ "type": "enabled", "budget_tokens": budget, "display": display }))
@@ -224,10 +208,8 @@ fn complete_body(req: &Request<'_>, parts: WireParts) -> serde_json::Value {
     body
 }
 
-// A fetched PDF ignores `max_content_tokens` and comes back whole (often
-// 100k+ tokens), then rides along on every later request, so old web_fetch
-// results are cleared server-side. Every other tool is excluded: their
-// results stay exactly as nudge sent them.
+// A fetched PDF ignores `max_content_tokens` and comes back whole (often 100k+
+// tokens), so old web_fetch results are cleared server-side; no other tool's are.
 fn context_management(tools: &[serde_json::Value], caps: ModelCaps) -> Option<serde_json::Value> {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     if !caps.clear_tool_uses || !names.contains(&WEB_FETCH_TOOL) {
@@ -265,10 +247,7 @@ fn cleared_notice(cm: Option<&WireContextManagement>) -> Option<String> {
     })
 }
 
-// Dynamic filtering (search or fetch results filtered by code before they
-// reach context) needs programmatic tool calling; without it the API rejects
-// any caller but "direct". "direct" stays allowed either way so the model can
-// still search and fetch without writing code.
+// Without programmatic tool calling the API rejects any caller but "direct".
 fn allowed_callers(caps: ModelCaps) -> serde_json::Value {
     if caps.programmatic_tools {
         json!(["direct", "code_execution_20260120"])
@@ -302,16 +281,14 @@ fn web_fetch_tool(caps: ModelCaps) -> Option<serde_json::Value> {
         "max_content_tokens": 25000,
         "allowed_callers": allowed_callers(caps),
         "response_inclusion": "excluded",
-        // A prompt injection could make a client tool (e.g. Bash) print a URL
-        // with secrets in its query string; fetching it would leak them from
-        // Anthropic's servers, past any local firewall.
+        // A prompt injection could make a client tool print a URL carrying
+        // secrets; fetching it would leak them past any local firewall.
         "url_sources": { "client_tool_results": { "type": "none" } },
     }))
 }
 
-// None only when `capabilities` is null; a field it doesn't report keeps
-// the UNKNOWN_CAPS guess, so one missing (e.g. Preview) field doesn't
-// discard the ones that are there.
+// None only when `capabilities` is null; a missing field keeps the UNKNOWN_CAPS
+// guess rather than discarding the fields that are there.
 fn parse_caps(caps: Option<&WireCapabilities>) -> Option<ModelCaps> {
     let caps = caps?;
     let supported = |s: Option<&WireSupport>| s.and_then(|s| s.supported);
@@ -380,9 +357,6 @@ impl Provider for AnthropicProvider {
     }
 
     async fn count_tokens(&self, req: &Request<'_>) -> Result<u64> {
-        // The count_tokens endpoint rejects `max_tokens` and doesn't need
-        // `thinking`; it accepts the same system/tools/messages shape (cache
-        // markers included, which it tolerates).
         let parts = self.wire_parts(req).await;
         let mut body = json!({
             "model": req.model,
@@ -423,8 +397,8 @@ impl Provider for AnthropicProvider {
     }
 }
 
-// Unlike `error_for_status`, keeps the API's error body: its `error.message` is the
-// only place the actual reason for a 4xx (e.g. an unsupported request field) appears.
+// Unlike `error_for_status`, keeps the error body: its `error.message` is the
+// only place the reason for a 4xx appears.
 async fn check_status(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = resp.status();
     if status.is_success() {
@@ -482,7 +456,7 @@ struct ModelInfo {
     capabilities: Option<WireCapabilities>,
 }
 
-// Every field optional: a missing one means "unknown", not "unsupported".
+// A missing field means "unknown", not "unsupported".
 #[derive(Deserialize, Debug)]
 struct WireCapabilities {
     code_execution: Option<WireSupport>,
@@ -528,14 +502,8 @@ struct WireUsage {
     cache_read_input_tokens: u64,
 }
 
-// Serialize `messages` for the API request body, injecting a `cache_control`
-// breakpoint on the last content block of the most recent assistant turn.
-// The breakpoint floats forward with the conversation: each request marks a
-// stable position (the model's already-emitted output, bytes fixed forever),
-// so the next request's 20-block lookback finds this entry and reads the
-// cached prefix instead of re-paying for the full history. cache_control is
-// request-time-only metadata; we don't carry it on the persisted Message
-// struct (which would corrupt the wire-faithful schema for JSONL replay).
+// Marks the last assistant turn, whose bytes never change, so the next request's
+// 20-block lookback hits the cached prefix. Request-time only, never persisted.
 fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Value> {
     let breakpoint_idx = messages.iter().rposition(|m| m.role == "assistant");
     messages
@@ -545,17 +513,14 @@ fn messages_with_floating_breakpoint(messages: &[Message]) -> Vec<serde_json::Va
             let mut content: Vec<serde_json::Value> = msg
                 .content
                 .iter()
-                // The API emits empty text blocks (around citation splits) but
-                // rejects them on input, so drop them here rather than at ingest:
-                // stored sessions stay wire-faithful and still replay.
+                // The API emits empty text blocks but rejects them on input;
+                // dropped here so stored sessions stay wire-faithful.
                 .filter(|b| !matches!(b, ContentBlock::Text { text } if text.is_empty()))
                 .map(|b| serde_json::to_value(b).expect("ContentBlock always serializes"))
                 .collect();
             if Some(i) == breakpoint_idx {
-                // cache_control is rejected on thinking/redacted_thinking
-                // blocks, and whether server tool or code-execution blocks
-                // accept it is undocumented, so walk back to the last block
-                // of a type known to take the marker.
+                // cache_control is rejected on thinking blocks and undocumented
+                // on server-tool blocks, so use the last block known to take it.
                 if let Some(last_idx) = content.iter().rposition(|v| {
                     matches!(
                         v.get("type").and_then(|t| t.as_str()),

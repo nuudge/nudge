@@ -21,14 +21,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // --list is a standalone read-only action: print this project's sessions and exit,
-    // touching no session and needing no API key.
+    // --list and --connect run before `run::host`: they need no API key or session.
     if cli.list {
         return sessions::print_sessions();
     }
 
-    // --connect owns no session: it just attaches a TUI to a running daemon, so it
-    // needs neither an API key nor any of the session setup in `run::host`.
     if cli.connect {
         return run::connect::run(cli).await;
     }

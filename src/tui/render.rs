@@ -23,10 +23,8 @@ impl App {
             match entry {
                 LogEntry::Blank => out.push(Line::from("")),
                 LogEntry::User { text, sender } => {
-                    // Own turns render as "> "; another party's turns are prefixed
-                    // with their name so a shared session stays legible. An empty
-                    // sender (a pre-sender log entry replayed unattributed) renders
-                    // as a plain own-style turn rather than a stray " > ".
+                    // An empty sender (an unattributed replayed entry) renders as an own
+                    // turn rather than a stray " > ".
                     let prefix = if sender.is_empty() || *sender == self.self_name {
                         "> ".to_string()
                     } else {
@@ -173,9 +171,6 @@ impl App {
     // dark-on-light, so a light-on-dark terminal would otherwise invert it.
     fn pair_panel_body(&self, inner_width: usize) -> Vec<Line<'static>> {
         let mut out = Vec::new();
-        // Which pairing is on screen: full-access confers full control, watch-only lets
-        // a teammate observe but not drive, agent-peer lets a remote nudge session
-        // /connect-peer into a mutual, unsupervised edge.
         let (label, scan_hint) = match self.pair_scope {
             PairScope::Full => (
                 "full-access — full control",
@@ -214,7 +209,6 @@ impl App {
             }
         }
         out.push(Line::from(""));
-        // Offer the `w` cycle only when another dialed leg exists to flip to.
         let footer = if let Some(next) = self.next_pairing_scope() {
             format!(
                 "{scan_hint} · w = {} · Enter = foreground · Ctrl-C = quit",
@@ -272,16 +266,15 @@ impl App {
         let total_input_lines = input_rows.len();
         let visible_input_lines = total_input_lines.clamp(1, MAX_INPUT_LINES);
         let input_height = (visible_input_lines as u16) + 2;
-        // Scroll follows the cursor: keep it on the last visible row when below the
-        // window, never past the end. Typing at the end still bottom-pins as before.
+        // Scroll keeps the cursor on the last visible row when below the window.
         let max_scroll = total_input_lines.saturating_sub(MAX_INPUT_LINES);
         let input_scroll = cursor_row
             .saturating_sub(MAX_INPUT_LINES - 1)
             .min(max_scroll) as u16;
         self.input_view_width = input_inner_width;
 
-        // Once the relay connects, /background swaps the input box for the QR panel; the
-        // log shrinks (Min(0)) rather than being taken over. Else a short banner.
+        // The QR panel replaces the input box; the log shrinks (Min(0)) rather than
+        // being taken over.
         let show_qr = self.mode == Mode::Background
             && self.visible_pairing_qr().is_some()
             && matches!(self.handoff_status, Some(HandoffStatus::Connected));

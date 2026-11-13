@@ -41,10 +41,8 @@ pub async fn run_agent<P: Provider, B: Backend>(
     io: AgentIo,
 ) -> Result<()> {
     let result = run_loop(cfg, provider, backend, &mut session, initial_messages, io).await;
-    // The single graceful-teardown seam: every way the loop winds down — quit,
-    // input channels closing, a loop error — funnels through this return. Only a
-    // process crash skips it, honestly leaving the row 'running' (last_activity
-    // is the staleness signal then).
+    // Every graceful wind-down funnels through here; only a crash skips it, leaving the
+    // row 'running' with last_activity as the staleness signal.
     let ended = session.end();
     result.and(ended)
 }
@@ -68,13 +66,10 @@ async fn run_loop<P: Provider, B: Backend>(
         multi_driver,
     } = io;
     let mut messages: Vec<Message> = initial_messages;
-    // Index of `messages` after the last completed turn. On API error mid-turn we roll
-    // back here so the next turn lands on a valid alternating-role boundary (the API
-    // rejects consecutive user turns, or a tool_use turn missing its tool_results).
+    // Rollback point on a mid-turn API error: the API rejects consecutive user turns and
+    // tool_use turns missing their tool_results.
     let mut last_good_snapshot: usize = messages.len();
 
-    // Last (model, git_branch, name, auto) emitted as SessionInfo, so we only re-emit on
-    // an actual change (a /model switch, a `git checkout`, a /session-rename, an /auto).
     let mut last_session_ctx = (
         cfg.model.clone(),
         backend.git_branch(),
@@ -82,7 +77,6 @@ async fn run_loop<P: Provider, B: Backend>(
         session.auto,
     );
 
-    // OUTER loop: one iteration per user turn.
     // A coalesce over-read stashes one input here; the next turn consumes it first.
     let mut pending_input: Option<LoopInput> = None;
     let mut last_context_cleared: Option<String> = None;
@@ -106,10 +100,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     reg = recv_registration(&mut peer_register_rx) => {
                         match reg {
                             Some(reg) => {
-                                // Fired only for runtime edges (a /connect-peer forward
-                                // edge, or an inbound remote dialer's reverse edge) — so
-                                // this Notice resolves the "connecting…" line on both
-                                // sides and names the peer.
+                                // Resolves the "connecting…" line on both sides.
                                 let name = reg.who.name.clone();
                                 peers.register(reg);
                                 let _ = agent_tx
@@ -127,8 +118,6 @@ async fn run_loop<P: Provider, B: Backend>(
                     }
                     (pid, ev) = peers.recv() => {
                         let roster_before = peers.roster();
-                        // A supervised peer's check-in comes back here and is decided by
-                        // one steering inference over this agent's own transcript.
                         if let supervision::Observed::CheckIn(checkin) =
                             supervise_peer_event(&mut peers, &agent_tx, pid, ev).await
                         {
@@ -147,7 +136,6 @@ async fn run_loop<P: Provider, B: Backend>(
                             )
                             .await?;
                         }
-                        // A disconnected peer was reaped above — re-advertise the roster.
                         if peers.roster() != roster_before {
                             let _ = agent_tx
                                 .send(capabilities_event(&cfg, &backend, &peers))
@@ -183,10 +171,8 @@ async fn run_loop<P: Provider, B: Backend>(
             }
         };
 
-        // Coalesce consecutive same-sender user messages already queued: a peer that
-        // fires several messages in a row is digested in one turn, not N (same info to
-        // the model, fewer tokens). Only what's already waiting is drained; the first
-        // non-mergeable input is stashed for the next turn.
+        // Coalesce already-queued messages from the same sender into one turn (fewer
+        // tokens); the first non-mergeable input is stashed for the next turn.
         loop {
             match ui_rx.try_recv() {
                 Ok((w, UiEvent::UserMessage { text })) if same_sender(&w, &who) => {
@@ -201,8 +187,7 @@ async fn run_loop<P: Provider, B: Backend>(
             }
         }
 
-        // The log stores the clean text + sender; the model-facing transcript gets
-        // the attributed form, derived here at build time (and again on resume).
+        // The log stores clean text + sender; only the model-facing copy is attributed.
         messages.push(Message {
             role: "user".into(),
             content: vec![ContentBlock::Text { text: user_text }],
@@ -214,19 +199,13 @@ async fn run_loop<P: Provider, B: Backend>(
             multi_driver.load(std::sync::atomic::Ordering::Relaxed),
         );
 
-        // INNER loop: model + tool turns until non-tool-use stop.
         // A pause_turn during server-side code execution must resume in the same
         // container; a paused response may not repeat its id, so keep the latest.
         let mut container: Option<String> = None;
         let mut resuming_pause = false;
         for iteration in 0..cfg.max_iterations {
             let (mut tools, tool_cache_boundary) = backend.tool_schemas();
-            // Loop-level peer tools ride after the backend's array (never inside the
-            // cached stable prefix); offered per capability (factory / held peers).
             tools.extend(peer_tools::schemas(&peers, &peer_factory, auto));
-            // The peer roster rides as a trailing, uncached system block after the
-            // backend's volatile env breakpoint, so the model knows whom it can address
-            // and a peer joining/leaving never busts the cached stable prefix.
             let mut system = backend.system_blocks();
             if let Some(text) = peer_tools::roster_system_text(&peers) {
                 system.push(crate::llm::SystemBlock { text, cache: false });
@@ -404,7 +383,6 @@ async fn run_loop<P: Provider, B: Backend>(
                 auto,
             )
             .await;
-            // A Spawn/DismissPeer in the batch changed the roster — re-advertise it.
             if peers.roster() != roster_before {
                 let _ = agent_tx
                     .send(capabilities_event(&cfg, &backend, &peers))
@@ -412,8 +390,7 @@ async fn run_loop<P: Provider, B: Backend>(
             }
             messages.push(assistant_msg);
 
-            // After a denial, pause for fresh user guidance that rides along in the
-            // same tool_results turn, so the model sees "denied — try this" in one step.
+            // After a denial, wait for guidance and send it in the same tool_results turn.
             let mut guidance_sender: Option<ClientIdentity> = None;
             if denied {
                 let _ = agent_tx.send(AgentEvent::TurnComplete).await;
@@ -460,10 +437,8 @@ async fn run_loop<P: Provider, B: Backend>(
                             )
                             .await;
                         }
-                        // Quit here drops any entries staged this turn (the tool_use
-                        // assistant + earlier iterations). That's intentional, not a
-                        // leak: the turn never committed, so on resume strict truncation
-                        // would have discarded those trailing entries anyway.
+                        // Dropping this turn's uncommitted staged entries is fine: resume
+                        // truncation would discard them anyway.
                         (_, UiEvent::Quit) => return Ok(()),
                         (_, UiEvent::PermissionResponse { .. }) => {}
                     }
@@ -483,9 +458,7 @@ async fn run_loop<P: Provider, B: Backend>(
             messages.push(user_msg);
 
             if iteration == cfg.max_iterations - 1 {
-                // Close the maxed-out turn on a valid alternating-role boundary —
-                // otherwise it ends on user(tool_results) and the next user turn would
-                // be two consecutive user turns, which the API rejects.
+                // End on an assistant turn: two consecutive user turns are rejected.
                 let notice = format!(
                     "I've reached the iteration limit ({}) for this turn. The work above is partial. Tell me how you'd like to proceed, or reply 'continue' to resume.",
                     cfg.max_iterations
@@ -504,10 +477,8 @@ async fn run_loop<P: Provider, B: Backend>(
                 last_good_snapshot = messages.len();
                 session.commit()?;
                 let _ = agent_tx.send(AgentEvent::MaxIterations).await;
-                // A subagent's parent is the only party that can send 'continue', and
-                // Notices never reach its model — report up the return edge (the same
-                // path a MessagePeer takes), so the spawner is woken to steer instead
-                // of the child stalling until a human notices.
+                // Notices never reach a spawner's model, so wake it with a message or
+                // the child stalls until a human notices.
                 if let Some(spawner) = peers.spawner_id() {
                     peers
                         .drive(
@@ -537,8 +508,7 @@ async fn run_loop<P: Provider, B: Backend>(
     }
 }
 
-// Whether two message senders are the same driver — the coalesce key. Two
-// unstamped (None) senders are treated as one; otherwise names must match.
+// Two unstamped (None) senders count as the same.
 fn same_sender(a: &Option<ClientIdentity>, b: &Option<ClientIdentity>) -> bool {
     match (a, b) {
         (Some(x), Some(y)) => x.name == y.name,
@@ -547,10 +517,6 @@ fn same_sender(a: &Option<ClientIdentity>, b: &Option<ClientIdentity>) -> bool {
     }
 }
 
-// The Capabilities event, assembled from the static command grammar, the resolved
-// model catalog, the backend's live MCP catalog, and the held peer roster.
-// Re-emitted when the surface changes (MCP load/unload, peer change) so clients
-// re-render menus.
 fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B, peers: &PeerSet) -> AgentEvent {
     AgentEvent::Capabilities {
         commands: command_catalog(),
@@ -560,9 +526,6 @@ fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B, peers: &PeerSe
     }
 }
 
-// Execute one parsed `/…` command against the loop's state. Results ride back as
-// Notice/SessionInfo/Capabilities events — the same shape a human, a --connect TUI,
-// and the phone all see, since the parse lives here rather than in any front-end.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_command<P: Provider, B: Backend>(
     line: &str,
@@ -580,8 +543,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
     auto: &mut bool,
 ) {
     match command::parse(line) {
-        // Auto mode delegates through Spawn, so an agent that cannot spawn (a subagent)
-        // has nothing to turn on.
+        // Auto mode delegates through Spawn, so a session that cannot spawn can't use it.
         Command::Auto => {
             let text = if peer_factory.is_none() {
                 "auto mode is not available in this session (it cannot spawn subagents)"
@@ -632,14 +594,11 @@ async fn dispatch_command<P: Provider, B: Backend>(
         Command::Rename(requested) => {
             let branch = backend.git_branch();
             let name = match requested {
-                // Tier 1: explicit name, used verbatim (trimmed).
                 Some(n) if !n.trim().is_empty() => n.trim().to_string(),
-                // Tier 2: inside a git repo, branch + a short id so two sessions on
-                // the same branch don't share a label.
+                // The short id keeps two sessions on the same branch distinct.
                 _ => match &branch {
                     Some(b) => format!("{}-{}", b, short_id(&session.id)),
-                    // Tier 3: no repo — ask the model for a title. Awaited inline to
-                    // keep the loop future `Send`.
+                    // Awaited inline to keep the loop future `Send`.
                     None => match title_prompt(messages) {
                         Some(prompt) => {
                             let probe = [Message {
@@ -673,8 +632,6 @@ async fn dispatch_command<P: Provider, B: Backend>(
         Command::Mcp(mcp) => {
             let text = backend.handle_mcp(&mcp, agent_tx).await;
             let _ = agent_tx.send(AgentEvent::Notice { text }).await;
-            // A load/unload mutates the tool surface — re-advertise the catalog. A
-            // bare list doesn't change anything, so it doesn't.
             if matches!(mcp, McpCommand::Load(_) | McpCommand::Unload(_)) {
                 let _ = agent_tx.send(capabilities_event(cfg, backend, peers)).await;
             }
@@ -717,11 +674,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 })
                 .await;
         }
-        // Dial a remote peer over the relay. Human-only (no model tool) and never
-        // blocks the loop: hand the code to the injected dialer and spawn it — the
-        // finished forward edge arrives via `peer_register_rx`, and the reverse edge
-        // (the far side driving us) attaches to our own broker. A failure comes back
-        // as a Notice from the spawned task.
+        // Spawned so the dial never blocks the loop; the edge arrives via `peer_register_rx`.
         Command::ConnectPeer(code) => {
             if code.trim().is_empty() {
                 let _ = agent_tx
@@ -764,12 +717,8 @@ async fn dispatch_command<P: Provider, B: Backend>(
     }
 }
 
-// Rebuild the model-facing transcript from logged entries: the log stores clean
-// text + sender, and attribution is derived here exactly as the live path derives
-// it at arrival — including the multi-driver rule, derived from the persisted
-// senders themselves (two or more distinct names → a shared session, so human
-// senders are named throughout). Pre-sender logs have `sender: None` (their text
-// may carry an already-baked prefix), which `attribute` leaves untouched.
+// Multi-driver is inferred from the persisted senders. Old logs have `sender: None` with
+// any prefix already baked into the text, which `attribute` leaves untouched.
 pub fn resume_messages(entries: &[LoggedMessage]) -> Vec<Message> {
     let distinct: std::collections::HashSet<&str> = entries
         .iter()

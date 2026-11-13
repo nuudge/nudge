@@ -1,15 +1,8 @@
-//! The dormant tool catalog — servers that ship *with* the agent but stay
-//! disconnected until the user loads one (`/mcp load <name>`). Defined in code
-//! rather than a config file so the binary is self-contained: there's no file
-//! to embed or ship alongside an installed `nudge`. User-owned servers
-//! live in the project-local `.mcp.json` instead and connect at startup.
-//!
-//! Each entry yields the same `ServerSpec` the `.mcp.json` parser produces, so
-//! everything downstream (connect, route, schema) is origin-agnostic.
+//! Built-in dormant servers, defined in code so the binary needs no shipped
+//! config file.
 
 use super::{HttpAuth, ServerSpec, Transport};
 
-/// The built-in dormant servers, in stable name order.
 pub(super) fn dormant_catalog() -> Vec<ServerSpec> {
     vec![
         ServerSpec {
@@ -38,7 +31,7 @@ pub(super) fn dormant_catalog() -> Vec<ServerSpec> {
             ),
             transport: Transport::Http {
                 url: "https://gitlab.com/api/v4/mcp".into(),
-                // No client_id ⇒ dynamic client registration (no GCP-style setup).
+                // No client_id ⇒ dynamic client registration.
                 auth: HttpAuth::OAuth {
                     scopes: Vec::new(),
                     client_id: None,

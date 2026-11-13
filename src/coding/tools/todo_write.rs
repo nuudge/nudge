@@ -90,9 +90,6 @@ pub async fn execute(input: &Value) -> Result<String> {
         );
     }
 
-    // Echo the list back to the model. This is partly for verification (the
-    // model sees what was committed) and partly so the tool_result carries
-    // human-readable state into the TUI's collapsible result view.
     let mut out = String::from("Todos updated:\n");
     for (i, t) in parsed.todos.iter().enumerate() {
         let marker = match t.status.as_str() {

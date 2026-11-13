@@ -3,13 +3,8 @@ package io.gitlab.hongtao1207.nudge.protocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-// Cross-language interop. This sealed frame was produced by the Rust crate
-// (transport::encryption::Cipher::seal over a serde_json ServerFrame) under a known
-// all-0x07 key. Proving the Kotlin client both opens AND parses it closes the one
-// interop risk the Kotlin-only round-trips can't: that lazysodium and dryoc agree on
-// the XSalsa20-Poly1305 secretbox wire format (nonce ‖ MAC ‖ ciphertext), and that
-// kotlinx parses serde's external tagging byte-for-byte. Regenerate the vector with
-// `cargo test print_interop_vector -- --nocapture` in the nudge crate.
+// Vector sealed by the Rust crate under an all-0x07 key; proves lazysodium and dryoc agree.
+// Regenerate with `cargo test print_interop_vector -- --nocapture`.
 class CryptoInteropTest {
     private fun hex(s: String) = ByteArray(s.length / 2) {
         s.substring(it * 2, it * 2 + 2).toInt(16).toByte()

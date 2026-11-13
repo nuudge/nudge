@@ -1,14 +1,5 @@
-// The transport layer, layered over `core`. It puts the in-memory session model
-// (the broker's `Controller`/event stream from `core`) onto a wire so a front-end
-// in another process can drive a session. `wire` holds the framed protocol plus a
-// transport-agnostic frame seam (`FrameReader`/`FrameWriter`) with two codecs —
-// the newline-JSON `Line*` codec for a local Unix socket and the `Ws*` codec for a
-// relayed WebSocket. `daemon` is the server side (the relay dial-out host that backs
-// both the normal session's `/background` handoff and `--daemon`, plus a standalone
-// Unix-socket daemon kept for local debugging) and `client` the `SocketClient` /
-// `RelayClient` that reconstruct a `Controller`. `encryption` seals frames for the
-// relayed path; `pairing` mints/encodes the QR code that carries the relay address,
-// rendezvous id, and E2E key to a device. Depends on `core`; `core` never depends on it.
+// Puts `core`'s session model onto a wire so a front-end in another process can
+// drive it. Depends on `core`; `core` never depends on it.
 pub mod client;
 pub mod daemon;
 pub mod encryption;

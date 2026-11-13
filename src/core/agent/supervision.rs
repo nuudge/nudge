@@ -4,8 +4,7 @@ use crate::core::events::{AgentEvent, ControllerEvent};
 use crate::core::identity::{ClientIdentity, ClientKind};
 use crate::core::peer::{PeerId, PeerRegistration, PeerSet};
 
-// Await the next peer handed in at runtime; pend forever once the registrar is gone
-// (or was never wired), so the loop's select arm stays quiet for a peerless session.
+// Pends forever without a registrar, so the select arm stays quiet for a peerless session.
 pub(super) async fn recv_registration(
     rx: &mut Option<mpsc::UnboundedReceiver<PeerRegistration>>,
 ) -> Option<PeerRegistration> {
@@ -15,14 +14,8 @@ pub(super) async fn recv_registration(
     }
 }
 
-// Fold the broker-stamped sender into the text that enters the transcript. An agent
-// peer's message is always named, so the model knows which peer spoke. A human's
-// message is named only in a multi-driver session (`multi`: two or more distinct
-// driving senders have connected) — a solo session stays bare, exactly as it always
-// has, while a shared session lets the model tell its drivers apart and address a
-// reply. Keep the prefix formats stable — the model learns to reference them.
-// Applied at payload-build time (live arrival and resume rebuild); the session log
-// stores the clean text plus the sender (see `session::LoggedMessage`).
+// Humans are named only in multi-driver sessions; agents always. Keep the prefix formats
+// stable — the model learns to reference them. The session log stores the clean text.
 pub(super) fn attribute(who: Option<&ClientIdentity>, text: String, multi: bool) -> String {
     match who {
         Some(w) if w.kind == ClientKind::Agent => {
@@ -35,8 +28,6 @@ pub(super) fn attribute(who: Option<&ClientIdentity>, text: String, multi: bool)
     }
 }
 
-// Apply `attribute` to a logged user message's typed text blocks (tool_result
-// blocks are untouched) — the model-facing form of a clean logged entry.
 pub(super) fn attribute_message(
     who: Option<&ClientIdentity>,
     msg: &mut crate::llm::Message,
@@ -49,16 +40,12 @@ pub(super) fn attribute_message(
     }
 }
 
-// The outcome of observing one peer event: most are fully handled here (Notices,
-// reaping, digest recording); a supervised peer's permission check-in is returned to
-// the loop, which runs a steering turn over its own transcript (`steering.rs`) —
-// that needs the whole loop state, which this module deliberately doesn't hold.
+// A check-in is returned rather than handled: steering needs the whole loop state.
 pub(super) enum Observed {
     Handled,
     CheckIn(CheckIn),
 }
 
-// A supervised peer's pending permission request, awaiting this agent's verdict.
 pub(super) struct CheckIn {
     pub pid: PeerId,
     pub tool_use_id: String,
@@ -66,13 +53,8 @@ pub(super) struct CheckIn {
     pub summary: String,
 }
 
-// Handle one event observed from a peer this agent drives: activity surfaces to this
-// agent's own front-end as a Notice (the watch substrate) and — for supervised peers
-// — accrues in the capped digest ring for the next steering check-in. A permission
-// request from a SUPERVISED peer becomes a `CheckIn` for the loop to steer; one from
-// an unsupervised peer is never answered by this agent (its own supervisor or a
-// human holds that decision — answering here would let e.g. a child rubber-stamp its
-// parent's gated calls via first-responder-wins).
+// Only a supervised peer's permission requests are answered here; answering others would
+// let e.g. a child rubber-stamp its parent's gated calls via first-responder-wins.
 pub(super) async fn supervise_peer_event(
     peers: &mut PeerSet,
     agent_tx: &mpsc::Sender<AgentEvent>,
@@ -108,9 +90,6 @@ pub(super) async fn supervise_peer_event(
                     summary,
                 })
             } else {
-                // Not mine to answer (the peer's own human holds that decision), and not
-                // mine to narrate either — an unsupervised peer's prompts are its own
-                // session's business, same as the rest of its activity.
                 Observed::Handled
             }
         }
@@ -118,13 +97,8 @@ pub(super) async fn supervise_peer_event(
             if let Some(line) = activity_line(&other) {
                 peers.record_activity(pid, &line);
             }
-            // Activity narration only for supervised children — it's the parent's live
-            // view of unattended work (no watch-mode for a child exists yet). An
-            // unsupervised peer's activity belongs to its own session and human;
-            // narrating it here floods this session's clients with another session's
-            // work (10 chatty peers = 10 transcripts' worth). Its conversation still
-            // arrives as MessagePeer turns, and errors are always surfaced (rare,
-            // significant).
+            // An unsupervised peer's activity belongs to its own session; narrating it
+            // would flood this session's clients. Errors are rare and always surfaced.
             let narrate =
                 peers.is_supervised(pid) || matches!(other, ControllerEvent::Error { .. });
             if narrate && let Some(text) = peer_notice(&name, &other) {
@@ -135,17 +109,12 @@ pub(super) async fn supervise_peer_event(
     }
 }
 
-// One digest line per meaningful peer event, for the steering check-in. Unprefixed —
-// the check-in header already names the peer; the ring in `PeerSet` enforces the
-// line/length caps.
+// Unprefixed: the check-in header already names the peer.
 fn activity_line(ev: &ControllerEvent) -> Option<String> {
     match ev {
         ControllerEvent::AssistantText { text } => Some(format!("said: {text}")),
-        // "requested", not "ran": ToolUseStart fires BEFORE the peer's permission
-        // gate, and a gated call's own start-line always lands as the digest's last
-        // entry for its own check-in — past tense would tell the steering model the
-        // very call it is judging already executed. Completion is what the "-> ok" /
-        // "-> error" result lines convey.
+        // "requested", not "ran": ToolUseStart fires before the peer's permission gate,
+        // so past tense would claim the very call being judged already executed.
         ControllerEvent::ToolUseStart {
             name: tool,
             summary,
@@ -165,10 +134,7 @@ fn activity_line(ev: &ControllerEvent) -> Option<String> {
     }
 }
 
-// Map a peer's observed event to a one-line Notice for this agent's front-end, or None
-// for the noisy/internal events (usage, session info, turn markers) that add no watch
-// value. Assistant text is clipped — the notice is a watch-glance, not the record (a
-// child's report arrives in full via MessagePeer).
+// Text is clipped: a notice is a glance, the full report arrives via MessagePeer.
 pub(super) fn peer_notice(name: &str, ev: &ControllerEvent) -> Option<String> {
     const NOTICE_CHARS_CAP: usize = 160;
     match ev {

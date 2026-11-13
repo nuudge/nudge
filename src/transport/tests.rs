@@ -1,11 +1,5 @@
-// End-to-end transport test: a real `SocketClient` driving a real broker over a
-// real Unix socket via the standalone daemon (`run_daemon`, the `--daemon --socket`
-// debug host). The broker has no agent loop behind it — events are injected directly
-// (see `spawn_bare_broker`) — so this exercises only the transport seam: framing, the
-// attach handshake, seq assignment + `after_seq` filtering, and the guest-quit-as-detach
-// rule. Broker-internal invariants (multi-attach fan-out, inbound merge,
-// first-responder permission, drop-reaping) are covered by the host unit tests; wire
-// framing by the wire tests.
+// End-to-end transport tests over a bare broker with events injected directly, so
+// only the transport seam is exercised; broker invariants live in the host tests.
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,18 +16,14 @@ use crate::core::{
     SessionHandle, UiEvent,
 };
 
-// A collision-free socket path under the system temp dir. The name is kept short
-// on purpose: a Unix socket path must fit in `sockaddr_un.sun_path` (104 bytes on
-// macOS), and the temp dir alone can be ~50, so a full UUID would overflow it.
+// Kept short: `sockaddr_un.sun_path` is 104 bytes on macOS and the temp dir alone
+// can be ~50, so a full UUID would overflow it.
 fn unique_socket_path() -> PathBuf {
     let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
     std::env::temp_dir().join(format!("ra-it-{token}.sock"))
 }
 
-// Open a fresh connection at the given resume cursor, failing loudly instead of
-// hanging if the daemon never accepts or refuses. The handoff server accepts one
-// connection at a time, so a reattach simply blocks until the previous connection's
-// detach lets the server loop back to `accept` — no busy/retry dance needed.
+// The serial server blocks a reattach until the previous detach frees `accept`.
 async fn attach_at(client: &SocketClient, after_seq: Option<u64>) -> Controller {
     timeout(
         Duration::from_secs(5),
@@ -67,14 +57,11 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
 
     let client = SocketClient::new(path.clone());
 
-    // Attach over the socket via the product path (`SessionHandle::attach`, full
-    // replay). The buffer is empty, so nothing replays yet.
     let mut a = client
         .attach(ClientIdentity::human("test"))
         .await
         .expect("initial attach");
 
-    // Two injected loop events buffer and stream live to A, in order.
     bb.agent_tx
         .send(AgentEvent::AssistantText { text: "one".into() })
         .await
@@ -86,14 +73,9 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
     expect_text(&mut a, "one").await;
     expect_text(&mut a, "two").await;
 
-    // Disconnect mid-session: dropping the controller sends a Detach frame; the
-    // session lives on headless. (The serial server returns from A's handler here,
-    // freeing it to accept the next connection.)
     drop(a);
 
-    // Reattach with a resume cursor: after_seq = Some(0) skips "one" (seq 0) and
-    // replays only "two" (seq 1) — the replay-from-seq correctness the roadmap calls
-    // out. Live events then continue on the same stream.
+    // after_seq = Some(0) skips "one" (seq 0) and replays only "two".
     let mut b = attach_at(&client, Some(0)).await;
     expect_text(&mut b, "two").await;
     bb.agent_tx
@@ -104,33 +86,25 @@ async fn socket_round_trip_replay_resume_and_guest_quit() {
         .unwrap();
     expect_text(&mut b, "three").await;
 
-    // A guest quit is a detach, not a kill: B's connection ends, but the session
-    // survives.
     b.ui_tx.send(UiEvent::Quit).await.unwrap();
     assert!(
         next_event(&mut b).await.is_none(),
         "a guest Quit must close the guest's connection"
     );
 
-    // Proof the session survived the guest quit: a fresh attach replays the whole
-    // history, "three" included.
+    // The session survived the guest quit: a fresh attach replays everything.
     let mut c = attach_at(&client, None).await;
     expect_text(&mut c, "one").await;
     expect_text(&mut c, "two").await;
     expect_text(&mut c, "three").await;
 
-    // Tear down the accept loop + broker and remove the socket file.
     drop(c);
     serve.abort();
     drop(bb);
     let _ = std::fs::remove_file(&path);
 }
 
-// A throwaway in-test relay: it accepts two WebSocket connections and pipes
-// messages between them verbatim, ignoring the rendezvous path (only one pair
-// exists here). Pairing-by-id, isolation, and the unpaired-waiter timeout are
-// covered by the relay binary's own tests; this exercises the *agent* side of the
-// WS transport — the `Ws*` codec, `RelayClient`, and the daemon's dial-out path.
+// Pipes the first two WebSocket connections together verbatim, ignoring the path.
 async fn spawn_test_relay() -> u16 {
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -139,8 +113,8 @@ async fn spawn_test_relay() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
-        // The daemon dials first (parks), the client second; upgrade each as it
-        // arrives so the daemon's handshake completes before the client connects.
+        // Upgrade each as it arrives so the daemon's handshake completes before the
+        // client connects.
         let (s1, _) = listener.accept().await.unwrap();
         let ws1 = accept_async(s1).await.unwrap();
         let (s2, _) = listener.accept().await.unwrap();
@@ -163,11 +137,6 @@ async fn spawn_test_relay() -> u16 {
     port
 }
 
-// A full session drives over the relay, plaintext: the daemon dials out and hosts
-// the broker, a `RelayClient` attaches through the relay, a loop event reaches the
-// client (daemon→client decode), a user message round-trips (client→daemon→echo),
-// and a remote Quit *detaches* the controller while the daemon keeps running — a
-// daemon ends only when its process stops, never because a controller left.
 #[tokio::test]
 async fn relay_round_trip_event_command_and_quit_detaches() {
     let port = spawn_test_relay().await;
@@ -191,15 +160,12 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
         .await
         .expect("relay attach");
 
-    // Injected loop event streams live to the client through the WS codec.
     bb.agent_tx
         .send(AgentEvent::AssistantText { text: "hi".into() })
         .await
         .unwrap();
     expect_text(&mut a, "hi").await;
 
-    // A user message goes client→daemon→broker; the broker echoes it back over the
-    // relay, proving both directions of the command path through the codec.
     a.ui_tx
         .send(UiEvent::UserMessage {
             text: "drive".into(),
@@ -211,8 +177,6 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
         other => panic!("expected echoed UserMessage, got {other:?}"),
     }
 
-    // Quit over the relay is a detach: the controller's stream closes, but the
-    // daemon survives (it re-dials for the next controller rather than returning).
     a.ui_tx.send(UiEvent::Quit).await.unwrap();
     assert!(
         next_event(&mut a).await.is_none(),
@@ -227,8 +191,7 @@ async fn relay_round_trip_event_command_and_quit_detaches() {
     bb.task.abort();
 }
 
-// Like `spawn_test_relay`, but records every Binary payload it forwards — so a test
-// can inspect exactly what the relay sees and prove it is opaque ciphertext.
+// Like `spawn_test_relay`, but records every Binary payload it forwards.
 async fn spawn_capturing_relay() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
     use futures::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
@@ -269,10 +232,8 @@ async fn spawn_capturing_relay() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<Ve
     (port, captured)
 }
 
-// The ciphertext-blind proof (8.2-e): drive a full session through the relay with a
-// distinctive plaintext marker in both directions, then assert every byte the relay
-// forwarded is opaque — no marker leaks, nothing deserializes as a protocol frame —
-// while still decrypting under the key (proving it's our ciphertext, not noise).
+// Every forwarded byte must hide the marker, fail to parse as a frame, and still
+// open under the key (so it's our ciphertext, not noise).
 #[tokio::test]
 async fn relay_sees_only_ciphertext() {
     const MARKER: &str = "TOP-SECRET-PLAINTEXT-MARKER";
@@ -298,7 +259,6 @@ async fn relay_sees_only_ciphertext() {
         .await
         .expect("relay attach");
 
-    // Send the marker each way: a loop event out, a user message in (echoed back).
     bb.agent_tx
         .send(AgentEvent::AssistantText {
             text: MARKER.into(),
@@ -317,8 +277,6 @@ async fn relay_sees_only_ciphertext() {
         other => panic!("expected echoed marker, got {other:?}"),
     }
 
-    // The round-trip is done and every marker-bearing frame has been forwarded and
-    // captured; a remote Quit no longer stops the daemon, so just abort the task.
     a.ui_tx.send(UiEvent::Quit).await.unwrap();
     assert!(
         next_event(&mut a).await.is_none(),
@@ -348,15 +306,10 @@ async fn relay_sees_only_ciphertext() {
     bb.task.abort();
 }
 
-// A role-aware test relay: pairs a `host`-role connection with a `client`-role one by
-// room id (path `<room>/<role>`), like the real relay binary. `spawn_test_relay` above
-// is fixed at two connections, so it can't exercise the daemon's spare-dial pool
-// serving *concurrent* clients — this can. A host spare parks with no timeout; a client
-// waits for a host; the party that parked owns the pump. Sending on the returned kill
-// switch drops every live pair at once (a forced network drop); parked spares survive.
+// Pairs `<room>/host` with `<room>/client` like the real relay, so concurrent clients
+// can be tested. The kill switch drops every live pair at once; parked spares survive.
 //
-// The handshake callback's `Err` type is tungstenite's large `ErrorResponse`, fixed by
-// its `Callback` trait (same as the real relay) — and we only ever return `Ok`.
+// The callback's `Err` type is fixed by tungstenite's `Callback` trait; we only return `Ok`.
 #[allow(clippy::result_large_err)]
 async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
     use futures::{SinkExt, StreamExt};
@@ -395,7 +348,6 @@ async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
                 let (room_id, role) = path.rsplit_once('/').unwrap();
                 let is_host = role == "host";
 
-                // Pair with a waiter in the opposite queue, or park in our own.
                 let rx = {
                     let mut map = rooms.lock().await;
                     let room = map.entry(room_id.to_string()).or_default();
@@ -406,7 +358,7 @@ async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
                     };
                     if let Some(tx) = opposite.pop() {
                         let _ = tx.send(ws);
-                        return; // paired; the parked partner runs the pump
+                        return; // the parked partner runs the pump
                     }
                     let (tx, rx) = oneshot::channel::<Ws>();
                     if is_host {
@@ -421,7 +373,6 @@ async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                // Pump verbatim until either side closes.
                 let mut killed = kill.subscribe();
                 let (mut at, mut ar) = ws.split();
                 let (mut bt, mut br) = partner.split();
@@ -444,11 +395,6 @@ async fn spawn_role_relay() -> (u16, tokio::sync::broadcast::Sender<()>) {
     (port, kill_tx)
 }
 
-// Two `RelayClient`s attach to one session concurrently over the role-aware relay: the
-// daemon parks a host spare, client A pairs, the daemon re-dials another spare, client B
-// pairs — and one injected event fans out to both. The end-to-end multi-attach-over-a-
-// transport proof the phase-2 plan left as a stretch, and the regression guard for
-// `issues/relay-single-remote-client.md`.
 #[tokio::test]
 async fn relay_two_clients_attach_concurrently() {
     let (port, _kill) = spawn_role_relay().await;
@@ -476,8 +422,6 @@ async fn relay_two_clients_attach_concurrently() {
     .await
     .expect("A attach timed out")
     .expect("A attach failed");
-    // B attaches to the SAME room while A is still attached — impossible before the fix
-    // (the relay was a one-shot pair and the daemon parked no second endpoint).
     let mut b = timeout(
         Duration::from_secs(5),
         client.attach(ClientIdentity::human("b")),
@@ -486,7 +430,6 @@ async fn relay_two_clients_attach_concurrently() {
     .expect("B attach timed out (second concurrent client)")
     .expect("B attach failed");
 
-    // One injected loop event fans out to both attached clients.
     bb.agent_tx
         .send(AgentEvent::AssistantText {
             text: "hi-all".into(),
@@ -507,12 +450,9 @@ async fn expect_notice(ctrl: &mut Controller, want: &str) {
     }
 }
 
-// A `--connect` TUI's relay connection is killed mid-session (a laptop sleep): the
-// client says so, redials the same pairing on its own, and resumes after the last
-// event it saw — the missed event arrives once, and nothing already seen replays (no
-// second SessionInfo/Capabilities, no re-prompt). A permission prompt seen before the
-// drop and answered during the outage still resolves through the new connection: the
-// broker matches answers by tool_use_id, from whichever controller sends them.
+// After a forced drop the client resumes past the last seen event, with no replay of
+// what it already had. A prompt answered during the outage still resolves, since the
+// broker matches answers by tool_use_id from any controller.
 #[tokio::test]
 async fn relay_client_reconnects_and_resumes_after_a_drop() {
     use crate::core::ModelInfo;
@@ -624,7 +564,6 @@ async fn relay_client_reconnects_and_resumes_after_a_drop() {
     bb.task.abort();
 }
 
-// An agent-kind identity for a peer session (what a session announces over the edge).
 fn agent_id(name: &str) -> ClientIdentity {
     ClientIdentity {
         kind: ClientKind::Agent,
@@ -634,12 +573,8 @@ fn agent_id(name: &str) -> ClientIdentity {
     }
 }
 
-// #60: both directed edges of a mutual peer pair ride ONE socket. Two bare brokers
-// (A's and B's), one relay, one socket. B parks an agent-scope leg that answers the
-// reverse-edge offer; A dials it. The forward peer (B) lands in A's PeerSet and the
-// return peer (A) lands in B's PeerSet — both through the #52 registrar, each named by
-// what the OTHER side announced — and all four half-channels work over the single
-// socket, before any command exists.
+// B parks an agent leg, A dials it; each lands in the other's PeerSet under the
+// name the other side announced, and all four half-channels work.
 #[tokio::test]
 async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
     let port = spawn_test_relay().await;
@@ -654,7 +589,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
     let who_a = agent_id("peer-a");
     let who_b = agent_id("peer-b");
 
-    // B is the acceptor: an agent leg that accepts the reverse-edge offer.
     let daemon = tokio::spawn(run_relay_daemon(
         vec![RelayLeg {
             dial_url: url.clone(),
@@ -668,7 +602,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         bb_b.handle.clone(),
     ));
 
-    // A dials B with the reverse-edge offer.
     let client = RelayClient::new(url.clone(), cipher.clone());
     timeout(
         Duration::from_secs(5),
@@ -678,8 +611,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
     .expect("dial_peer timed out")
     .expect("dial_peer failed");
 
-    // Both return edges arrive through the registrars, each named by the OTHER side's
-    // announced identity (never derived locally).
     let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
         .await
         .expect("A registrar timeout")
@@ -706,7 +637,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
     let id_b = peers_a.register(peer_b);
     let id_a = peers_b.register(peer_a);
 
-    // A observes B: an event injected into B's broker reaches A's held peer.
     bb_b.agent_tx
         .send(AgentEvent::AssistantText {
             text: "from-b".into(),
@@ -724,7 +654,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         other => panic!("A expected to observe B's text, got {other:?}"),
     }
 
-    // A drives B: a message driven to A's held peer reaches B's broker, stamped as A.
     peers_a
         .drive(
             id_b,
@@ -744,7 +673,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         other => panic!("B's loop expected A's drive, got {other:?}"),
     }
 
-    // B observes A: an event injected into A's broker reaches B's held peer.
     bb_a.agent_tx
         .send(AgentEvent::AssistantText {
             text: "from-a".into(),
@@ -762,7 +690,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         other => panic!("B expected to observe A's text, got {other:?}"),
     }
 
-    // B drives A: a message driven to B's held peer reaches A's broker, stamped as B.
     peers_b
         .drive(
             id_a,
@@ -787,9 +714,6 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
     bb_b.task.abort();
 }
 
-// #60 negative case: dialing a leg WITHOUT `peer_accept` (a plain full-scope leg, or an
-// old daemon that ignores the offer) must fail closed within the ReverseAttach timeout,
-// not hang — and register no forward peer. Proves the bounded-wait fallback.
 #[tokio::test]
 async fn dial_peer_without_return_edge_fails_closed() {
     let port = spawn_test_relay().await;
@@ -797,7 +721,6 @@ async fn dial_peer_without_return_edge_fails_closed() {
     let cipher = Cipher::generate();
 
     let bb = spawn_bare_broker(Vec::new());
-    // A plain full-scope leg: it admits the attach but offers no return edge.
     let daemon = tokio::spawn(run_relay_daemon(
         vec![RelayLeg {
             dial_url: url.clone(),
@@ -811,8 +734,6 @@ async fn dial_peer_without_return_edge_fails_closed() {
     let (reg_tx, mut reg_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let bb_dialer = spawn_bare_broker(Vec::new());
     let client = RelayClient::new(url, cipher);
-    // The outer timeout is generous vs. the internal ReverseAttach timeout: dial_peer
-    // must RETURN (with an error), never hang.
     let result = timeout(
         Duration::from_secs(20),
         client.dial_peer(bb_dialer.handle.clone(), reg_tx, agent_id("peer-a")),

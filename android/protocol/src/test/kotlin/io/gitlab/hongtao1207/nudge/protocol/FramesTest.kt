@@ -3,9 +3,7 @@ package io.gitlab.hongtao1207.nudge.protocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
-// These assertions pin the exact JSON bytes against serde's external tagging. If the
-// Rust enum reorders fields or renames a variant, an exact-string check here breaks
-// loudly — far better than a silent wire mismatch discovered on a real phone.
+// Exact-string checks pin the JSON bytes serde emits, so Rust-side drift fails here.
 class FramesTest {
     private inline fun <reified T> enc(s: kotlinx.serialization.KSerializer<T>, v: T) =
         WireJson.encodeToString(s, v)
@@ -17,9 +15,6 @@ class FramesTest {
 
     @Test
     fun clientFrameAttachStructVariant() {
-        // The attach frame carries the client's identity; these bytes pin serde's field
-        // order (after_seq, who) and ClientIdentity's shape (kind as a bare string, then
-        // name, session_id, task — nulls emitted, not omitted).
         val who = ClientIdentity.human("alice")
         assertEquals(
             """{"Attach":{"after_seq":null,"who":{"kind":"Human","name":"alice","session_id":null,"task":null}}}""",
@@ -53,8 +48,7 @@ class FramesTest {
             """{"Command":{"PermissionResponse":{"tool_use_id":"t1","allow":true}}}""",
             enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.PermissionResponse("t1", true))),
         )
-        // A slash-command line. Both the frame wrapper and the UiEvent are named
-        // "Command" (distinct enums), so the tag nests — this pins that exact shape.
+        // Frame wrapper and UiEvent are both named "Command", so the tag nests.
         assertEquals(
             """{"Command":{"Command":{"line":"/model x"}}}""",
             enc(ClientFrame.serializer(), ClientFrame.Command(UiEvent.Command("/model x"))),
@@ -142,9 +136,6 @@ class FramesTest {
 
     @Test
     fun capabilitiesDecodesAndRoundTrips() {
-        // Exact bytes serde emits for ControllerEvent::Capabilities — the field order
-        // (commands, models, mcp, peers) and the struct shapes are byte-pinned so a
-        // phone menu built from this can't silently drift from the daemon.
         val decoded = WireJson.decodeFromString(
             ServerFrame.serializer(),
             """{"Event":{"seq":1,"event":{"Capabilities":{"commands":[{"name":"/model","usage":"u"}],"models":[{"id":"id1","label":"L1"}],"mcp":[{"name":"gitlab","description":"d","loaded":false}],"peers":[{"name":"child-ab12cd34","kind":"Agent","supervised":true,"session_id":"s1","task":null}]}}}}""",
@@ -162,7 +153,6 @@ class FramesTest {
             decoded,
         )
 
-        // A dormant server with no blurb → description null (serde emits the key).
         val cap = ControllerEvent.Capabilities(
             listOf(CommandInfo("/mcp", "usage")),
             listOf(ModelInfo("m", "Model")),
@@ -171,7 +161,7 @@ class FramesTest {
         )
         assertEquals(cap, WireJson.decodeFromString(ControllerEvent.serializer(), enc(ControllerEvent.serializer(), cap)))
 
-        // A pre-peers daemon omits the field entirely → decodes as an empty roster.
+        // An older daemon omits `peers` entirely.
         val old = WireJson.decodeFromString(
             ControllerEvent.serializer(),
             """{"Capabilities":{"commands":[],"models":[],"mcp":[]}}""",
@@ -181,9 +171,6 @@ class FramesTest {
 
     @Test
     fun sessionInfoDecodesAndRoundTrips() {
-        // Exact bytes serde emits for ControllerEvent::SessionInfo (snake_case keys; the
-        // header is the only consumer, so a drift here would break the phone silently).
-        // A renamed session carries session_name; the header prefers it over the uuid.
         val named = WireJson.decodeFromString(
             ServerFrame.serializer(),
             """{"Event":{"seq":0,"event":{"SessionInfo":{"model":"claude-opus-4-8","cwd":"~/proj","git_branch":"main","session_id":"7f3a","session_name":"auth-fix","auto":true}}}}""",
@@ -193,16 +180,14 @@ class FramesTest {
             named,
         )
 
-        // git_branch and session_name are Option<String> in Rust → null when absent (no
-        // git repo / never renamed). serde emits the keys as null, not omitted.
+        // serde emits None as an explicit null key, not omitted.
         val bare = WireJson.decodeFromString(
             ControllerEvent.serializer(),
             """{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id","session_name":null,"auto":false}}""",
         )
         assertEquals(ControllerEvent.SessionInfo("m", "/tmp", null, "id", null, false), bare)
 
-        // A pre-field daemon (no session_name / auto keys) still decodes — the properties
-        // default to null and false.
+        // An older daemon omits session_name and auto.
         val legacy = WireJson.decodeFromString(
             ControllerEvent.serializer(),
             """{"SessionInfo":{"model":"m","cwd":"/tmp","git_branch":null,"session_id":"id"}}""",

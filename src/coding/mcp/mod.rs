@@ -1,18 +1,6 @@
-//! MCP (Model Context Protocol) client — Phase 7.
-//!
-//! Connects to external MCP servers — local **stdio** subprocesses or remote
-//! **Streamable HTTP** endpoints (optionally with a static bearer token) — and
-//! exposes their tools to the agent loop in the same shape as built-in tools.
-//! To the model, an MCP tool is indistinguishable from a native one; only the
-//! dispatch branch in `agent.rs` routes by name. Permission follows each tool's
-//! `readOnlyHint` annotation.
-//!
-//! Servers come from two origins with different load policies:
-//! - **User-specified** (`.mcp.json` in cwd) connect at startup and stay for the
-//!   session — part of the stable, cached tool prefix.
-//! - **Dormant** (the built-in [`catalog`]) are known but disconnected; the user
-//!   loads/unloads them mid-session (`/mcp load <name>`), which is the only
-//!   thing that changes the tool surface after startup.
+//! MCP client. User-specified servers (`.mcp.json`) connect at startup and stay
+//! in the cached tool prefix; dormant catalog servers load/unload mid-session,
+//! the only thing that changes the tool surface after startup.
 
 mod catalog;
 mod oauth;
@@ -37,48 +25,37 @@ use tokio::sync::mpsc;
 
 use crate::core::AgentEvent;
 
-/// Separator between the server namespace and the tool name. Double underscore
-/// because the Anthropic API restricts tool names to `^[a-zA-Z0-9_-]{1,64}$`,
-/// so `.` / `/` are not options.
+/// The API restricts tool names to `^[a-zA-Z0-9_-]{1,64}$`, so no `.` or `/`.
 const SEP: &str = "__";
 
-/// Project-local config filename, read from the session cwd.
 const CONFIG_FILE: &str = ".mcp.json";
 
-/// Name of the foundational meta-tool that lets the *model* connect a dormant
-/// server on demand (the model-driven counterpart to the user's `/mcp load`).
 pub const LOAD_TOOL_NAME: &str = "load_tool";
 
-/// A server to connect to, parsed from `.mcp.json` or the dormant [`catalog`].
 pub struct ServerSpec {
     pub name: String,
-    /// One-line capability blurb shown to the model in the `load_tool` schema so
-    /// it can decide what to pull in. Only set for dormant-catalog entries;
-    /// `None` for user-specified servers (those load at startup, not on request).
+    /// Shown to the model in the `load_tool` schema; only set for dormant entries.
     pub description: Option<String>,
     pub transport: Transport,
 }
 
-/// How to reach a server.
 pub enum Transport {
-    /// Local subprocess; client launches it and talks over stdin/stdout.
     Stdio {
         command: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
     },
-    /// Remote Streamable HTTP endpoint.
-    Http { url: String, auth: HttpAuth },
+    Http {
+        url: String,
+        auth: HttpAuth,
+    },
 }
 
-/// How a remote HTTP server is authenticated.
 pub enum HttpAuth {
-    /// Optional static `Authorization` header value (e.g. `Bearer <token>`).
+    /// Full `Authorization` header value, if any.
     Static(Option<String>),
-    /// OAuth 2.0 authorization-code flow (PKCE). Empty `scopes` lets the server
-    /// select them. Tokens are obtained interactively once, then persisted.
-    /// `client_id` present ⇒ pre-registered client (e.g. Google, which doesn't
-    /// support dynamic registration); absent ⇒ dynamic client registration.
+    /// Empty `scopes` lets the server choose. No `client_id` ⇒ dynamic client
+    /// registration (Google and others require a pre-registered client).
     OAuth {
         scopes: Vec<String>,
         client_id: Option<String>,
@@ -86,46 +63,33 @@ pub enum HttpAuth {
     },
 }
 
-/// `.mcp.json` shape — matches Claude Code / Claude Desktop's `mcpServers` block
-/// for paste-compatibility. A `BTreeMap` gives deterministic (sorted) server
-/// order, which keeps the merged `tools` array stable for prompt caching.
+/// Matches Claude Code's `mcpServers` block for paste-compatibility. BTreeMap
+/// keeps server order, and so the cached tool array, deterministic.
 #[derive(Deserialize)]
 struct ConfigFile {
     #[serde(rename = "mcpServers", default)]
     mcp_servers: BTreeMap<String, ServerEntry>,
 }
 
-/// One entry. `command` ⇒ stdio; `url` ⇒ remote HTTP. Fields are optional so a
-/// single shape covers both transports.
+/// `command` ⇒ stdio; `url` ⇒ remote HTTP.
 #[derive(Deserialize)]
 struct ServerEntry {
-    // stdio
     command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
-    // http
     url: Option<String>,
-    /// Literal bearer token (convenient, but avoid committing secrets).
     token: Option<String>,
-    /// Name of an env var holding the bearer token — preferred for secrets.
     token_env: Option<String>,
-    /// Auth mode for an http server: `"oauth"` runs the OAuth flow; anything
-    /// else (or absent) uses the static token above.
+    /// `"oauth"` runs the OAuth flow; anything else uses the static token.
     auth: Option<String>,
-    /// OAuth scopes to request (optional; empty lets the server choose).
     #[serde(default)]
     scopes: Vec<String>,
-    /// Pre-registered OAuth client id (e.g. a Google Cloud web-app client).
-    /// When set, skips dynamic client registration.
     client_id: Option<String>,
-    /// Env var holding the pre-registered client secret (kept out of the file).
     client_secret_env: Option<String>,
 }
 
-/// Load server specs from a project-local `.mcp.json` in `cwd`. A missing file
-/// is not an error — MCP is opt-in per project, so we return an empty list.
 pub fn load_config(cwd: &Path) -> Result<Vec<ServerSpec>> {
     let path = cwd.join(CONFIG_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -142,7 +106,7 @@ pub fn load_config(cwd: &Path) -> Result<Vec<ServerSpec>> {
 }
 
 fn entry_to_spec(name: String, e: ServerEntry) -> Result<ServerSpec> {
-    // `url` wins if both are set; otherwise fall back to stdio `command`.
+    // `url` wins if both are set.
     let transport = if let Some(url) = e.url {
         let auth = if e.auth.as_deref() == Some("oauth") {
             let client_secret =
@@ -186,12 +150,8 @@ fn entry_to_spec(name: String, e: ServerEntry) -> Result<ServerSpec> {
     })
 }
 
-/// All servers share the no-op `()` client handler, so the running-service type
-/// is concrete — no `into_dyn()` needed for the single-handler case.
 type Client = RunningService<RoleClient, ()>;
 
-/// Which origin/load-policy a connected server belongs to. Only `Dormant`
-/// servers can be unloaded; user-specified ones live for the whole session.
 #[derive(Clone, Copy, PartialEq)]
 enum Layer {
     UserSpecified,
@@ -201,38 +161,28 @@ enum Layer {
 struct ServerConn {
     layer: Layer,
     client: Client,
-    /// Pre-built, namespaced, Anthropic-shaped tool schemas for this server.
     schemas: Vec<Value>,
 }
 
-/// Where a namespaced tool lives and whether it's safe to auto-run.
 struct Route {
-    /// Key into `servers` — the server's (raw) name. A name key, not a Vec
-    /// index, so unloading a server doesn't invalidate other tools' routes.
+    /// A name key, not an index, so unloading a server doesn't invalidate other routes.
     server: String,
-    /// Original (un-namespaced) tool name on the server.
+    /// Un-namespaced tool name on the server.
     tool: String,
-    /// From the server's `readOnlyHint` annotation — auto-allow if true.
     read_only: bool,
 }
 
 pub struct McpRegistry {
-    /// server name -> connection
     servers: BTreeMap<String, ServerConn>,
-    /// namespaced tool name -> route
+    /// Keyed by namespaced tool name.
     routes: HashMap<String, Route>,
-    /// The built-in dormant catalog, keyed by server name — parsed but not
-    /// connected until loaded on demand.
     dormant: BTreeMap<String, ServerSpec>,
-    /// Human-readable connect outcomes, emitted by the caller before the TUI starts.
+    /// Emitted by the caller before the TUI starts.
     pub connect_log: Vec<String>,
 }
 
 impl McpRegistry {
-    /// Connect the user-specified servers (from `.mcp.json`) and stage the
-    /// built-in dormant catalog (parsed, not connected). A failed connection is
-    /// logged and skipped — the agent still runs with built-in tools (graceful
-    /// degradation). Dormant servers connect later via [`load`](Self::load).
+    /// A failed connection is logged and skipped so the agent still runs.
     pub async fn bootstrap(user_specs: &[ServerSpec]) -> Self {
         let mut reg = Self {
             servers: BTreeMap::new(),
@@ -259,9 +209,6 @@ impl McpRegistry {
         reg
     }
 
-    /// Register an already-connected server: namespace its tools, build their
-    /// schemas, and install routes. Returns the tool count. Pure mutation — no
-    /// I/O — so it borrows `&mut self` without holding any spec borrow.
     fn register(&mut self, name: &str, layer: Layer, client: Client, tools: &[Tool]) -> usize {
         let prefix = sanitize(name);
         let mut schemas = Vec::with_capacity(tools.len());
@@ -294,9 +241,7 @@ impl McpRegistry {
         tools.len()
     }
 
-    /// Connect a dormant server by name. Errors if the name is unknown to the
-    /// catalog or already connected. `notify` carries the OAuth authorize URL
-    /// out to the TUI when an interactive auth flow is triggered mid-session.
+    /// `notify` carries an OAuth authorize URL out to the TUI.
     pub async fn load(
         &mut self,
         name: &str,
@@ -316,8 +261,6 @@ impl McpRegistry {
         Ok(self.register(name, Layer::Dormant, client, &tools))
     }
 
-    /// Disconnect a dormant server by name. Dropping the `ServerConn` closes the
-    /// transport / kills the subprocess. Refuses to unload user-specified servers.
     pub fn unload(&mut self, name: &str) -> Result<()> {
         match self.servers.get(name) {
             None => return Err(anyhow!("server '{name}' is not loaded")),
@@ -333,8 +276,6 @@ impl McpRegistry {
         Ok(())
     }
 
-    /// One line per server: loaded user-specified, loaded dormant, then dormant
-    /// servers still available to load. For the `/mcp` listing.
     pub fn status_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (name, conn) in &self.servers {
@@ -358,12 +299,9 @@ impl McpRegistry {
         lines
     }
 
-    /// The MCP catalog for capability discovery: every dormant server (with its
-    /// blurb + loaded state) plus any loaded user-specified server. Sorted, stable
-    /// order so clients render a steady menu. `(name, description, loaded)`.
+    /// `(name, description, loaded)`, in stable order so clients render a steady menu.
     pub fn catalog(&self) -> Vec<(String, Option<String>, bool)> {
         let mut out = Vec::new();
-        // Loaded user-specified servers (from .mcp.json) aren't in the dormant catalog.
         for (name, conn) in &self.servers {
             if conn.layer == Layer::UserSpecified {
                 out.push((name.clone(), None, true));
@@ -379,13 +317,8 @@ impl McpRegistry {
         out
     }
 
-    /// Schema for the `load_tool` meta-tool. The dormant catalog (name +
-    /// description) is baked into the tool's `description`, so the model knows
-    /// what it can pull in without a separate discovery round-trip. The catalog
-    /// is compile-time-fixed and `dormant` iterates in sorted order, so this
-    /// schema is byte-stable across the session — it stays a foundational,
-    /// cached tool even as servers load/unload (loading mutates `servers`, not
-    /// `dormant`). Returns `None` when the catalog is empty (nothing to load).
+    /// Byte-stable across the session (built from the fixed, sorted `dormant`
+    /// map, not `servers`), so it stays in the cached tool prefix.
     pub fn load_tool_schema(&self) -> Option<Value> {
         if self.dormant.is_empty() {
             return None;
@@ -419,14 +352,10 @@ impl McpRegistry {
         }))
     }
 
-    /// Schemas for always-on servers (user-specified) — the stable, cached
-    /// prefix. Kept separate from [`dormant_schemas`](Self::dormant_schemas) so
-    /// the agent can place a cache breakpoint at the boundary between them.
     pub fn always_on_schemas(&self) -> Vec<Value> {
         self.schemas_for(Layer::UserSpecified)
     }
 
-    /// Schemas for currently-loaded dormant servers — the dynamic tail.
     pub fn dormant_schemas(&self) -> Vec<Value> {
         self.schemas_for(Layer::Dormant)
     }
@@ -443,18 +372,13 @@ impl McpRegistry {
         self.routes.contains_key(name)
     }
 
-    /// Whether an MCP tool should prompt for permission. Tools the server marks
-    /// `readOnlyHint` auto-allow; everything else (incl. unhinted tools) gates.
-    /// NOTE: annotations come from the (untrusted) server — a hostile server
-    /// could under-report a destructive tool as read-only. Per-server trust is
-    /// the stronger control; this is the ergonomic default. See [[mcp]] tool-safety.
+    /// `readOnlyHint` comes from an untrusted server, which could under-report a
+    /// destructive tool; unhinted tools gate.
     pub fn requires_permission(&self, name: &str) -> bool {
         self.routes.get(name).map(|r| !r.read_only).unwrap_or(true)
     }
 
-    /// Invoke a namespaced MCP tool. Flattens the result's text content to a
-    /// String; a result flagged `is_error` is returned as `Err` so it flows
-    /// through the existing tool_result error pipeline.
+    /// An `is_error` result returns `Err` so it flows through the tool_result error path.
     pub async fn call(&self, name: &str, input: &Value) -> Result<String> {
         let route = self
             .routes
@@ -486,8 +410,6 @@ async fn connect_one(
     spec: &ServerSpec,
     notify: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<(Client, Vec<Tool>)> {
-    // Both transports yield the same `RunningService<RoleClient, ()>`, so only
-    // the transport construction differs — the handshake/discovery is identical.
     let client = match &spec.transport {
         Transport::Stdio { command, args, env } => {
             let cmd = Command::new(command).configure(|c| {
@@ -533,7 +455,6 @@ fn tool_to_schema(namespaced: &str, tool: &Tool) -> Value {
     json!({
         "name": namespaced,
         "description": tool.description.as_deref().unwrap_or(""),
-        // MCP's `inputSchema` -> the API's `input_schema`; `title` is dropped.
         "input_schema": Value::Object((*tool.input_schema).clone()),
     })
 }

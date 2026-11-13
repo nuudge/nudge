@@ -5,11 +5,7 @@ import com.goterl.lazysodium.SodiumJava
 import com.goterl.lazysodium.interfaces.SecretBox
 import java.security.SecureRandom
 
-// Application-layer E2E — the Kotlin peer of Rust's transport::encryption. Same
-// primitive (XSalsa20-Poly1305 secretbox) and the same per-frame wire layout,
-// nonce(24) ‖ MAC(16) ‖ ciphertext, so a frame sealed by the Rust daemon opens
-// here and vice versa. The crypto binding is injected as a SecretBox.Native so the
-// Android module can pass a LazySodiumAndroid instead — the wire format is identical.
+// Must match Rust's transport::encryption byte-for-byte: nonce(24) ‖ MAC(16) ‖ ciphertext.
 class Cipher(
     private val key: ByteArray,
     private val sodium: SecretBox.Native = defaultSodium,
@@ -20,7 +16,6 @@ class Cipher(
         }
     }
 
-    // Fresh random nonce prepended to the secretbox output.
     fun seal(plaintext: ByteArray): ByteArray {
         val nonce = ByteArray(SecretBox.NONCEBYTES).also(rng::nextBytes)
         val cipher = ByteArray(SecretBox.MACBYTES + plaintext.size)
@@ -30,8 +25,6 @@ class Cipher(
         return nonce + cipher
     }
 
-    // Split off the nonce, then authenticate-and-decrypt. A wrong key or any
-    // tampering fails the Poly1305 tag and throws rather than returning garbage.
     fun open(framed: ByteArray): ByteArray {
         val overhead = SecretBox.NONCEBYTES + SecretBox.MACBYTES
         require(framed.size >= overhead) { "sealed frame too short to contain a nonce + MAC" }

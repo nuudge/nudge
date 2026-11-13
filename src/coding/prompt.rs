@@ -1,10 +1,7 @@
 use crate::coding::tools;
 
-// The tool roster (`{{TOOLS}}`) is filled in at runtime from the live tool
-// registry so the prompt can never advertise a tool that isn't wired up, and
-// adding a tool updates the prompt automatically. Per-tool mechanics live in
-// each tool's schema description (single source of truth, next to the call
-// site) — the prompt only orients; it does not restate them.
+// `{{TOOLS}}` is filled from the live registry so the prompt never advertises an
+// unwired tool. Per-tool mechanics live in schema descriptions, not here.
 const SYSTEM_PROMPT_TEMPLATE: &str = "You are nudge, a coding assistant running in the user's terminal.
 
 Engineering posture
@@ -44,10 +41,7 @@ pub fn system_prompt_body(web_search: bool) -> String {
     SYSTEM_PROMPT_TEMPLATE.replace("{{TOOLS}}", &tools::roster(web_search))
 }
 
-// The role preamble a spawned subagent runs under (see `CodingBackend::into_subagent`).
-// Role is set by prompt, not by a type — this block is what makes an otherwise
-// ordinary agent behave as a subagent: its one hard obligation is that results are
-// DELIVERED via MessagePeer, because the spawner never reads its transcript.
+// Results must be delivered via MessagePeer: the spawner never reads the transcript.
 const SUBAGENT_ROLE_TEMPLATE: &str = "## Subagent role
 
 You were spawned by another agent, {{PARENT}}, to work on an assigned task in this directory. {{PARENT}} is an agent, not a human: it does not watch your terminal and never reads your transcript. The only output that reaches it is what you send with the MessagePeer tool.

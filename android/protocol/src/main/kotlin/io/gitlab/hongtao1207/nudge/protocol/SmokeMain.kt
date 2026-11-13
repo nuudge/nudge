@@ -4,13 +4,8 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
-// Headless smoke driver for 8.4-a: attach to a relay-paired daemon, send one message,
-// print the streamed response, and exit on TurnComplete. Proves the whole protocol
-// kit end-to-end over the *real* relay (WS dial → E2E → attach handshake → live events)
-// before any Android UI exists. Run via the Gradle `:protocol:smoke` task:
-//   ./gradlew :protocol:smoke --args "nudge:<pairing-code>"
-// Optional second arg overrides the prompt. Permission requests are auto-denied so the
-// smoke can never mutate anything on the host.
+// Live smoke against a relay-paired daemon: ./gradlew :protocol:smoke --args "nudge:<code>"
+// Permission requests are auto-denied so the smoke can never mutate the host.
 fun main(args: Array<String>) {
     require(args.isNotEmpty()) {
         "usage: smoke <nudge:pairing-code> [message]"

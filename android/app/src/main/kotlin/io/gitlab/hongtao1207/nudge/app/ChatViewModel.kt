@@ -26,26 +26,18 @@ enum class Connection { Disconnected, Connecting, Attached, Busy, Error, Detache
 
 enum class Role { User, Assistant, Thinking, ToolCall, ToolResult, System }
 
-// `text` is the primary line (assistant markdown, user message, tool name, …); `body`
-// is optional secondary content rendered collapsibly (a tool call's arguments, a tool
-// result's output). `isError` tints tool results that failed.
 data class ChatLine(
     val id: Long,
     val role: Role,
     val text: String,
     val body: String? = null,
     val isError: Boolean = false,
-    // For a User line, the sender's name when it wasn't us (another party in a shared
-    // session); null for our own turns, which render without a name label.
+    // Null for our own turns, which render without a name label.
     val sender: String? = null,
 )
 
-// The tool-call permission the agent is currently blocked on, awaiting our answer.
 data class PendingPermission(val toolUseId: String, val toolName: String, val summary: String)
 
-// Static session context for the header, from the daemon's SessionInfo event (replayed
-// first on attach). gitBranch is null when the cwd isn't a git repo. sessionName is the
-// human label (null until renamed); the header shows it in place of the uuid.
 data class SessionContext(
     val model: String,
     val cwd: String,
@@ -62,38 +54,28 @@ data class ChatUiState(
     val turnInFlight: Boolean = false,
     val pendingPermission: PendingPermission? = null,
     val sessionInfo: SessionContext? = null,
-    // The daemon's capability surface (models, commands, MCP catalog), from the
-    // Capabilities event (replayed first on attach). Drives the model picker.
     val capabilities: ControllerEvent.Capabilities? = null,
 )
 
-// Bridges the pure-JVM RelayClient to Compose. RelayClient's listener callbacks fire on
-// OkHttp's WebSocket thread; updating a MutableStateFlow from there is thread-safe and
-// Compose collects the flow on the main thread, so no explicit handler marshalling is
-// needed. User and assistant bubbles are both rendered from the daemon's event stream
-// (the daemon echoes UserMessage back) — one source of truth, so reconnect-replay
-// reproduces the transcript correctly without client-side bookkeeping.
+// Listener callbacks fire on OkHttp's thread; MutableStateFlow updates are thread-safe, so
+// no marshalling. User bubbles come from the daemon's UserMessage echo, so replay rebuilds
+// the transcript with no client-side bookkeeping.
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = _state.asStateFlow()
 
-    // App-private store for the last working pairing code, so backgrounding or being
-    // killed doesn't force a re-scan. NOTE: the code embeds the E2E key — this persists a
-    // secret to disk. It's app-private and allowBackup=false (manifest), acceptable for a
-    // personal tool; EncryptedSharedPreferences/Keystore would harden it further.
+    // The pairing code embeds the E2E key, so this persists a secret; it's app-private
+    // and allowBackup=false.
     private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     private var client: RelayClient? = null
     private var pairing: Pairing? = null
     private var nextId = 0L
 
-    // This device's identity, announced at attach so the daemon (and any co-attached
-    // laptop) can attribute our turns. The device model is a recognizable label.
     private val identity = ClientIdentity.human(Build.MODEL)
 
-    // Watch the default network so a wifi↔cellular handoff redials immediately instead of
-    // waiting ~20-40s for OkHttp's ping to notice the stranded socket. Callbacks arrive off
-    // the main thread, so each hops back to Main (viewModelScope) before touching state.
+    // A wifi↔cellular handoff strands the socket until OkHttp's ping notices (~20-40s);
+    // watching the default network redials immediately. Callbacks arrive off main.
     private val connectivityManager = app.getSystemService(ConnectivityManager::class.java)
     private var lastNetwork: Network? = null
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -102,16 +84,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // Bumped on every connect and detach. A connection's listener is tagged with the
-    // epoch it was born in and ignores its own callbacks once the epoch moves on, so the
-    // socket we just left can't clobber the UI with a late teardown event. Read on
-    // OkHttp's thread, written on the main thread — @Volatile keeps it visible.
+    // Bumped on every connect and detach; a listener ignores callbacks from a past epoch so
+    // a stale socket can't clobber the UI. Read on OkHttp's thread, hence @Volatile.
     @Volatile
     private var generation = 0
 
-    // Auto-reconnect state. wantConnected is true between a successful connect() and an
-    // intentional detach; a drop while it's set triggers a backoff redial that resumes
-    // from lastSeq (replaying only missed events). Read on OkHttp's thread → @Volatile.
+    // True between connect() and an intentional detach; a drop while set triggers a redial.
     @Volatile
     private var wantConnected = false
     private var reconnectAttempts = 0
@@ -119,8 +97,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         connectivityManager?.registerDefaultNetworkCallback(networkCallback)
-        // Cold launch into the detached state: reflect "bound but paused" so the UI shows
-        // Reattach (not the scanner) and resume() leaves it alone until the user taps.
         if (prefs.getString(KEY_CODE, null) != null && prefs.getBoolean(KEY_PAUSED, false)) {
             _state.update { it.copy(connection = Connection.Detached, status = "Detached") }
         }
@@ -128,9 +104,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(code: String) {
         reconnectJob?.cancel()
-        // Fresh transcript: a plain connect does a full replay (after_seq = null), so
-        // starting empty avoids doubling earlier lines. (Reconnects below instead resume
-        // from lastSeq and keep the transcript.)
+        // A plain connect does a full replay, so start empty to avoid doubling lines.
         _state.update {
             it.copy(
                 connection = Connection.Connecting,
@@ -150,14 +124,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         pairing = decoded
         wantConnected = true
         reconnectAttempts = 0
-        prefs.edit().putString(KEY_CODE, code).remove(KEY_PAUSED).apply() // bind + un-pause
-        dial(afterSeq = null) // fresh attach → full replay
+        prefs.edit().putString(KEY_CODE, code).remove(KEY_PAUSED).apply()
+        dial(afterSeq = null)
     }
 
-    // Open a connection (or reconnection) on a fresh epoch, so any prior socket's late
-    // callbacks (e.g. a stranded one finally erroring after a handoff) are ignored and
-    // can't bounce the healthy new connection. afterSeq = null replays everything; a
-    // cursor resumes and replays only the events missed during the gap.
     private fun dial(afterSeq: Long?) {
         val p = pairing ?: return
         client?.close()
@@ -165,10 +135,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         client = RelayClient(p, listener(generation), identity).also { it.connect(afterSeq) }
     }
 
-    // Called when the app returns to the foreground (or launches). If we're bound and
-    // active, re-attach from the saved pairing (stops a "switch away" or app-kill from
-    // forcing a re-scan). If we're bound but *paused* (the user detached), stay put and
-    // wait for a manual Reattach. Unbound → nothing (the pairing screen shows).
+    // A paused (user-detached) pairing waits for a manual Reattach instead of reconnecting.
     fun resume() {
         val current = _state.value.connection
         if (current == Connection.Attached || current == Connection.Connecting) return
@@ -180,13 +147,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // Temporarily leave but stay bound to this daemon: stop the reconnect loop, mark the
-    // pairing paused (kept on disk), and wait for a manual Reattach. The agent keeps
-    // running headless — at the wire level this is the same Detach the daemon always sees.
+    // Stays bound (pairing kept, marked paused); the agent keeps running headless.
     fun detach() {
         wantConnected = false
         reconnectJob?.cancel()
-        prefs.edit().putBoolean(KEY_PAUSED, true).apply() // keep the code; mark paused
+        prefs.edit().putBoolean(KEY_PAUSED, true).apply()
         generation++
         client?.detach()
         client?.close()
@@ -201,25 +166,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // Reattach to the SAME daemon from the saved pairing — the only target a detach allows.
     fun reattach() {
         prefs.getString(KEY_CODE, null)?.let { connect(it) }
     }
 
-    // Unbind: forget the pairing entirely (switching daemons, or done) and return to the
-    // pairing screen, where any daemon can be scanned. The agent still runs headless on
-    // the host — a controller can't end the session; only stopping the daemon process can.
+    // Forgets the pairing. A controller can't end the session; only stopping the daemon can.
     fun disconnect() {
         wantConnected = false
         reconnectJob?.cancel()
-        prefs.edit().remove(KEY_CODE).remove(KEY_PAUSED).apply() // forget the binding
+        prefs.edit().remove(KEY_CODE).remove(KEY_PAUSED).apply()
         generation++
         client?.detach()
         client?.close()
         client = null
-        // Unbinding returns to the pairing screen; clear the transcript so a new pairing
-        // starts fresh and stale history doesn't sit behind the scanner. (Detach keeps the
-        // transcript — it's the same session, just paused.)
         _state.update {
             it.copy(
                 connection = Connection.Disconnected,
@@ -236,10 +195,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     fun send(text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty() || client == null) return
-        // Mirror the TUI: a single-line leading-`/` input is a slash command parsed
-        // server-side (its effects return as Notice/SessionInfo/Capabilities, not a
-        // turn); a multi-line `/…` is an ordinary message. So a command shouldn't
-        // flip turnInFlight — there's no TurnComplete coming to clear it.
+        // Like the TUI, a single-line `/…` is a server-parsed command, not a turn: no
+        // TurnComplete will come to clear turnInFlight.
         if (trimmed.startsWith("/") && !trimmed.contains("\n")) {
             client?.send(UiEvent.Command(trimmed))
             return
@@ -248,13 +205,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         client?.send(UiEvent.UserMessage(trimmed))
     }
 
-    // Switch the API model via the shared command surface (rendered from Capabilities).
     fun selectModel(id: String) {
         client?.send(UiEvent.Command("/model $id"))
     }
 
-    // Answer the tool-call permission the agent is blocked on. The daemon then streams a
-    // PermissionResolved (and, if allowed, the tool's ToolUseStart/ToolResult).
     fun respondPermission(allow: Boolean) {
         val pending = _state.value.pendingPermission ?: return
         client?.send(UiEvent.PermissionResponse(pending.toolUseId, allow))
@@ -262,18 +216,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun listener(epoch: Int) = object : RelayClient.Listener {
-        // False once we've connected elsewhere or detached: drop this socket's callbacks.
         private fun live() = epoch == generation
 
         override fun onAttached() {
             if (!live()) return
-            reconnectAttempts = 0 // a clean attach resets the backoff budget
+            reconnectAttempts = 0
             _state.update { it.copy(connection = Connection.Attached, status = "Attached") }
         }
 
         override fun onBusy() {
-            // With the daemon multi-attach, an attach is refused only when there's no
-            // live session (the broker is gone) — not because another controller holds it.
+            // The daemon is multi-attach, so Busy means no live session, not a held one.
             if (live()) _state.update {
                 it.copy(connection = Connection.Busy, status = "The daemon has no live session")
             }
@@ -283,8 +235,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (!live()) return
             when (event) {
                 is ControllerEvent.UserMessage -> {
-                    // Attribute to the sender unless it's us (or unstamped) — then it's
-                    // a plain own-turn bubble.
                     val from = event.sender.takeIf { it.isNotEmpty() && it != identity.name }
                     append(Role.User, event.text, sender = from)
                 }
@@ -303,7 +253,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 is ControllerEvent.PermissionResolved -> {
                     append(Role.System, "permission ${if (event.allow) "allowed" else "denied"}: ${event.toolName}")
-                    // Clear the prompt even if it was resolved elsewhere (another controller).
+                    // May have been resolved by another controller.
                     _state.update { it.copy(pendingPermission = null) }
                 }
                 is ControllerEvent.Notice -> append(Role.System, event.text)
@@ -330,7 +280,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 is ControllerEvent.Capabilities -> _state.update { it.copy(capabilities = event) }
-                is ControllerEvent.Usage -> Unit // not surfaced in the UI yet
+                is ControllerEvent.Usage -> Unit
             }
         }
 
@@ -351,36 +301,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // A dropped socket while we still want to be connected: redial with capped
-    // exponential backoff, resuming from lastSeq so the daemon replays only the events
-    // missed during the gap (the transcript is kept, not cleared). Gives up after
-    // MAX_RECONNECT_ATTEMPTS by parking in the detached state (still bound) so the user
-    // can tap Reattach to retry, or Disconnect to switch — rather than hammering a dead box.
+    // Resumes from lastSeq so only missed events replay; after MAX_RECONNECT_ATTEMPTS it
+    // parks in Detached (still bound) rather than hammering a dead host.
     private fun scheduleReconnect() {
         if (!wantConnected) return
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             wantConnected = false
-            prefs.edit().putBoolean(KEY_PAUSED, true).apply() // stay bound, stop hammering
+            prefs.edit().putBoolean(KEY_PAUSED, true).apply()
             _state.update {
                 it.copy(connection = Connection.Detached, status = "Couldn't reconnect — tap Reattach", turnInFlight = false)
             }
             return
         }
         val attempt = reconnectAttempts++
-        val backoffMs = 1000L shl attempt.coerceAtMost(3) // 1s, 2s, 4s, 8s, 8s…
+        val backoffMs = 1000L shl attempt.coerceAtMost(3)
         _state.update {
             it.copy(connection = Connection.Connecting, status = "Reconnecting… (${attempt + 1})")
         }
         reconnectJob?.cancel()
         reconnectJob = viewModelScope.launch {
             delay(backoffMs)
-            if (wantConnected) dial(client?.lastSeq) // resume cursor → replay only missed events
+            if (wantConnected) dial(client?.lastSeq)
         }
     }
 
-    // A default-network change (wifi↔cellular) strands the current socket on a dead
-    // interface that OkHttp wouldn't notice until its ~20s ping times out. Redial now over
-    // the new network, with a fresh attempt budget, rather than waiting for that timeout.
     private fun forceReconnect() {
         if (!wantConnected) return
         reconnectJob?.cancel()
@@ -392,8 +336,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun onNetworkAvailable(network: Network) {
         val previous = lastNetwork
         lastNetwork = network
-        // The first callback (at registration) and repeats of the same network are no-ops;
-        // a *changed* default network while we want to be connected triggers an instant redial.
+        // The first callback fires at registration; only a changed network should redial.
         if (previous != null && previous != network && wantConnected) forceReconnect()
     }
 
@@ -419,6 +362,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         const val MAX_RECONNECT_ATTEMPTS = 6
         const val PREFS = "nudge"
         const val KEY_CODE = "pairing_code"
-        const val KEY_PAUSED = "paused" // bound-but-detached: don't auto-reconnect on resume
+        const val KEY_PAUSED = "paused" // bound but detached: don't auto-reconnect on resume
     }
 }

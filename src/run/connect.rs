@@ -5,12 +5,9 @@ use crate::run::local_identity;
 use crate::transport;
 use crate::tui;
 
-// Attach a TUI to a running daemon (Unix socket or relay). The client owns no loop
-// and no session metadata, so the header starts as placeholders and is filled from
-// the daemon's `SessionInfo` event — replayed first on attach.
 pub async fn run(cli: Cli) -> Result<()> {
-    // Placeholders only: the daemon's SessionInfo event (replayed first on attach)
-    // overwrites session id / model / cwd / branch with the daemon's real context.
+    // Placeholders: the daemon's SessionInfo event, replayed first on attach, fills
+    // in the real session id / model / cwd / branch.
     let who = local_identity();
     let ui_cfg = tui::UiConfig {
         session_id: "(connecting…)".into(),
@@ -18,30 +15,20 @@ pub async fn run(cli: Cli) -> Result<()> {
         auto: false,
         model: crate::config::default_model(),
         thinking_display: crate::config::resolve_thinking(cli.thinking.as_ref())?,
-        // A --connect client never hosts a relay, so it shows no pairing QR.
         pairing_qr: None,
         pairing_code: None,
         pairing_qr_watch: None,
         pairing_code_watch: None,
         pairing_qr_agent: None,
         pairing_code_agent: None,
-        // A --connect client is a guest: it attaches to a daemon it doesn't host
-        // (cosmetic badge only — clients coexist, none reclaims).
         is_owner: false,
         user_name: who.name.clone(),
-        // A guest renders its model picker from the daemon's Capabilities event
-        // (replayed first on attach), not a compiled-in list — so it shows the
-        // daemon's real models. Empty until that arrives.
+        // Filled from the daemon's Capabilities event so a guest shows the daemon's models.
         models: Vec::new(),
     };
-    // Use each client's `connect` rather than the silent `SessionHandle::attach` for
-    // this first attach: it runs before the TUI owns the screen, so a connection
-    // failure can (and should) surface its cause here. `Err` = transport failure
-    // (no daemon / relay unreachable); `None` = reachable but the session is gone
-    // (the daemon's broker has shut down).
+    // `connect` rather than the silent `SessionHandle::attach`: this runs before the
+    // TUI owns the screen, so a connection failure can surface its cause here.
     if let Some(code) = cli.pair_code {
-        // A scanned pairing code is self-contained: it carries the relay URL, room
-        // id, and E2E key, so it needs no other flags.
         let pairing = transport::Pairing::decode(&code)?;
         let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
         let controller = match client.connect(None, who.clone()).await? {
@@ -50,7 +37,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         };
         tui::run(&client, ui_cfg, who, controller, None).await
     } else if let Some(path) = cli.socket {
-        // Local debug daemon over a Unix socket (--daemon --socket on the other end).
         let client = transport::SocketClient::new(path);
         let controller = match client.connect(None, who.clone()).await? {
             Some(c) => c,

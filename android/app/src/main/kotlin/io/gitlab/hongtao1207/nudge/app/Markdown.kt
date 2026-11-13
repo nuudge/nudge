@@ -18,11 +18,6 @@ import io.noties.markwon.ext.tables.TablePlugin
 import io.noties.markwon.ext.tasklist.TaskListPlugin
 import io.noties.markwon.linkify.LinkifyPlugin
 
-// Full-fidelity Markdown for assistant text, backed by Markwon (CommonMark + GFM tables,
-// strikethrough, task lists, autolinks). Rendered into a TextView via AndroidView — the
-// agent replies in Markdown and tables were the gap the previous hand-rolled subset
-// couldn't cover. Colors/size are pulled from the surrounding Compose theme so it matches
-// the bubble it sits in.
 @Composable
 fun MarkdownText(
     text: String,

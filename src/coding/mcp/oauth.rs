@@ -1,11 +1,6 @@
-//! OAuth (authorization-code + PKCE) for remote MCP servers — Phase 7.
-//!
-//! rmcp's `OAuthState` drives discovery, the authorize URL, the token exchange,
-//! and refresh. This module owns the three things the crate doesn't: opening
-//! the browser, catching the loopback redirect, and persisting tokens so the
-//! browser dance only happens once per server. The flow can run at startup
-//! (authorize URL prints to stderr) or mid-session via `/mcp load`, where stderr
-//! is hidden behind the TUI — so the URL is also surfaced as a [`Notify`] event.
+//! OAuth for remote MCP servers. rmcp handles discovery, token exchange and
+//! refresh; this module opens the browser, catches the loopback redirect, and
+//! persists tokens so the browser flow runs once per server.
 
 use std::path::PathBuf;
 
@@ -26,30 +21,20 @@ use tokio::sync::mpsc;
 
 use crate::core::AgentEvent;
 
-/// Loopback port for the OAuth redirect. With dynamic client registration the
-/// client registers this exact redirect URI, so a fixed port is fine.
+/// Fixed: dynamic client registration registers this exact redirect URI.
 const CALLBACK_PORT: u16 = 8765;
 
-/// The authorized transport type handed back to `connect_one`.
 type AuthedTransport = StreamableHttpClientTransport<AuthClient<reqwest::Client>>;
 
-/// Optional channel for surfacing the authorize URL as a TUI `Notice`. `Some`
-/// for mid-session loads (stderr is hidden behind the TUI); `None` at startup,
-/// where the `eprintln` is visible.
+/// `Some` for mid-session loads, where stderr is hidden behind the TUI.
 type Notify<'a> = Option<&'a mpsc::Sender<AgentEvent>>;
 
-/// On-disk token record. `OAuthTokenResponse` is serde-serializable; we re-feed
-/// it to `set_credentials` on the next launch to skip the browser.
 #[derive(Serialize, Deserialize)]
 struct PersistedAuth {
     client_id: String,
     token: OAuthTokenResponse,
 }
 
-/// Build an OAuth-authorized Streamable HTTP transport for `url`. A configured
-/// `client_id` selects the pre-registered-client flow (e.g. Google, which has no
-/// dynamic registration); otherwise dynamic client registration is used. Either
-/// way a saved token skips the browser, and the browser flow runs at most once.
 pub async fn authorized_transport(
     name: &str,
     url: &str,
@@ -64,17 +49,14 @@ pub async fn authorized_transport(
     }
 }
 
-/// Dynamic-client-registration flow (servers that support RFC 7591).
 async fn dcr_transport(
     name: &str,
     url: &str,
     scopes: &[String],
     notify: Notify<'_>,
 ) -> Result<AuthedTransport> {
-    // Prefer a persisted token, but only after confirming it still yields a live
-    // access token (refreshing if expired). A stale token that can't refresh
-    // falls through to a fresh browser flow rather than failing the connect with
-    // an "Auth required" on the first request.
+    // A saved token that can't refresh falls through to a fresh browser flow
+    // instead of failing the first request with "Auth required".
     if let Some(saved) = load_tokens(name)?
         && let Some(am) = revive_saved_credentials(name, url, saved).await
     {
@@ -86,7 +68,7 @@ async fn dcr_transport(
         .map_err(|e| anyhow!("oauth discovery failed: {e}"))?;
     run_browser_flow(&mut state, scopes, notify).await?;
     if let Ok((client_id, Some(token))) = state.get_credentials().await {
-        // Best-effort persistence — failing to save just means re-auth later.
+        // Failing to save just means re-auth later.
         let _ = save_tokens(name, &PersistedAuth { client_id, token });
     }
     let am = state
@@ -95,13 +77,8 @@ async fn dcr_transport(
     Ok(make_transport(url, am))
 }
 
-/// Revive a persisted DCR token: install it, then force a validity check that
-/// auto-refreshes an expired access token (`get_access_token` does this and
-/// returns `AuthorizationRequired` when it can't). Returns the authorized
-/// manager only if the credentials are usable; `None` (stale / unrefreshable)
-/// signals the caller to re-run the browser flow. Re-persists on success,
-/// because the manager's in-memory store won't update our token file and DCR
-/// refresh tokens can rotate.
+/// `None` means the caller should re-run the browser flow. Re-persists on
+/// success because DCR refresh tokens can rotate.
 async fn revive_saved_credentials(
     name: &str,
     url: &str,
@@ -113,11 +90,8 @@ async fn revive_saved_credentials(
         .await
         .ok()?;
     let am = state.into_authorization_manager()?;
-    // Force a refresh rather than calling get_access_token: set_credentials stamps
-    // `token_received_at = now`, which makes the SDK's expiry check think the
-    // (actually stale) access token is brand new and hand it back un-refreshed.
-    // refresh_token mints a live token from the refresh token; failure here
-    // (refresh token missing/expired) returns None → caller re-runs the browser flow.
+    // Force a refresh: set_credentials stamps `token_received_at = now`, so
+    // get_access_token would hand back a stale token as if it were fresh.
     match am.refresh_token().await {
         Ok(_) => {}
         Err(e) => {
@@ -164,9 +138,8 @@ async fn run_browser_flow(
     Ok(())
 }
 
-/// Pre-registered-client flow (e.g. Google): uses the lower-level
-/// `AuthorizationManager` since `OAuthState` only does dynamic registration.
-/// A file-backed credential store persists (and refreshes) the token across runs.
+/// `OAuthState` only does dynamic registration, so this uses the lower-level
+/// `AuthorizationManager`.
 async fn pre_registered_transport(
     name: &str,
     url: &str,
@@ -192,8 +165,6 @@ async fn pre_registered_transport(
     mgr.configure_client(config)
         .map_err(|e| anyhow!("oauth configure_client failed: {e}"))?;
 
-    // Reuse a persisted token when one is present and still usable (refresh handled
-    // by the manager); otherwise run the browser flow once.
     let mut have_token = mgr.initialize_from_store().await.unwrap_or(false);
     if have_token && mgr.get_access_token().await.is_err() {
         have_token = false;
@@ -221,10 +192,8 @@ fn redirect_uri() -> String {
     format!("http://127.0.0.1:{CALLBACK_PORT}/callback")
 }
 
-/// Print + open the authorize URL, then block on the loopback redirect. The URL
-/// also goes out as a `Notice` when `notify` is set — mid-session the `eprintln`
-/// lands on stderr hidden behind the TUI, so the in-app message is what the user
-/// actually sees if the browser doesn't auto-open.
+/// Also sent as a `Notice` when `notify` is set, since stderr is hidden behind
+/// the TUI mid-session.
 async fn prompt_and_capture(auth_url: &str, notify: Notify<'_>) -> Result<(String, String)> {
     let msg = format!(
         "[mcp] Authorize access in your browser:\n  {auth_url}\n  (waiting for the redirect on {} ...)",
@@ -238,8 +207,6 @@ async fn prompt_and_capture(auth_url: &str, notify: Notify<'_>) -> Result<(Strin
     wait_for_callback(CALLBACK_PORT).await
 }
 
-/// Bind the loopback port, accept one request, and pull `code`/`state` out of
-/// the redirect query. Returns once the browser hits the callback.
 async fn wait_for_callback(port: u16) -> Result<(String, String)> {
     let listener = TcpListener::bind(("127.0.0.1", port))
         .await
@@ -369,9 +336,7 @@ fn restrict_perms(path: &std::path::Path) {
 #[cfg(not(unix))]
 fn restrict_perms(_path: &std::path::Path) {}
 
-/// File-backed [`CredentialStore`] for the pre-registered-client flow. rmcp
-/// loads from it on startup and writes back after token exchange/refresh, so
-/// refreshed tokens persist automatically. Stores rmcp's `StoredCredentials`.
+/// rmcp writes back after exchange/refresh, so refreshed tokens persist.
 struct FileCredentialStore {
     path: PathBuf,
 }

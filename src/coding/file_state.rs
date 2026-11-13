@@ -3,27 +3,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-// Session-scoped Read-before-Edit tracker. Records the mtime of each file at
-// the moment Read returned successfully. Edit consults this to enforce two
-// invariants:
-//
-//   1. The model has Read the file in this session (otherwise it's editing on
-//      assumptions, which silently corrupts files).
-//   2. The file hasn't been modified externally between that Read and the
-//      pending Edit (otherwise the `old_string` may match a different line
-//      than the model intended, or the model's mental model of the file is
-//      stale).
-//
-// Paths are canonicalized before insertion/lookup so `./foo`, `/abs/foo`, and
-// symlink-equivalent paths all resolve to the same key. mtime equality is the
-// staleness check — cheap, and sufficient for the local-dev case (the file
-// would have to be rewritten at sub-second precision *and* land on the exact
-// same mtime to slip through, which doesn't happen in practice).
-//
-// In-memory only. Not persisted to the JSONL session log — on `--resume`, the
-// tracker starts empty and the model must Read again before editing. This is
-// the safe default: a resumed session is a fresh process with no guarantee
-// that the files match the pre-resume state.
+// Edit requires a prior Read this session and an unchanged mtime since, so
+// `old_string` can't match against a stale view. Not persisted: a resumed
+// session must Read again, since files may have changed in between.
 #[derive(Default)]
 pub struct FileState {
     read_mtimes: HashMap<PathBuf, SystemTime>,
@@ -37,9 +19,7 @@ impl FileState {
         Ok(())
     }
 
-    // Verify the Read-before-Edit invariant for `path`. Returns Ok(()) if the
-    // edit may proceed. Call `record_write` after the edit lands to refresh
-    // the stored mtime so chained edits in the same turn don't false-reject.
+    // Callers must `record_write` after the edit so chained edits don't false-reject.
     pub fn check_edit(&self, path: &Path) -> Result<()> {
         let canon = canonicalize(path)?;
         let Some(stored) = self.read_mtimes.get(&canon) else {

@@ -11,7 +11,6 @@ pub enum Thinking {
 }
 
 impl Thinking {
-    // The string form the agent + UI configs expect.
     pub fn as_display(&self) -> String {
         match self {
             Thinking::Summarized => "summarized",

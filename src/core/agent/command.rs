@@ -1,28 +1,19 @@
 use crate::core::events::CommandInfo;
 
-// The server-side parse of a `/…` command line. Internal — never crosses the wire
-// (the wire carries `UiEvent::Command { line }`). The loop executes each variant
-// against its own state (model / session / MCP registry), so the grammar lives in
-// exactly one place regardless of which front-end typed the line.
+// Internal; the wire carries only the raw line, so the grammar lives in one place.
 pub(super) enum Command {
-    // Switch the API model at the next turn boundary.
     SetModel(String),
-    // Rename the session: Some = verbatim, None = let the loop derive one.
+    // None = let the loop derive a name.
     Rename(Option<String>),
     Mcp(McpCommand),
-    // List the session's held peer edges (read-only).
     Peers,
-    // Dial a remote peer over the relay using a pasted pairing code (human-only).
+    // Human-only.
     ConnectPeer(String),
-    // Toggle auto mode: delegate work to a supervised subagent, Spawn ungated.
     Auto,
-    // `/model` with no argument: not an error, but the pickerless path needs a hint.
     ModelUsage,
-    // Anything unrecognized, echoed back so the client sees why nothing happened.
     Unknown(String),
 }
 
-// The MCP subgrammar, handed to the backend (which owns the registry).
 pub enum McpCommand {
     List,
     Load(String),
@@ -58,14 +49,12 @@ pub(super) fn parse(line: &str) -> Command {
     }
 }
 
-// Turning auto mode on pre-approves future Spawn prompts, so only a client that may
-// answer permission prompts may issue it (the broker enforces this).
+// Auto mode pre-approves future Spawn prompts, so the broker only lets a client that
+// may answer permission prompts issue it.
 pub(crate) fn pre_approves_permissions(line: &str) -> bool {
     matches!(parse(line), Command::Auto)
 }
 
-// The daemon's command list, advertised in Capabilities so clients render menus
-// (and know what to send) without a compiled-in copy of the grammar.
 pub fn command_catalog() -> Vec<CommandInfo> {
     vec![
         CommandInfo {
@@ -99,8 +88,6 @@ pub fn command_catalog() -> Vec<CommandInfo> {
 mod tests {
     use super::*;
 
-    // `/connect-peer` takes the rest of the line as the pairing code; bare = empty
-    // (dispatch turns that into a usage hint).
     #[test]
     fn parses_connect_peer_with_and_without_code() {
         match parse("/connect-peer nudge:abc123") {
@@ -113,7 +100,6 @@ mod tests {
         }
     }
 
-    // The command is advertised so front-ends render it (and know it exists).
     #[test]
     fn catalog_advertises_connect_peer() {
         assert!(command_catalog().iter().any(|c| c.name == "/connect-peer"));

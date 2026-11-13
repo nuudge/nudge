@@ -12,82 +12,50 @@ use tokio_tungstenite::tungstenite::Message;
 use super::encryption::Cipher;
 use crate::core::{ClientIdentity, ControllerEvent, UiEvent};
 
-// The serializable form of the in-memory `Controller`/`UiEvent` model from 8.0.
-// 8.1 only *transports* that model — the broker's buffer/replay and permission
-// correlation already exist in memory; here we frame it onto a byte stream
-// (the TUI↔daemon Unix socket now, the relayed WebSocket later).
-//
-// Encoding is newline-delimited JSON: `serde_json` compact output contains no
-// literal newline (any newline inside string data is escaped as `\n`), so a
-// single `\n` is an unambiguous frame terminator and the stream stays readable
-// for debugging. Switch to a length-prefixed binary codec only if relay
-// throughput on long tool outputs ever justifies it (a deferred open question).
+// Newline-delimited JSON over byte streams: compact `serde_json` output escapes every
+// newline, so a bare `\n` is an unambiguous frame terminator.
 
-// Client → daemon.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub enum ClientFrame {
-    // Bind to the session. `after_seq` is the resume cursor: replay only events
-    // with `seq > after_seq`, so a client whose connection dropped catches up on
-    // exactly what it missed. `None` = fresh attach → full replay from seq 0. `who`
-    // is the attaching client's identity — the attach frame is the handshake.
-    // `reverse_offer` requests the duplex peer edge: the acceptor also drives/observes
-    // the dialer over this one socket (see `ReverseEvent`/`ServerFrame::ReverseCommand`).
-    // Defaulted + skipped when false, so a non-offering attach (every phone, every
-    // ordinary client) is byte-identical to before and the Kotlin mirror needs no change.
+    // The handshake. `after_seq` is the resume cursor: replay only `seq > after_seq`;
+    // `None` replays from 0. `reverse_offer` requests the duplex peer edge, and is
+    // skipped when false so ordinary clients' bytes (and the Kotlin mirror) are unaffected.
     Attach {
         after_seq: Option<u64>,
         who: ClientIdentity,
         #[serde(default, skip_serializing_if = "is_false")]
         reverse_offer: bool,
     },
-    // Yield the session without ending it — the loop keeps running headless and
-    // buffering. (Distinct from dropping the connection, though the daemon
-    // treats a dropped socket as an implicit detach too.)
+    // Yield the session without ending it; the loop keeps running headless.
     Detach,
-    // An application-level command (user message, model switch, MCP, permission
-    // answer, quit). Maps straight to the in-memory `UiEvent`.
     Command(UiEvent),
-    // The dialer's OWN broker events, streamed to the acceptor over a reverse-offered
-    // edge (the acceptor observes the dialer — the reverse half of the mutual peer
-    // pair). Its own monotonic `seq` is the reverse direction's replay cursor. Only
-    // ever produced by a duplex dialer; a phone never offers, so never sends it.
+    // The dialer's own broker events over a reverse-offered edge; `seq` is that
+    // direction's replay cursor.
     ReverseEvent {
         seq: u64,
         event: ControllerEvent,
     },
 }
 
-// serde skip predicate: keep a non-offering `Attach` byte-for-byte as it was.
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
-// Daemon → client.
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub enum ServerFrame {
-    // Attach accepted; the controller event stream (replay-from-cursor, then
-    // live) follows as `Event` frames.
     Attached,
-    // Attach could not be served: the session is gone (the daemon's broker has shut
-    // down). The client should not expect any `Event` frames.
+    // The session is gone (broker shut down); no `Event` frames will follow.
     Busy,
-    // One controller event tagged with its monotonic sequence number. `seq`
-    // counts every event the session has ever emitted (replay + live share one
+    // `seq` counts every event the session ever emitted (replay and live share one
     // sequence), so it is a stable resume cursor across reconnects.
     Event { seq: u64, event: ControllerEvent },
-    // The acceptor's own identity, announced once right after `Attached` iff the dialer
-    // offered a reverse edge and this leg accepts peers. Lets the dialer name the return
-    // peer and stamp the acceptor's drives — the mirror of the dialer's `Attach.who`.
-    // Never sent to a non-offering client, so a phone never receives it.
+    // Sent once after `Attached`, only if the dialer offered a reverse edge.
     ReverseAttach { who: ClientIdentity },
-    // The acceptor's drives, streamed to the dialer's broker over a reverse-offered edge
-    // (the acceptor drives the dialer). Never sent to a non-offering client.
+    // Never sent to a non-offering client.
     ReverseCommand(UiEvent),
 }
 
-// Write one frame as a single newline-terminated JSON line and flush. Flushing
-// per frame keeps latency low for an interactive control channel — frames are
-// small and infrequent relative to throughput limits.
+// Flushes per frame to keep the interactive control channel low-latency.
 pub async fn write_frame<W, T>(w: &mut W, frame: &T) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
@@ -100,10 +68,7 @@ where
     Ok(())
 }
 
-// Read one newline-delimited frame. `Ok(None)` is a clean EOF (the peer closed
-// the connection) — the caller distinguishes that from an error to tell an
-// orderly disconnect apart from a transport fault. The reader must be buffered
-// (`BufReader`) so `read_line` doesn't issue a syscall per byte.
+// `Ok(None)` is a clean EOF, distinct from a transport fault.
 pub async fn read_frame<R, T>(r: &mut R) -> Result<Option<T>>
 where
     R: AsyncBufReadExt + Unpin,
@@ -112,22 +77,14 @@ where
     let mut line = String::new();
     let n = r.read_line(&mut line).await?;
     if n == 0 {
-        return Ok(None); // clean EOF
+        return Ok(None);
     }
     let frame = serde_json::from_str(line.trim_end())?;
     Ok(Some(frame))
 }
 
-// ── Frame-level transport seam ───────────────────────────────────────────────
-// The codec above delimits frames with newlines because a Unix socket is a raw
-// *byte* stream with no message boundaries. A WebSocket is *message*-shaped and
-// supplies its own boundaries, so its codec (added with the relay path) maps one
-// frame to exactly one WS message and never newline-frames — re-framing on top of
-// WS messages would be redundant. These two traits are that seam, one frame at a
-// time: the daemon's `handle_conn` and the socket client's bridge tasks are
-// generic over them, so the same session logic drives either transport and only
-// the codec differs. Read and write are separate halves because both sides own the
-// two directions independently — the client in two tasks, the daemon in a `select!`.
+// Frame-level seam so the same session logic drives either codec: newline-framed
+// for a Unix byte stream, one-frame-per-message for a WebSocket.
 pub trait FrameReader<F>: Send {
     // `Ok(None)` = clean EOF (peer closed); `Err` = transport or parse fault.
     fn recv(&mut self) -> impl Future<Output = Result<Option<F>>> + Send;
@@ -136,29 +93,24 @@ pub trait FrameReader<F>: Send {
 pub trait FrameWriter<F>: Send {
     fn send(&mut self, frame: &F) -> impl Future<Output = Result<()>> + Send;
 
-    // Prove the connection is alive to the far hop. Only a relayed WebSocket can die
-    // silently (a sleeping laptop leaves it half-open); a Unix socket's peer dying
-    // surfaces as EOF, so it has nothing to send.
+    // Only a relayed WebSocket can die silently (a sleeping laptop leaves it
+    // half-open); a Unix socket's peer dying surfaces as EOF.
     fn keepalive(&mut self) -> impl Future<Output = Result<()>> + Send {
         async { Ok(()) }
     }
 }
 
-// How often every relay leg pings; matches the phone (OkHttp `pingInterval(20s)`).
+// Matches the phone (OkHttp `pingInterval(20s)`).
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
-// No frame of any kind for this long — three ping intervals without even a pong —
-// means the socket is dead. Must stay above the relay's own ping interval too.
+// Three ping intervals without even a pong means the socket is dead. Must stay
+// above the relay's own ping interval too.
 const READ_DEADLINE: Duration = Duration::from_secs(60);
 
-// The tick that drives `FrameWriter::keepalive` next to each read/write loop.
 pub fn keepalive_timer() -> Interval {
     interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL)
 }
 
-// The newline-delimited-JSON codec over a raw byte stream — the Unix-socket
-// transport. A named pair (rather than a blanket impl over every `AsyncRead`/
-// `AsyncWrite`) so it reads as "the line codec", parallel to the WS codec to come.
 pub struct LineReader<R>(pub R);
 pub struct LineWriter<W>(pub W);
 
@@ -182,12 +134,7 @@ where
     }
 }
 
-// The WebSocket codec — the relayed transport. A WebSocket is message-framed, so
-// one protocol frame maps to exactly one WS Binary message and there's no newline
-// framing (re-framing on top of WS messages would be redundant). Each frame is
-// sealed with the app-layer [`Cipher`] before it becomes a Message and opened on
-// receipt, so the relay only ever forwards opaque ciphertext (8.2-d). Generic over
-// the underlying sink/stream so it works for any tokio-tungstenite connection.
+// One sealed frame per WS Binary message, so the relay only forwards ciphertext.
 //
 // The read deadline is reader state (time of the last frame) rather than a per-call
 // timeout, because callers `select!` on `recv` alongside ping ticks and events: each
@@ -230,7 +177,7 @@ where
         loop {
             let msg = match timeout_at(self.last_frame + self.deadline, self.stream.next()).await {
                 Ok(Some(msg)) => msg?,
-                Ok(None) => return Ok(None), // stream ended without a Close frame
+                Ok(None) => return Ok(None),
                 Err(_) => anyhow::bail!("no frame received in {:?}", self.deadline),
             };
             self.last_frame = Instant::now();
@@ -239,11 +186,8 @@ where
                     let plaintext = self.cipher.open(&sealed)?;
                     return Ok(Some(serde_json::from_slice(&plaintext)?));
                 }
-                // A Close (like a byte-stream EOF) ends the frame stream cleanly.
                 Message::Close(_) => return Ok(None),
-                // Only Binary carries sealed application frames; ping/pong/text/
-                // continuation frames have no payload for us — but they do prove the
-                // socket alive, so skip them and keep reading.
+                // Control frames carry no payload but still reset the deadline above.
                 _ => continue,
             }
         }
@@ -259,8 +203,6 @@ where
     async fn send(&mut self, frame: &F) -> Result<()> {
         let bytes = serde_json::to_vec(frame)?;
         let sealed = self.cipher.seal(&bytes);
-        // `SinkExt::send` feeds + flushes, matching the line codec's flush-per-frame
-        // so an interactive control channel stays low-latency.
         self.sink.send(Message::Binary(sealed)).await?;
         Ok(())
     }
@@ -276,7 +218,6 @@ mod tests {
     use super::*;
     use tokio::io::BufReader;
 
-    // A representative event round-trips through JSON unchanged.
     #[test]
     fn event_serde_round_trip() {
         let ev = ControllerEvent::ToolResult {
@@ -285,7 +226,6 @@ mod tests {
             is_error: false,
         };
         let json = serde_json::to_string(&ev).unwrap();
-        // Compact JSON must not contain a raw newline — the framing relies on it.
         assert!(
             !json.contains('\n'),
             "compact JSON leaked a raw newline: {json}"
@@ -316,8 +256,6 @@ mod tests {
         }
     }
 
-    // A WebSocket that delivers nothing at all (half-open after a sleep) errors out
-    // at the read deadline instead of pending forever.
     #[tokio::test]
     async fn ws_read_deadline_fires_on_a_silent_socket() {
         let stream = futures::stream::pending::<WsItem>();
@@ -330,8 +268,7 @@ mod tests {
         assert!(res.is_err(), "expected a deadline error, got {res:?}");
     }
 
-    // Any frame — a bare Pong included — proves the socket alive and pushes the
-    // deadline out, even across `recv` calls cancelled by a caller's `select!`.
+    // The deadline must survive `recv` calls cancelled by a caller's `select!`.
     #[tokio::test]
     async fn ws_control_frames_keep_the_read_deadline_at_bay() {
         let cipher = Cipher::generate();
@@ -359,13 +296,11 @@ mod tests {
         );
     }
 
-    // Frames written back-to-back are read back in order, and EOF reads as None.
     #[tokio::test]
     async fn framed_write_then_read_in_order() {
         let (client, server) = tokio::io::duplex(256);
         let mut reader = BufReader::new(server);
 
-        // Writer task: emit two frames then drop the stream → EOF on the reader.
         let writer = tokio::spawn(async move {
             let mut w = client;
             write_frame(
@@ -380,7 +315,6 @@ mod tests {
             write_frame(&mut w, &ServerFrame::Attached).await.unwrap();
         });
 
-        // Reader sees the two frames in order, then a clean EOF.
         match read_frame::<_, ServerFrame>(&mut reader).await.unwrap() {
             Some(ServerFrame::Event { seq, event }) => {
                 assert_eq!(seq, 0);
@@ -403,7 +337,6 @@ mod tests {
         writer.await.unwrap();
     }
 
-    // A ClientFrame carrying a UiEvent round-trips across the same framing.
     #[tokio::test]
     async fn client_frame_round_trip() {
         let (a, b) = tokio::io::duplex(256);
@@ -447,13 +380,9 @@ mod tests {
         }
     }
 
-    // A non-offering Attach serializes byte-identically to before the reverse_offer
-    // field existed (skip_serializing_if), so the phone/ordinary-client wire is
-    // unchanged; an offering Attach carries the flag. The reverse-direction frames
-    // round-trip across the same framing.
+    // A non-offering Attach must omit `reverse_offer` so phone clients see unchanged bytes.
     #[test]
     fn reverse_edge_frames_wire_bytes_and_round_trip() {
-        // A plain attach omits reverse_offer entirely (pins the phone-compatible bytes).
         let plain = ClientFrame::Attach {
             after_seq: None,
             who: ClientIdentity::human("alice"),
@@ -463,7 +392,6 @@ mod tests {
             serde_json::to_string(&plain).unwrap(),
             r#"{"Attach":{"after_seq":null,"who":{"kind":"Human","name":"alice","session_id":null,"task":null}}}"#
         );
-        // An offering attach carries the flag.
         let offering = ClientFrame::Attach {
             after_seq: None,
             who: ClientIdentity::human("alice"),
@@ -514,10 +442,7 @@ mod tests {
         }
     }
 
-    // Exact wire bytes for the new control-plane variants, pinned against serde's
-    // external tagging so the Kotlin mirror (FramesTest) can assert the same strings.
-    // A UiEvent::Command inside ClientFrame::Command double-nests the tag — the frame
-    // wrapper and the event share the name "Command", which is fine (distinct enums).
+    // Pinned so the Kotlin mirror (FramesTest) can assert the same strings.
     #[test]
     fn command_and_capabilities_wire_bytes() {
         use crate::core::events::{CommandInfo, PeerInfo};
@@ -559,8 +484,8 @@ mod tests {
         );
     }
 
-    // Pinned for the Kotlin mirror (FramesTest). A frame from a daemon that predates
-    // `auto` has no such key and must still decode, as auto off.
+    // Pinned for the Kotlin mirror (FramesTest). A frame without `auto` must still
+    // decode, as auto off.
     #[test]
     fn session_info_wire_bytes() {
         use crate::core::ControllerEvent;

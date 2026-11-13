@@ -5,15 +5,9 @@ use std::path::{Path, PathBuf};
 use crate::core::store::{ImportedMessage, SessionRow, SessionState, SessionStore};
 use crate::llm::Message;
 
-// One-time migration of the legacy JSONL layout (~/.nudge/projects/<flattened-cwd>/)
-// into the store. Strictly READ-ONLY on the JSONL side: old transcripts and
-// index.json are never modified or deleted — they remain the archival source.
-//
-// Error posture: a malformed line skips that line, an unreadable file skips that
-// session, and every skip is counted and reported — never silent, never fatal to
-// the run. Only a store write error aborts (and leaves the marker unset, so the
-// next open retries; `import_session` is per-session atomic and skips ids already
-// present, making the retry cheap and duplicate-free).
+// Read-only on the JSONL side: the legacy files stay as the archive. Bad lines
+// and files are counted and skipped; only a store write error aborts, leaving
+// the marker unset so the next open retries (per-session atomic, dedup by id).
 pub(super) fn run(store: &mut SessionStore) -> Result<()> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
     let root = PathBuf::from(home).join(".nudge").join("projects");
@@ -38,7 +32,6 @@ struct ImportStats {
 
 fn import_tree(root: &Path, store: &mut SessionStore) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
-    // No legacy layout at all — a fresh install — is nothing to import.
     let Ok(dirs) = std::fs::read_dir(root) else {
         return Ok(stats);
     };
@@ -57,10 +50,8 @@ fn import_dir(dir: &Path, store: &mut SessionStore, stats: &mut ImportStats) -> 
         return Ok(());
     };
 
-    // The cwd is recovered from the envelopes themselves (the directory name is a
-    // lossy flattening). Index-only sessions (renamed before their first turn)
-    // have no envelopes, so they borrow a sibling transcript's cwd — every
-    // session in one legacy dir shared the same working directory.
+    // The dir name is a lossy flattening of cwd, so cwd comes from envelopes;
+    // index-only sessions borrow a sibling's, since a legacy dir shared one cwd.
     let mut dir_cwd: Option<String> = None;
     let mut seen: Vec<String> = Vec::new();
 
@@ -124,9 +115,8 @@ fn import_dir(dir: &Path, store: &mut SessionStore, stats: &mut ImportStats) -> 
         }
     }
 
-    // Index entries with no transcript file: renamed before the first turn (the
-    // old set_name materialized the file, but belt-and-suspenders — import them
-    // as empty named sessions so a resume by name keeps working).
+    // Index entries without a transcript import as empty named sessions so
+    // resume by name keeps working.
     for (id, entry) in &index {
         if seen.iter().any(|s| s == id) {
             continue;
@@ -149,12 +139,8 @@ fn import_dir(dir: &Path, store: &mut SessionStore, stats: &mut ImportStats) -> 
     Ok(())
 }
 
-// The legacy envelope contract (the pre-store `Session::open`): `message` is
-// required and must parse as a typed Message; `sender` is lenient — absent on
-// pre-sender logs, malformed reads as None — so old lines import unattributed.
-// The content column gets the typed message serialized ONCE with to_string,
-// the same fidelity the JSONL resume path had. Returns the envelope's own cwd
-// alongside, the only surviving record of where the session ran.
+// `sender` is lenient (absent or malformed reads as None) so old lines import
+// unattributed; `message` must parse.
 fn parse_line(line: &str) -> Option<(ImportedMessage, Option<String>)> {
     let envelope: Value = serde_json::from_str(line).ok()?;
     let message: Message = serde_json::from_value(envelope.get("message")?.clone()).ok()?;
@@ -182,8 +168,6 @@ fn parse_line(line: &str) -> Option<(ImportedMessage, Option<String>)> {
     ))
 }
 
-// One row of the legacy per-project name index (`index.json`), read leniently:
-// a missing/corrupt index just means "no names", never a hard error.
 #[derive(serde::Deserialize)]
 struct IndexEntry {
     name: String,
@@ -250,7 +234,6 @@ mod tests {
                 })),
             ),
             envelope("assistant", text("ok"), "2026-01-01T00:01:00+00:00", None),
-            // A malformed sender is lenient: the line imports unattributed.
             envelope(
                 "user",
                 text("again"),
@@ -289,7 +272,6 @@ mod tests {
         assert_eq!(sender.name, "child-1");
         assert!(rows[1].sender.is_none(), "pre-sender line is unattributed");
         assert!(rows[2].sender.is_none(), "malformed sender reads as None");
-        // Content fidelity: the column holds the typed message serialized once.
         let expected = serde_json::to_string(&Message {
             role: "user".into(),
             content: vec![ContentBlock::Text {
@@ -333,8 +315,7 @@ mod tests {
         let root = temp_root();
         let dir = root.join("p");
         std::fs::create_dir_all(&dir).unwrap();
-        // A directory named like a transcript: read_to_string fails, the
-        // session is skipped, and the sibling still imports.
+        // A directory named like a transcript makes read_to_string fail.
         std::fs::create_dir_all(dir.join("bad.jsonl")).unwrap();
         std::fs::write(
             dir.join("good.jsonl"),
@@ -380,7 +361,6 @@ mod tests {
         assert_eq!(row.cwd, "/proj/alpha", "borrows the sibling's cwd");
         assert_eq!(row.last_activity, "2026-03-03T00:00:00+00:00");
         assert!(store.load_transcript("bbbb").unwrap().is_empty());
-        // And it resolves by name for resume, scoped to the recovered cwd.
         assert_eq!(
             store
                 .resolve_reference("/proj/alpha", "early-name")
@@ -423,11 +403,8 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // The money test: a real-world shape — clean prefix, then an orphaned tail
-    // (a user prompt that never got a reply and an assistant tool_use turn).
-    // The import lands ALL rows; the first resume truncates the tail in memory
-    // (dropped=2) and flips exactly those rows to superseded, leaving the audit
-    // record intact underneath.
+    // Import lands all rows; the first resume supersedes (not deletes) the
+    // orphaned tail: an unanswered prompt and a dangling tool_use.
     #[test]
     fn resume_of_imported_session_truncates_and_supersedes_the_orphaned_tail() {
         let root = temp_root();
@@ -453,8 +430,6 @@ mod tests {
         assert_eq!(resumed.dropped, 2);
         assert_eq!(resumed.entries.len(), 2);
 
-        // Superseded, not deleted: the live view is the clean prefix, the audit
-        // record still holds all four rows.
         let conn = rusqlite::Connection::open(&db).unwrap();
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(

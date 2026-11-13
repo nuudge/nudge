@@ -5,24 +5,14 @@ use super::events::{ControllerEvent, UiEvent};
 use super::host::{BrokerHandle, Controller, SessionHost};
 use super::identity::ClientIdentity;
 
-// The set of peers this agent is a *client* of — the outbound half of symmetric
-// communication. Each peer is held as an ordinary `Controller` (the same one a
-// human front-end gets from `attach`), so `observe` = drain its events and `drive`
-// = send on its `ui_tx`. This module names no transport: a local peer's controller
-// comes from `SessionHost::attach`, a remote peer's from `RelayClient::attach`, and
-// this set can't tell them apart — the composition root creates them and hands them
-// in via `register`.
+// Peers this agent is a client of. Each is an ordinary `Controller`, so local and
+// remote peers are indistinguishable here; the composition root supplies them.
 
-// Local routing key for one held peer. Broker-side controllers have their own
-// `ControllerId`; this is the mirror on the client side and is unrelated to it.
+// Unrelated to the broker's `ControllerId`.
 pub type PeerId = u64;
 
-// Creates a peer on demand — the executor behind the model-facing `Spawn` tool. The
-// composition root supplies it (building an agent needs a provider, a backend, and a
-// session — all things `core` must not construct), and the loop calls it with the
-// task plus a handle to its OWN broker so the factory can wire the return edge
-// (child attaches back to the spawner). Absent for agents that may not spawn (a
-// factory-made child gets `None`, so there is no recursive spawning yet).
+// Supplied by the composition root because building an agent needs things `core` must
+// not construct. Gets the spawner's own broker so the child can attach back.
 pub type PeerFactory = Box<
     dyn Fn(
             String,
@@ -33,13 +23,8 @@ pub type PeerFactory = Box<
         + Sync,
 >;
 
-// Dials a remote peer on demand — the executor behind the human-only `/connect-peer`
-// command. Like `PeerFactory`, the composition root supplies it (dialing needs a
-// transport, which `core` must not name), and the loop hands it the pasted pairing
-// code plus a handle to its OWN broker (so the far side's reverse edge attaches back).
-// It captures the runtime registrar, so the completed forward edge returns through
-// `peer_register_rx` rather than blocking the loop on network I/O. Absent for a session
-// that cannot dial (a spawned child).
+// The completed edge returns through `peer_register_rx` so the loop never blocks on
+// network I/O.
 pub type PeerDialer = Box<
     dyn Fn(
             String,
@@ -49,35 +34,22 @@ pub type PeerDialer = Box<
         + Sync,
 >;
 
-// A peer this agent holds a client connection to.
 struct Peer {
     who: ClientIdentity,
     controller: Controller,
-    // Keep-alive for a locally spawned child: the `SessionHost` owns the child's loop
-    // and broker tasks, so dropping this `Peer` (reap, or the parent ending) ends the
-    // child. `None` when the peer's lifetime is owned elsewhere (the return edge held
-    // by a child, a remote peer, a test's synthetic controller).
+    // Owns a locally spawned child's tasks, so dropping the Peer ends the child.
     _host: Option<SessionHost>,
-    // Direction of creation: true = this agent spawned the peer, so it steers the
-    // peer's permission check-ins and may dismiss it. The return edge a child holds
-    // to its spawner is unsupervised — which is what stops a child answering its
-    // parent's gated calls (first-responder-wins would let it beat the human).
+    // True = this agent spawned the peer. The return edge stays unsupervised so a
+    // child can't answer its parent's gated calls ahead of the human.
     supervised: bool,
-    // The mirror of `supervised`: true = this peer spawned this agent (the return
-    // edge seeded at spawn). The loop reports up this edge when it stalls (e.g.
-    // hitting the iteration limit), so the spawner's model is woken to steer.
+    // True = this peer spawned this agent; the loop reports stalls up this edge.
     spawner: bool,
-    // Compact activity digest for the NEXT steering check-in (supervised peers
-    // only): a capped ring of one-line records, drained when a check-in is composed
-    // and folded nowhere else — supervision cost scales with check-ins, not with
-    // the peer's verbosity.
+    // Capped and drained per check-in, so supervision cost scales with check-ins,
+    // not the peer's verbosity.
     recent: VecDeque<String>,
 }
 
-// Dropping a held child (dismissal, reap, or this agent itself ending) must
-// actually end it: the child's loop holds its own broker handle, so only an
-// explicit Quit reaches it — this is what makes "dropping the Peer ends the
-// child" true, letting the child's loop wind down and mark its row 'ended'.
+// The child's loop holds its own broker handle, so only an explicit Quit ends it.
 impl Drop for Peer {
     fn drop(&mut self) {
         if let Some(host) = &self._host {
@@ -86,31 +58,19 @@ impl Drop for Peer {
     }
 }
 
-// The most a steering check-in may carry from the activity ring: these caps are the
-// context-frugality contract (see supervision_plan.md decision 2).
 const RECENT_LINES_CAP: usize = 10;
 const RECENT_LINE_CHARS_CAP: usize = 120;
 
-// A peer handed to the loop at runtime (spawned by the factory, or registered by the
-// composition root). Carries the controller plus the peer's announced identity, so
-// the loop can attribute the peer's activity to a name.
 pub struct PeerRegistration {
     pub controller: Controller,
     pub who: ClientIdentity,
     pub host: Option<SessionHost>,
-    // Set only by this agent's own Spawn path (trust-by-wiring — never announced
-    // over the handshake, so a peer cannot claim it).
+    // Set only by local wiring, never announced over the handshake, so a peer can't claim it.
     pub supervised: bool,
-    // Set only when seeding a child's return edge (trust-by-wiring, like
-    // `supervised`): this peer is the agent's spawner.
+    // Set only when seeding a child's return edge, like `supervised`.
     pub spawner: bool,
 }
 
-// The peer capabilities an agent is born with: whether it may spawn subagents (the
-// factory), which peers it already holds — e.g. a spawned child starts with its
-// return edge to the spawner seeded here, so MessagePeer is available from its very
-// first turn — and the runtime registrar the composition root drives to hand the
-// live loop new peers (a `/connect-peer` edge). Default = a plain session with none.
 #[derive(Default)]
 pub struct PeerWiring {
     pub factory: Option<PeerFactory>,
@@ -120,8 +80,6 @@ pub struct PeerWiring {
 }
 
 impl PeerRegistration {
-    // A registration with no owned host and no supervision — for peers whose
-    // lifetime and steering live elsewhere (a return edge, a test controller).
     pub fn new(controller: Controller, who: ClientIdentity) -> Self {
         Self {
             controller,
@@ -133,9 +91,6 @@ impl PeerRegistration {
     }
 }
 
-// Holds every peer the agent drives/observes and merges their event streams into
-// one input for the loop. Empty by default, so a top-level session (no peers) never
-// exercises any of this.
 #[derive(Default)]
 pub struct PeerSet {
     peers: HashMap<PeerId, Peer>,
@@ -143,7 +98,6 @@ pub struct PeerSet {
 }
 
 impl PeerSet {
-    // Start holding a peer; returns its local id (the routing key for `drive`).
     pub fn register(&mut self, reg: PeerRegistration) -> PeerId {
         let id = self.next_id;
         self.next_id += 1;
@@ -165,7 +119,6 @@ impl PeerSet {
         self.peers.get(&id).is_some_and(|p| p.supervised)
     }
 
-    // The edge to this agent's spawner, if it has one (a factory-made child).
     pub fn spawner_id(&self) -> Option<PeerId> {
         self.peers
             .iter()
@@ -173,15 +126,11 @@ impl PeerSet {
             .map(|(id, _)| *id)
     }
 
-    // Whether any held peer is supervised — gates the RespondToPeer/DismissPeer
-    // schemas (an agent that supervises nobody has no verdicts to deliver).
     pub fn has_supervised(&self) -> bool {
         self.peers.values().any(|p| p.supervised)
     }
 
-    // Record one line of observed activity for a supervised peer's next check-in.
-    // No-op for unsupervised peers — this agent will never steer them, so buffering
-    // their activity would pay for context nobody spends.
+    // Unsupervised peers are never steered, so their activity isn't buffered.
     pub fn record_activity(&mut self, id: PeerId, line: &str) {
         let Some(p) = self.peers.get_mut(&id) else {
             return;
@@ -202,7 +151,6 @@ impl PeerSet {
         p.recent.push_back(clipped);
     }
 
-    // Take the activity recorded since the last check-in (clears the ring).
     pub fn drain_activity(&mut self, id: PeerId) -> Vec<String> {
         self.peers
             .get_mut(&id)
@@ -210,12 +158,8 @@ impl PeerSet {
             .unwrap_or_default()
     }
 
-    // Resolve to the next event from ANY held peer, tagged by its id, or never
-    // resolve while none are held (so the loop's other `select!` arms keep running
-    // — `select_all` panics on an empty iterator, so guard it). `None` = that peer's
-    // event stream closed (it went away); the caller reaps it with `remove`. Same
-    // borrow discipline as the broker's `recv_any_ui`: the losing futures are dropped
-    // before returning, ending the `&mut` borrow, and the handler re-borrows fresh.
+    // Pends forever when empty (`select_all` panics on an empty iterator). `None` means
+    // that peer's stream closed; the caller reaps it with `remove`.
     pub async fn recv(&mut self) -> (PeerId, Option<ControllerEvent>) {
         if self.peers.is_empty() {
             std::future::pending().await
@@ -229,16 +173,13 @@ impl PeerSet {
         }
     }
 
-    // Drive a peer: send it a UiEvent up its `ui_tx` (an instruction, or a permission
-    // verdict). Best-effort — a peer whose channel is gone is reaped on the next
-    // `recv`, so a failed send here is a harmless no-op.
+    // A failed send is harmless: the gone peer is reaped on the next `recv`.
     pub async fn drive(&self, id: PeerId, ev: UiEvent) {
         if let Some(p) = self.peers.get(&id) {
             let _ = p.controller.ui_tx.send(ev).await;
         }
     }
 
-    // Stop holding a peer (its stream closed). No-op if already gone.
     pub fn remove(&mut self, id: PeerId) {
         self.peers.remove(&id);
     }
@@ -247,7 +188,6 @@ impl PeerSet {
         self.peers.is_empty()
     }
 
-    // Resolve a peer by its announced name — how the model addresses one.
     pub fn find_by_name(&self, name: &str) -> Option<PeerId> {
         self.peers
             .iter()
@@ -255,16 +195,14 @@ impl PeerSet {
             .map(|(id, _)| *id)
     }
 
-    // The names of every held peer, for the model's error recovery ("no such peer;
-    // current peers: …"). Sorted so the wording is deterministic.
+    // Sorted so the wording is deterministic.
     pub fn roster(&self) -> Vec<String> {
         let mut names: Vec<String> = self.peers.values().map(|p| p.who.name.clone()).collect();
         names.sort();
         names
     }
 
-    // The full roster for /peers and the Capabilities event. Sorted by name so the
-    // listing (and change detection against a prior snapshot) is deterministic.
+    // Sorted so change detection against a prior snapshot is deterministic.
     pub fn infos(&self) -> Vec<super::events::PeerInfo> {
         let mut out: Vec<super::events::PeerInfo> = self
             .peers
@@ -281,8 +219,6 @@ impl PeerSet {
         out
     }
 
-    // Display name for a peer, for attributing its activity in Notices. Falls back to
-    // the routing id if the peer is already gone.
     pub fn display_name(&self, id: PeerId) -> String {
         self.peers
             .get(&id)
@@ -296,8 +232,7 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    // A synthetic peer: the `Controller` the PeerSet holds, plus the far ends a test
-    // uses to inject the peer's events and observe what the PeerSet drives to it.
+    // Returns the far ends a test uses to inject events and observe what's driven.
     fn fake_peer() -> (
         Controller,
         mpsc::UnboundedSender<ControllerEvent>,
@@ -315,7 +250,6 @@ mod tests {
         )
     }
 
-    // recv() merges every held peer's stream and tags each event with the right id.
     #[tokio::test]
     async fn recv_merges_and_tags_by_peer() {
         let mut peers = PeerSet::default();
@@ -352,7 +286,6 @@ mod tests {
         }
     }
 
-    // drive() sends a UiEvent up the addressed peer's ui_tx.
     #[tokio::test]
     async fn drive_reaches_the_addressed_peer() {
         let mut peers = PeerSet::default();
@@ -368,8 +301,6 @@ mod tests {
         }
     }
 
-    // A peer whose event stream closes surfaces as (id, None); removing it leaves the
-    // other peers intact and still mergeable.
     #[tokio::test]
     async fn closed_peer_reports_none_and_reaps_without_disturbing_others() {
         let mut peers = PeerSet::default();
@@ -381,7 +312,7 @@ mod tests {
         ));
         let b = peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")));
 
-        drop(a_ev); // A's broker/stream is gone
+        drop(a_ev);
         match peers.recv().await {
             (id, None) => {
                 assert_eq!(id, a);
@@ -390,7 +321,6 @@ mod tests {
             other => panic!("expected A closed, got {other:?}"),
         }
 
-        // B is unaffected: its events still merge after A was reaped.
         b_ev.send(ControllerEvent::Notice {
             text: "still-here".into(),
         })

@@ -4,11 +4,8 @@ use super::types::AgentConfig;
 use crate::core::events::AgentEvent;
 use crate::core::session::Session;
 
-// Emit SessionInfo only when the (model, branch, name, auto) tuple changed, so headers
-// track the daemon without an identical event flooding the replay buffer each turn.
-// `branch` — and the session fields — are read by the caller *before* the await: holding
-// `&Backend` across it would force a `B: Sync` bound on the whole loop, and holding
-// `&Session` would demand `Sync` of the store connection.
+// Dedup keeps identical events from flooding the replay buffer each turn. Fields are
+// passed owned: borrowing `&Backend`/`&Session` across the await would demand `Sync`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn emit_session_info_if_changed(
     tx: &mpsc::Sender<AgentEvent>,
@@ -37,9 +34,7 @@ pub(super) async fn emit_session_info_if_changed(
         .await;
 }
 
-// Persist a resolved label and broadcast it: a Notice (so the user — and the TUI, which
-// can't know a daemon-derived name synchronously — sees the final label) plus a re-emit
-// of SessionInfo through the change-detecting helper.
+// The Notice matters: the TUI can't know a daemon-derived name synchronously.
 pub(super) async fn finalize_rename(
     name: String,
     branch: Option<String>,

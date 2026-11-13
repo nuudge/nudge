@@ -20,27 +20,21 @@ use crate::core::{
     SessionHandle, UiEvent,
 };
 
-// Channel depth between the bridge tasks and the TUI. Matches the in-process
-// host's CHANNEL_CAPACITY so backpressure behaves the same across transports.
+// Matches the in-process host's CHANNEL_CAPACITY so backpressure behaves the same
+// across transports.
 const CHANNEL_CAPACITY: usize = 64;
 
-// How long a peer dial waits, after `Attached`, for the acceptor's `ReverseAttach`.
-// A real `--daemon --peer` sends it as the first post-Attached frame; a non-peer
-// target never does, so this bound turns "no return edge" into a clean failure
-// instead of a hang.
+// A non-peer target never sends `ReverseAttach`; this bound turns that into a clean
+// failure instead of a hang.
 const REVERSE_ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 // Several relay pair timeouts' worth of failed redials: past a sleep's network
 // recovery, so the likelier cause is a restarted daemon (see `redial`).
 const RESTART_HINT_AFTER: Duration = Duration::from_secs(120);
 
-// The remote counterpart of `SessionHost`: it owns no loop, only the path to a
-// daemon's Unix socket. Each `attach` opens a fresh connection, performs the
-// handshake, and spawns two bridge tasks that translate between socket frames and
-// the in-memory `Controller` channels the TUI already speaks — so the TUI runs
-// unchanged whether it drives a local host or a remote daemon. A connection lives
-// exactly as long as one foreground attachment: detaching or quitting drops the
-// `Controller`, which tears the connection down.
+// Bridges a daemon's Unix socket to the in-memory `Controller` channels, so the TUI
+// runs unchanged against a remote daemon. Dropping the `Controller` tears the
+// connection down.
 pub struct SocketClient {
     socket_path: PathBuf,
 }
@@ -50,9 +44,6 @@ impl SocketClient {
         Self { socket_path }
     }
 
-    // Open + handshake on a fresh connection. `after_seq` is the resume cursor
-    // (None = full replay). Split from the trait method so a future auto-reconnect
-    // path can request replay-from-cursor without a new public API.
     pub(crate) async fn connect(
         &self,
         after_seq: Option<u64>,
@@ -75,18 +66,14 @@ impl SocketClient {
         let handshake: Option<ServerFrame> = reader.recv().await?;
         match handshake {
             Some(ServerFrame::Attached) => {}
-            Some(ServerFrame::Busy) => return Ok(None), // session gone (broker down)
-            // The daemon must answer the handshake with Attached or Busy; anything
-            // else (including EOF) is a protocol fault.
+            Some(ServerFrame::Busy) => return Ok(None),
             other => anyhow::bail!("unexpected handshake response: {other:?}"),
         }
 
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
 
-        // Reader bridge: inbound Event frames → the controller's event stream.
         tokio::spawn(pump_reads(reader, event_tx));
-        // Writer bridge: the controller's UiEvents → outbound Command frames.
         tokio::spawn(pump_writes(writer, ui_rx));
 
         Ok(Some(Controller {
@@ -97,36 +84,18 @@ impl SocketClient {
 }
 
 impl SessionHandle for SocketClient {
-    // The TUI always attaches with a full replay (`after_seq = None`), matching the
-    // in-process behaviour where a foreground reattach replays the whole buffer.
-    // Seq-aware resume is wired through `connect` but unused until drops are real
-    // (relay / cellular in a later phase).
-    //
-    // Silent on failure (Err → None): a foreground reattach runs this *under the
-    // TUI*, where any stderr write would corrupt the alternate screen and desync
-    // ratatui's diff (the stderr-under-TUI rule). The one place that needs the
-    // error's cause — the very first connect, before the TUI owns the screen — calls
-    // `connect` directly (see `run_connect`) and reports it there.
+    // Silent on failure: a foreground reattach runs under the TUI, where a stderr
+    // write would corrupt the screen. The first connect reports errors via `connect`.
     async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
         self.connect(None, who).await.ok().flatten()
     }
 
-    // No-op: the connection lives in the bridge tasks, not here. The TUI drops the
-    // `Controller` immediately after calling this (run_loop: detach → events = None,
-    // ui_tx = None), which closes `ui_rx` (the writer sends an explicit Detach frame
-    // and drops the write half) and the event receiver (the reader winds down on the
-    // next send or on socket EOF). The daemon reads that as a pause-in-place detach.
+    // The connection lives in the bridge tasks; dropping the `Controller` ends it.
     fn detach(&self) {}
 }
 
-// The relayed counterpart of `SocketClient`: it owns no loop, only the relay URL
-// (rendezvous path included) it dials OUT to. `attach` opens a fresh WebSocket
-// through the relay, runs the same handshake as the Unix client — only the codec
-// differs (`WsReader`/`WsWriter` instead of `LineReader`/`LineWriter`), so the TUI is
-// unchanged across transports. Unlike a Unix socket, a relayed connection can die
-// under a live TUI (a laptop sleeping), so the connection is supervised and redialed
-// (see `stay_attached`). Every frame is end-to-end encrypted under `cipher` before it
-// hits the relay (8.2-d).
+// Unlike a Unix socket, a relayed connection can die under a live TUI (a laptop
+// sleeping), so it is supervised and redialed (see `stay_attached`).
 #[derive(Clone)]
 pub struct RelayClient {
     relay_url: String,
@@ -142,16 +111,15 @@ impl RelayClient {
         Self { relay_url, cipher }
     }
 
-    // Dial the relay + handshake, then keep the TUI attached across drops. Split from
-    // the trait method (mirroring `SocketClient::connect`) so the first connect — run
-    // before the TUI owns the screen — can surface its error cause via `run_connect`.
+    // Split from the trait method so the first connect, before the TUI owns the
+    // screen, can surface its error.
     pub(crate) async fn connect(
         &self,
         after_seq: Option<u64>,
         who: ClientIdentity,
     ) -> Result<Option<Controller>> {
         let Some(conn) = self.open(after_seq, who.clone()).await? else {
-            return Ok(None); // session gone (broker down)
+            return Ok(None);
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
@@ -170,8 +138,7 @@ impl RelayClient {
         }))
     }
 
-    // One connection: dial the relay and run the attach handshake. `None` = reachable,
-    // but the session is gone (Busy).
+    // `None` = reachable, but the session is gone (Busy).
     async fn open(
         &self,
         after_seq: Option<u64>,
@@ -199,14 +166,9 @@ impl RelayClient {
         }
     }
 
-    // Dial a peer session over the relay and establish the DUPLEX edge (#60): both
-    // directed edges of the mutual pair ride this one socket. `self_broker` is the
-    // dialer's OWN broker (so the far side can drive/observe it — the reverse edge),
-    // `registrar` hands the forward peer to the dialer's live loop (#52), and `who` is
-    // the dialer's announced identity. Non-blocking: it performs the handshake,
-    // registers the forward peer, attaches the reverse controller, spawns the duplex
-    // pump, and returns — the caller's loop is never held on network I/O. `Err` = the
-    // far side is gone or offered no return edge (not a `--daemon --peer`).
+    // Both directed edges of the mutual peer pair ride this one socket; `self_broker`
+    // is the dialer's own broker, exposed to the far side. Returns once the pump is
+    // spawned so the caller's loop never blocks on network I/O.
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
@@ -232,9 +194,6 @@ impl RelayClient {
             Some(ServerFrame::Busy) => anyhow::bail!("the peer session has ended"),
             other => anyhow::bail!("unexpected handshake response: {other:?}"),
         }
-        // The acceptor announces itself in ReverseAttach as the first frame after
-        // Attached. A non-peer target (a phone daemon) ignores the offer and streams
-        // forward Events instead; bound the wait so we don't hang, then fail cleanly.
         let peer_who = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
             Ok(Ok(Some(ServerFrame::ReverseAttach { who }))) => who,
             _ => anyhow::bail!(
@@ -242,9 +201,6 @@ impl RelayClient {
             ),
         };
 
-        // Forward edge: the dialer holds the acceptor as a peer (drives/observes it).
-        // The pump feeds inbound Events into `fwd_ev_tx` and drains outbound drives from
-        // `fwd_ui_rx`; the Controller with the matching ends goes to the loop's PeerSet.
         let (fwd_ev_tx, fwd_ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (fwd_ui_tx, fwd_ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAPACITY);
         let forward = Controller {
@@ -258,9 +214,7 @@ impl RelayClient {
             anyhow::bail!("the dialer's loop is gone");
         }
 
-        // Reverse edge: attach a controller to the dialer's OWN broker as the acceptor
-        // (provenance: the reverse grant is implied by running /connect-peer). Its
-        // events go out as ReverseEvent; inbound ReverseCommands drive it.
+        // The reverse grant is implied by the user running /connect-peer.
         let ac = match self_broker
             .attach_as(peer_who, ClientProfile::agent())
             .await
@@ -275,22 +229,15 @@ impl RelayClient {
 }
 
 impl SessionHandle for RelayClient {
-    // Full-replay attach, silent on failure — same contract as `SocketClient`
-    // (see its `attach` for why a foreground reattach must not write to stderr).
+    // Silent on failure, same as `SocketClient::attach`.
     async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
         self.connect(None, who).await.ok().flatten()
     }
 
-    // No-op: the connection lives in `stay_attached`. Dropping the `Controller` closes
-    // `ui_rx` (it sends a Detach frame, then drops the socket) and the event receiver,
-    // which the daemon reads as a pause-in-place detach — and which stops any redial.
+    // Dropping the `Controller` detaches and stops any redial in `stay_attached`.
     fn detach(&self) {}
 }
 
-// Forward controller events the daemon streams us into the TUI's event channel.
-// Ends when the daemon closes the connection (clean EOF, or the host shutting down)
-// or the TUI drops the receiver; dropping `event_tx` here closes the TUI's stream,
-// which the run loop reads as "session/connection ended".
 async fn pump_reads<R: FrameReader<ServerFrame> + 'static>(
     mut reader: R,
     event_tx: mpsc::UnboundedSender<ControllerEvent>,
@@ -298,40 +245,32 @@ async fn pump_reads<R: FrameReader<ServerFrame> + 'static>(
     loop {
         match reader.recv().await {
             Ok(Some(ServerFrame::Event { event, .. })) => {
-                // (`seq` is the daemon's cursor bookkeeping; the client ignores it
-                // until auto-reconnect needs to resume from a cursor.)
                 if event_tx.send(event).is_err() {
-                    break; // TUI dropped the stream (detach / quit)
+                    break;
                 }
             }
-            // Post-handshake Attached/Busy are unexpected; ignore defensively.
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break, // daemon closed the connection, or a fault
+            Ok(None) | Err(_) => break,
         }
     }
 }
 
-// Forward the TUI's UiEvents to the daemon as Command frames. When the TUI drops
-// its `ui_tx` (detach / quit), `recv` returns None: send an explicit Detach so the
-// daemon pauses in place rather than inferring it from EOF, then drop the write
-// half (closing the connection).
+// Sends an explicit Detach when the TUI lets go, so the daemon pauses in place
+// rather than inferring it from EOF.
 async fn pump_writes<W: FrameWriter<ClientFrame> + 'static>(
     mut writer: W,
     mut ui_rx: mpsc::Receiver<UiEvent>,
 ) {
     while let Some(ev) = ui_rx.recv().await {
         if writer.send(&ClientFrame::Command(ev)).await.is_err() {
-            return; // connection gone; the reader task will also wind down
+            return;
         }
     }
     let _ = writer.send(&ClientFrame::Detach).await;
 }
 
-// Keep a TUI attached over one relay connection after another — the phone's
-// ChatViewModel pattern. When the socket dies under a still-attached TUI, redial the
-// same pairing and resume after the last event it saw (`after_seq`), so only the gap
-// replays and the transcript isn't duplicated. Ends, dropping `event_tx` (which the TUI
-// reads as "session ended"), once the TUI lets go or the session is gone.
+// Redials the same pairing whenever the socket dies under a still-attached TUI,
+// resuming after `last_seq` so only the gap replays.
 async fn stay_attached(
     client: RelayClient,
     who: ClientIdentity,
@@ -351,8 +290,7 @@ async fn stay_attached(
     )
     .await
     {
-        // TUI input typed from here on queues in `ui_rx` (nothing drains it until the
-        // next `pump_relay`), so it flushes in order after the re-attach.
+        // Input typed during the redial queues in `ui_rx` and flushes in order after.
         let _ = event_tx.send(ControllerEvent::Notice {
             text: "relay connection lost — reconnecting…".into(),
         });
@@ -366,10 +304,8 @@ async fn stay_attached(
     }
 }
 
-// Bridge the TUI's channels to one live connection. `true` = the connection dropped
-// under the TUI (worth a redial); `false` = the TUI let go (detach / quit). A command
-// whose send failed as the socket died is kept in `unsent` and goes out first on the
-// next connection.
+// `true` = the connection dropped (worth a redial); `false` = the TUI let go. A
+// command whose send failed is kept in `unsent` for the next connection.
 async fn pump_relay(
     reader: &mut RelayReader,
     writer: &mut RelayWriter,
@@ -425,15 +361,11 @@ async fn pump_relay(
     false
 }
 
-// Redial with backoff — 1s, 2s, 4s, then every 8s, the phone's schedule — for as long
-// as the TUI stays attached: with no Reattach button to fall back on, giving up would
-// strand a TUI whose network is slow to return after a wake. `None` = stop: the TUI
-// let go, or the session is gone.
+// Backoff 1s, 2s, 4s, then every 8s, forever while the TUI stays attached: giving up
+// would strand a TUI whose network is slow to return after a wake.
 //
-// A restarted daemon minted a new room, so the old code's room has no host: every
-// attempt then parks as a lonely client until the relay's pair timeout closes it, and
-// the retries would go on silently. Once failures have lasted `restart_hint_after`,
-// say so once — the user is the only one who can fetch the new code.
+// A restarted daemon mints a new room, so every attempt then waits out the relay's
+// pair timeout silently; after `restart_hint_after`, tell the user once.
 async fn redial(
     client: &RelayClient,
     who: &ClientIdentity,
@@ -470,14 +402,8 @@ async fn redial(
     }
 }
 
-// The dialer's half of the duplex peer edge (#60): both directed edges over one
-// socket. Forward — the dialer holds the acceptor as a peer: inbound `Event`s feed the
-// forward peer's stream (observe), outbound drives from `fwd_ui_rx` go out as `Command`
-// (drive). Reverse — the acceptor drives/observes the dialer: `ac` (attached to the
-// dialer's own broker) streams its events out as `ReverseEvent`, and inbound
-// `ReverseCommand`s drive it. When the socket drops (or either side tears its half
-// down) the loop ends: dropping `fwd_ev_tx` closes the forward peer's stream (the
-// dialer's PeerSet reaps it), and dropping `ac` detaches the reverse controller.
+// Ends when the socket drops or either half is torn down: dropping `fwd_ev_tx` lets
+// the PeerSet reap the forward peer, and dropping `ac` detaches the reverse controller.
 async fn dial_pump<R, W>(
     mut reader: R,
     mut writer: W,
@@ -494,29 +420,21 @@ async fn dial_pump<R, W>(
         tokio::select! {
             _ = ping.tick() => if writer.keepalive().await.is_err() { break },
             ui = fwd_ui_rx.recv() => match ui {
-                // Drive the acceptor (forward).
                 Some(ui) => if writer.send(&ClientFrame::Command(ui)).await.is_err() { break },
-                // The loop reaped the forward peer → tear the edge down.
                 None => break,
             },
             ev = ac.events.recv() => match ev {
-                // The dialer's own broker events → the acceptor observes them (reverse).
                 Some(event) => {
                     let seq = rev_seq;
                     rev_seq += 1;
                     if writer.send(&ClientFrame::ReverseEvent { seq, event }).await.is_err() { break }
                 }
-                // The dialer's broker went away.
                 None => break,
             },
             frame = reader.recv() => match frame {
-                // The acceptor's events → the forward peer's observe stream.
                 Ok(Some(ServerFrame::Event { event, .. })) => { let _ = fwd_ev_tx.send(event); }
-                // The acceptor drives the dialer (reverse) → the dialer's own broker.
                 Ok(Some(ServerFrame::ReverseCommand(ui))) => { let _ = ac.ui_tx.send(ui).await; }
-                // ReverseAttach was consumed at the handshake; Attached/Busy are noise here.
                 Ok(Some(_)) => {}
-                // Socket closed or a fault → the edge is dropped.
                 Ok(None) | Err(_) => break,
             },
         }
@@ -527,8 +445,6 @@ async fn dial_pump<R, W>(
 mod tests {
     use super::*;
 
-    // A pairing whose room never answers again (the daemon restarted) keeps retrying,
-    // but says once — and only once — that the code may be stale.
     #[tokio::test]
     async fn redial_hints_once_at_a_stale_code() {
         let port = {

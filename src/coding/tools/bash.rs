@@ -5,12 +5,8 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-// Bash runs each command to completion in a fresh shell. Two guards keep a
-// single bad command from wrecking the session: a wall-clock deadline (a hung
-// or interactive command would otherwise block the agent loop indefinitely —
-// the stall is *inside* one tool call, so max_iterations can't break it), and
-// an output cap (a verbose command would otherwise flood the context window).
-// Both are fixed conventions, not tunables — the agent works out of the box.
+// A hang inside one tool call can't be broken by max_iterations, hence the
+// deadline; the cap keeps verbose output from flooding the context.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 
@@ -46,10 +42,6 @@ fn intent_of(input: &Value) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-// Display label: the model-stated intent reads better than a raw command in
-// the collapsed tool-call header. Tolerate a missing intent (schema requires
-// it, but display shouldn't break on a non-conforming call) by falling back
-// to the command itself.
 pub fn summarize(input: &Value) -> String {
     match intent_of(input) {
         Some(intent) => intent.to_string(),
@@ -57,9 +49,7 @@ pub fn summarize(input: &Value) -> String {
     }
 }
 
-// Permission prompts must show the actual command, not just the intent — the
-// user is approving what will run, and an intent like "list files" says
-// nothing about what the command really does.
+// The user is approving what will run, so show the command, not just the intent.
 pub fn permission_summary(input: &Value) -> String {
     let command = command_of(input);
     match intent_of(input) {
@@ -76,10 +66,8 @@ pub async fn execute(input: &Value) -> Result<String> {
 }
 
 async fn run(command: &str, deadline: Duration) -> Result<String> {
-    // kill_on_drop so the timeout path actually reaps the child: when the
-    // deadline elapses, the `wait_with_output` future is dropped, dropping the
-    // Child, which sends a kill. Without it the process would orphan and keep
-    // running after we've already returned a timeout error.
+    // kill_on_drop: on timeout the dropped future drops the Child, killing it
+    // instead of orphaning it.
     let child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -97,20 +85,15 @@ async fn run(command: &str, deadline: Duration) -> Result<String> {
         ),
     };
 
-    // stderr last so it survives middle-truncation: a failing command's
-    // diagnostic text is almost always what the model needs, and the tail is
-    // the part the cap keeps.
+    // stderr last so a failure's diagnostics survive middle-truncation.
     let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
     body.push_str(&String::from_utf8_lossy(&output.stderr));
     let status = output.status.code().unwrap_or(-1);
     Ok(format!("[exit {status}]\n{}", cap_output(&body)))
 }
 
-// Cap output to MAX_OUTPUT_BYTES by eliding the middle, keeping head and tail.
-// Middle-truncation (vs head- or tail-only) preserves both the command echo /
-// first errors and the final summary / exit diagnostics — the two ends carry
-// the most signal. Boundaries are walked to valid char positions so the slice
-// can't split a UTF-8 sequence.
+// Elides the middle: the head (first errors) and tail (summary, diagnostics)
+// carry the most signal.
 fn cap_output(s: &str) -> String {
     if s.len() <= MAX_OUTPUT_BYTES {
         return s.to_string();
@@ -167,8 +150,6 @@ mod tests {
 
     #[test]
     fn truncation_never_splits_a_utf8_sequence() {
-        // '€' is 3 bytes; a byte-index cut could land mid-sequence. The slice
-        // must stay valid UTF-8 regardless of where the boundary falls.
         let s = "€".repeat(MAX_OUTPUT_BYTES);
         let out = cap_output(&s);
         assert!(out.starts_with('€'));
@@ -197,9 +178,6 @@ mod tests {
         let err = run("sleep 30", Duration::from_millis(200))
             .await
             .unwrap_err();
-        // The deadline fires well before the command would finish, and the
-        // error is surfaced (dispatch maps Err → is_error: true) rather than
-        // hanging the loop for 30s.
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(err.to_string().contains("timed out"));
     }

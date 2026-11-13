@@ -55,9 +55,7 @@ pub async fn execute(input: &Value, file_state: &Arc<Mutex<FileState>>) -> Resul
         .await
         .with_context(|| format!("failed to read {file_path}"))?;
 
-    // Record AFTER the read succeeds so a failed read (missing/unreadable file)
-    // doesn't pollute the tracker. Use a sync-side block scoped tight so we
-    // don't hold the lock across other awaits.
+    // Only after a successful read, so a failed read doesn't satisfy Edit's check.
     file_state.lock().await.record_read(path)?;
 
     let mut out = String::new();

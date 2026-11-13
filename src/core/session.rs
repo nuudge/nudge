@@ -8,29 +8,17 @@ use crate::llm::{ContentBlock, Message};
 pub struct Session {
     pub id: String,
     pub cwd: PathBuf,
-    // Human-readable label for the session, layered on top of the immutable
-    // uuid `id`. `None` until the user renames (see `set_name`). The uuid stays
-    // the stored identity (session row, message rows, resume cursor); the name
-    // is pure metadata on the session row, so renaming never touches the
-    // transcript or breaks resume.
+    // Metadata on the row only; the uuid stays the identity, so renaming never breaks resume.
     pub name: Option<String>,
-    // Auto mode as last toggled, persisted on the row so a resume restores it.
     pub auto: bool,
     store: SessionStore,
-    // Log entries produced by the in-flight turn but not yet in the store. They mirror
-    // the messages the loop pushed past its `last_good_snapshot`: `commit` flushes them
-    // when the turn lands on a valid boundary, `rollback` drops them when a provider
-    // error (or steering failure) rolls memory back — so the store always holds exactly
-    // the committed prefix of the transcript, never an entry the live model didn't keep.
+    // The in-flight turn's entries, flushed on `commit` or dropped on `rollback`, so the
+    // store only ever holds the committed prefix the live model kept.
     staged: Vec<(Message, Option<ClientIdentity>)>,
 }
 
-// One logged transcript entry: the model-facing message plus, for a typed user
-// turn, the identity of whoever sent it. The stored text is CLEAN — attribution
-// (the `[message from peer …]` prefix the model sees, the `name > ` stamp a UI
-// shows) is derived from `sender` at build time, never baked into the log.
-// Entries stored without a sender read back as `None` (unattributed); their user
-// text may carry an already-baked prefix, which the absent sender leaves untouched.
+// Stored text is clean: attribution (peer prefix, UI stamp) is derived from `sender`
+// at build time. Entries without a sender may carry an already-baked prefix.
 pub struct LoggedMessage {
     pub message: Message,
     pub sender: Option<ClientIdentity>,
@@ -39,23 +27,14 @@ pub struct LoggedMessage {
 pub struct Resumed {
     pub session: Session,
     pub entries: Vec<LoggedMessage>,
-    // Count of trailing entries discarded by strict truncation (orphaned
-    // tool_use, mid-flight tool_results, or a user prompt with no reply).
-    // Surfaced to the TUI so the user knows their log was partially dropped.
     pub dropped: usize,
 }
 
 impl Session {
-    // `store` is the storage endpoint (the caller's policy — e.g. the shared
-    // ~/.nudge/nudge.db); session identity (the uuid) and the transcript rows are
-    // the mechanism owned here, where the database file lives is not.
     pub fn create(cwd: PathBuf, store: SessionStore) -> Result<Self> {
         Self::create_with(cwd, store, None, None)
     }
 
-    // A session spawned by another agent: identical, plus the provenance edge —
-    // spawned_by (the parent's session id, a foreign key) and the spawn task —
-    // recorded on the row so "which child did what, and why" is queryable later.
     pub fn create_spawned(
         cwd: PathBuf,
         store: SessionStore,
@@ -83,12 +62,8 @@ impl Session {
         })
     }
 
-    // Re-open a session by ID from the store. Applies strict truncation so the
-    // returned message vec ends on a valid alternating-role boundary that the
-    // Messages API will accept on the next request; the truncated tail is marked
-    // superseded in the store (excluded from future reads, never deleted) so a
-    // later resume doesn't replay the orphaned entries mid-transcript. The row
-    // flips back to 'running' — a resumed session is live again.
+    // Truncates to a boundary the Messages API accepts and marks the dropped tail
+    // superseded, so a later resume doesn't replay it mid-transcript.
     pub fn open(id: &str, cwd: PathBuf, store: SessionStore) -> Result<Resumed> {
         let row = store
             .session(id)?
@@ -137,9 +112,6 @@ impl Session {
         })
     }
 
-    // Set (or replace) the session's human label. The uuid `id` — session row,
-    // message rows, resume cursor — is untouched; this only updates the row's
-    // name/branch columns. `branch` is recorded as context for the `--list` picker.
     pub fn set_name(&mut self, name: String, branch: Option<String>) -> Result<()> {
         self.store.set_name(&self.id, &name, branch.as_deref())?;
         self.name = Some(name);
@@ -153,19 +125,13 @@ impl Session {
         self.store.set_auto(&self.id, on)
     }
 
-    // The session's cwd as a display string with $HOME collapsed to `~` — the form
-    // shown in a controller's header. Computed daemon-side (it knows HOME) so a remote
-    // client just renders the string.
+    // Computed daemon-side (it knows HOME) so a remote client just renders the string.
     pub fn cwd_display(&self) -> String {
         tilde_path(&self.cwd)
     }
 
-    // Log a message with the identity of whoever sent it (a typed user turn).
-    // The message's text must be the clean, unattributed form — see `LoggedMessage`.
-    // The message is serialized ONCE here and stored byte-exact; `open` reads those
-    // same bytes back, which the floating cache breakpoint depends on. The write is
-    // a single sub-millisecond INSERT at a turn boundary, so it runs inline rather
-    // than through spawn_blocking.
+    // `message` must be the clean, unattributed form (see `LoggedMessage`). Serialized
+    // once and stored byte-exact, which the floating cache breakpoint depends on.
     pub fn log_from(&mut self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
         let content = serde_json::to_string(message).context("serializing message")?;
         self.store
@@ -173,16 +139,11 @@ impl Session {
         Ok(())
     }
 
-    // Buffer a log entry for the in-flight turn. The message's text must be the clean,
-    // unattributed form (see `LoggedMessage`); it reaches the store only when `commit`
-    // runs.
+    // `message` must be the clean, unattributed form (see `LoggedMessage`).
     pub fn stage(&mut self, message: &Message, sender: Option<&ClientIdentity>) {
         self.staged.push((message.clone(), sender.cloned()));
     }
 
-    // The turn landed on a valid boundary: flush every staged entry to the transcript
-    // and clear the buffer. A write error surfaces as the turn's error exactly as an
-    // eager `log` would today — no entry is silently dropped on a failed flush.
     pub fn commit(&mut self) -> Result<()> {
         for (message, sender) in std::mem::take(&mut self.staged) {
             self.log_from(&message, sender.as_ref())?;
@@ -190,23 +151,17 @@ impl Session {
         Ok(())
     }
 
-    // The turn rolled back (provider error, steering failure): drop its staged entries
-    // so they never reach the store.
     pub fn rollback(&mut self) {
         self.staged.clear();
     }
 
-    // Graceful teardown: mark the row 'ended'. Called once when the agent loop
-    // winds down (quit, dismissal, or a loop error); a crash never gets here,
-    // honestly leaving 'running' — last_activity is the staleness signal then.
+    // A crash never reaches this, leaving 'running'; last_activity is the staleness signal.
     pub fn end(&self) -> Result<()> {
         self.store.set_state(&self.id, SessionState::Ended)
     }
 }
 
-// Collapse a leading $HOME to `~` for display. Falls back to the full path when HOME
-// is unset or isn't a prefix. Lives here (in `core`) so both the daemon seed and the
-// agent loop can format the cwd identically, without depending on the TUI layer.
+// Lives in `core` so the daemon seed and the agent loop format the cwd identically.
 pub fn tilde_path(path: &Path) -> String {
     let display = path.display().to_string();
     match std::env::var("HOME") {
@@ -219,12 +174,8 @@ pub fn tilde_path(path: &Path) -> String {
     }
 }
 
-// Strict truncation: keep only up to and including the most recent assistant
-// turn whose content carries no ToolUse blocks. That is the only state where
-// the next expected role is "user" and there is no dangling tool_use awaiting
-// a tool_result — i.e., a valid place to hand back to the outer loop and wait
-// for the next user message. Anything beyond (orphaned tool_use after a crash,
-// stray tool_results, a user prompt that never got a reply) is discarded.
+// Keep through the last assistant turn with no ToolUse: the only point where the next
+// role is "user" and no tool_use awaits a result. Everything after is discarded.
 fn truncate_to_clean_boundary(entries: &mut Vec<LoggedMessage>) {
     let mut cutoff: Option<usize> = None;
     for (i, entry) in entries.iter().enumerate().rev() {
@@ -250,8 +201,7 @@ mod tests {
     use super::*;
     use crate::core::identity::ClientKind;
 
-    // File-backed temp database so `open` can attach a fresh store connection to
-    // the same data a `create`d session wrote (WAL allows both live at once).
+    // File-backed so `open` can attach a second connection to the same data.
     fn temp_db() -> PathBuf {
         std::env::temp_dir().join(format!("nudge-session-{}.db", uuid::Uuid::new_v4()))
     }
@@ -271,8 +221,6 @@ mod tests {
         }
     }
 
-    // log_from persists the sender next to the (clean) message; open restores it.
-    // Messages logged without a sender (assistant turns) round-trip as None.
     #[test]
     fn log_from_persists_sender_and_open_restores_it() {
         let db = temp_db();
@@ -305,8 +253,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // set_name updates the session row and the in-memory name; a fresh store
-    // connection sees the persisted name with its branch context.
     #[test]
     fn set_name_persists_to_store() {
         let db = temp_db();
@@ -337,8 +283,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // A renamed session's label survives a create → log → open round-trip: open
-    // reloads the name from the session row keyed by the uuid.
     #[test]
     fn open_reloads_persisted_name() {
         let db = temp_db();
@@ -356,9 +300,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // The reported edge: a fresh session renamed before its first turn must still
-    // be resumable — the session row exists from create, so it resolves by name
-    // and opens as an empty, named session.
     #[test]
     fn rename_before_first_turn_is_resumable() {
         let db = temp_db();
@@ -380,8 +321,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // A created-but-never-logged session opens as empty (its row exists from
-    // create), while an unknown id is a genuine error.
     #[test]
     fn open_of_never_logged_session_is_empty_and_unknown_id_errors() {
         let db = temp_db();
@@ -396,9 +335,7 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // Strict truncation on open: the orphaned tail is dropped from the returned
-    // entries AND marked superseded in the store, so a second open sees a clean
-    // transcript with nothing left to drop.
+    // The second open proves the dropped tail was persisted as superseded.
     #[test]
     fn open_truncates_orphaned_tail_and_supersedes_it() {
         let db = temp_db();
@@ -419,8 +356,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // The provenance edge: a spawned session's row carries spawned_by (an
-    // enforced FK to the parent) and the task; a plain create leaves both NULL.
     #[test]
     fn create_spawned_records_provenance_edge() {
         let db = temp_db();
@@ -438,8 +373,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // The state lifecycle: born running, ended on graceful teardown, running
-    // again when a resume re-opens it.
     #[test]
     fn end_marks_row_ended_and_open_marks_running_again() {
         let db = temp_db();
