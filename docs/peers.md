@@ -17,6 +17,23 @@ nudge has two multi-agent models, and it helps to know which one you want:
 This page is about **peers**. For the design behind both, see
 [multi-agent models](multi-agent-models.md).
 
+## Same machine: connect by session id or name
+
+A session running on this machine needs no code and no relay. Pass its id (from any
+project) or its name (within this directory):
+
+```
+/connect-peer backend-api
+```
+
+It connects over the target's local socket, `~/.nudge/run/<session-id>.sock`, which only
+your OS user can open. If the target's human is attached, the edge is an ordinary
+unsupervised peer. A target with no one attached to answer its prompts is
+**supervised** by its first dialer instead: your agent answers its permission prompts.
+The target has to be running; otherwise you get `session <name> isn't running`.
+
+The rest of this page covers peers on other machines, which connect over the relay.
+
 ## Prerequisites
 
 - The session being *connected to* (the target) needs a relay: set `$NUDGE_RELAY` (the
@@ -55,7 +72,7 @@ In the *other* session, paste the code:
 /connect-peer <code>
 ```
 
-You'll see `connecting to peer over the relay…`, then `connected to peer <name>` — the
+You'll see `connecting to peer…`, then `connected to peer <name>` — the
 name is the target's session name (rename yours with `/session-rename` before sharing a
 code if you want a recognizable name). One connect is **bidirectional**: both agents can
 now message each other, and `/peers` on either side lists the other:
@@ -109,6 +126,7 @@ driving their own sessions throughout.
 
 | Surface | What it does |
 | --- | --- |
+| `/connect-peer <id\|name>` | connect a session running on this machine over its socket |
 | `/connect-peer <code>` | dial an agent-peer code; one call, bidirectional edge |
 | `/peers` | list connected peers and spawned subagents |
 | `w` (background screen) | cycle the pairing QR: full-access → watch-only → agent-peer |
