@@ -1,15 +1,7 @@
-# nudge agent instructions
+# Agent Instructions
 
-Instructions for AI agents (and humans) working in this repo. `CLAUDE.md` is a symlink to this file.
+Instructions for AI agents (and humans) working in this repo.
 
-## Commands
-
-Use the `mise` tasks; they mirror CI exactly:
-
-- `mise run ci` — fmt check, clippy with `-D warnings`, tests.
-- `mise run fmt` — auto-fix lints, then format.
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for toolchain setup and the PR workflow, and [`ARCHITECTURE.md`](ARCHITECTURE.md) for where a change belongs.
 
 ## Think before coding
 
