@@ -48,9 +48,17 @@ pub enum ServerFrame {
     Busy,
     // `seq` counts every event the session ever emitted (replay and live share one
     // sequence), so it is a stable resume cursor across reconnects.
-    Event { seq: u64, event: ControllerEvent },
+    Event {
+        seq: u64,
+        event: ControllerEvent,
+    },
     // Sent once after `Attached`, only if the dialer offered a reverse edge.
-    ReverseAttach { who: ClientIdentity },
+    // `supervised` = the dialer was granted `supervisor` over this session.
+    ReverseAttach {
+        who: ClientIdentity,
+        #[serde(default, skip_serializing_if = "is_false")]
+        supervised: bool,
+    },
     // Never sent to a non-offering client.
     ReverseCommand(UiEvent),
 }
@@ -422,16 +430,28 @@ mod tests {
                 session_id: Some("s1".into()),
                 task: None,
             },
+            supervised: true,
         };
         match serde_json::from_str::<ServerFrame>(&serde_json::to_string(&rev_att).unwrap())
             .unwrap()
         {
-            ServerFrame::ReverseAttach { who } => {
+            ServerFrame::ReverseAttach { who, supervised } => {
                 assert_eq!(who.name, "peer-b");
                 assert!(matches!(who.kind, crate::core::identity::ClientKind::Agent));
+                assert!(supervised);
             }
             other => panic!("expected ReverseAttach, got {other:?}"),
         }
+        let unsupervised = ServerFrame::ReverseAttach {
+            who: ClientIdentity::human("h"),
+            supervised: false,
+        };
+        assert!(
+            !serde_json::to_string(&unsupervised)
+                .unwrap()
+                .contains("supervised"),
+            "an unsupervised ReverseAttach must serialize as before"
+        );
 
         let rev_cmd = ServerFrame::ReverseCommand(UiEvent::UserMessage { text: "go".into() });
         match serde_json::from_str::<ServerFrame>(&serde_json::to_string(&rev_cmd).unwrap())

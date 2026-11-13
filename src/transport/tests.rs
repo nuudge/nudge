@@ -168,21 +168,16 @@ fn bind_listener_rebinds_a_stale_socket_and_restricts_it() {
     let _ = std::fs::remove_file(&path);
 }
 
-// The socket counterpart of the relay duplex test: one dial yields both edges.
-#[tokio::test]
-async fn socket_peer_handshake_registers_both_edges() {
-    let bb_a = spawn_bare_broker(Vec::new());
-    let bb_b = spawn_bare_broker(Vec::new());
-    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+// Returns (A's edge to B, B's edge to A) after A dials B's socket.
+async fn dial_socket_peer(
+    a: &BrokerHandle,
+    path: &std::path::Path,
+    reg_b_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>,
+) -> (PeerRegistration, PeerRegistration) {
     let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
-
     timeout(
         Duration::from_secs(5),
-        SocketClient::new(path.clone()).dial_peer(
-            bb_a.handle.clone(),
-            reg_a_tx,
-            agent_id("peer-a"),
-        ),
+        SocketClient::new(path.to_path_buf()).dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
@@ -198,6 +193,22 @@ async fn socket_peer_handshake_registers_both_edges() {
         .expect("B received peer A");
     assert_eq!(peer_b.who.name, "peer-b");
     assert_eq!(peer_a.who.name, "peer-a");
+    (peer_b, peer_a)
+}
+
+// The socket counterpart of the relay duplex test: one dial yields both edges.
+#[tokio::test]
+async fn socket_peer_of_a_human_attended_session_is_unsupervised() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let _human = bb_b
+        .handle
+        .attach(ClientIdentity::human("h"))
+        .await
+        .unwrap();
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+
+    let (peer_b, peer_a) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
     assert!(
         !peer_b.supervised && !peer_a.supervised,
         "both edges unsupervised"
@@ -222,6 +233,53 @@ async fn socket_peer_handshake_registers_both_edges() {
             other => panic!("expected to observe {text:?}, got {other:?}"),
         }
     }
+
+    serve.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+// With no answerer attached, the dialer becomes the target's supervisor and can
+// answer its prompts; the target's edge back stays unsupervised.
+#[tokio::test]
+async fn socket_peer_of_an_unattended_session_supervises_it() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+
+    let (peer_b, peer_a) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
+    assert!(peer_b.supervised, "the dialer holds a supervised edge");
+    assert!(!peer_a.supervised, "the target never supervises its dialer");
+
+    let mut forward = peer_b.controller;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<bool>();
+    bb_b.agent_tx
+        .send(AgentEvent::PermissionRequest {
+            tool_use_id: "t1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+            respond: resp_tx,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut forward).await,
+        Some(ControllerEvent::PermissionRequest { .. })
+    ));
+    forward
+        .ui_tx
+        .send(UiEvent::PermissionResponse {
+            tool_use_id: "t1".into(),
+            allow: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(5), resp_rx).await,
+        Ok(Ok(true)),
+        "the supervisor's answer must resolve the target's prompt"
+    );
 
     serve.abort();
     bb_a.task.abort();

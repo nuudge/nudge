@@ -148,9 +148,12 @@ no relay configured, `/background` still pauses the session — it just shows no
 Every host (TUI or `--daemon`) also listens on a Unix socket at
 `~/.nudge/run/<session-id>.sock` (mode 0600, so the trust boundary is the OS user)
 and unlinks it on exit. It serves clients concurrently and accepts reverse-edge peer
-offers, so a dialer over the socket forms the same unsupervised mutual peer edge as
-over an agent-peer relay room. A second host resuming the same session is refused
-because the socket is live.
+offers. The target's broker picks the dialer's profile at attach: if no attached
+controller can answer permissions, the dialer becomes its `supervisor`; otherwise it is
+a plain `agent_peer`. A TUI session (its human is attached) therefore yields an
+unsupervised mutual edge, and an unattended one is supervised by its first dialer.
+`ReverseAttach` tells the dialer which it got. Relay peers are always unsupervised. A
+second host resuming the same session is refused because the socket is live.
 
 ## Run modes (selected in `main.rs`)
 
