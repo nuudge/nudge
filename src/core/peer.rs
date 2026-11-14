@@ -4,6 +4,7 @@ use std::future::Future;
 use super::events::{ControllerEvent, UiEvent};
 use super::host::{BrokerHandle, Controller, SessionHost};
 use super::identity::ClientIdentity;
+use super::profile::ClientProfile;
 
 // Peers this agent is a client of. Each is an ordinary `Controller`, so local and
 // remote peers are indistinguishable here; the composition root supplies them.
@@ -88,6 +89,33 @@ impl PeerRegistration {
             host: None,
             supervised: false,
             spawner: false,
+        }
+    }
+
+    // The two halves of a mutual peer edge between A and B. If A supervises B, A's edge
+    // to B is `supervised` and B's edge back to A is its `spawner`, so B reports stalls
+    // up it; otherwise both are plain. B attaches back with `back_profile`.
+    pub fn forward(controller: Controller, who: ClientIdentity, supervised: bool) -> Self {
+        Self {
+            supervised,
+            ..Self::new(controller, who)
+        }
+    }
+
+    pub fn back(controller: Controller, who: ClientIdentity, supervised: bool) -> Self {
+        Self {
+            spawner: supervised,
+            ..Self::new(controller, who)
+        }
+    }
+
+    // A supervised B gets no command scope over its supervisor; a plain peer keeps the
+    // `/connect-peer` grant. Neither can answer A's prompts.
+    pub fn back_profile(supervised: bool) -> ClientProfile {
+        if supervised {
+            ClientProfile::agent_peer()
+        } else {
+            ClientProfile::agent()
         }
     }
 }

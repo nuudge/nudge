@@ -15,7 +15,7 @@ use super::wire::{
 };
 use crate::core::{
     BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, HandoffStatus,
-    PeerRegistration, SessionHandle, UiEvent,
+    PeerRegistration, UiEvent,
 };
 
 // A stale socket file (nothing listening) is removed and rebound; a live one means
@@ -58,10 +58,11 @@ pub async fn serve_socket(listener: UnixListener, broker: BrokerHandle, peer_acc
             let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await else {
                 return;
             };
+            // Only this OS user can open the socket, so a non-peer client gets full rights.
             let grant = if reverse_offer {
                 Grant::Peer
             } else {
-                Grant::Kind
+                Grant::Fixed(ClientProfile::human())
             };
             bridge(
                 reader,
@@ -79,8 +80,6 @@ pub async fn serve_socket(listener: UnixListener, broker: BrokerHandle, peer_acc
 }
 
 enum Grant {
-    // From the client's claimed kind.
-    Kind,
     Fixed(ClientProfile),
     // `supervisor` or `agent_peer`, decided by the target's broker.
     Peer,
@@ -262,7 +261,6 @@ async fn bridge<R, W>(
     W: FrameWriter<ServerFrame>,
 {
     let (attached, supervised) = match grant {
-        Grant::Kind => (broker.attach(who.clone()).await, false),
         Grant::Fixed(profile) => (broker.attach_as(who.clone(), profile).await, false),
         Grant::Peer => match broker.attach_peer(who.clone()).await {
             Some((controller, supervised)) => (Some(controller), supervised),
@@ -299,18 +297,15 @@ async fn bridge<R, W>(
         }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
-        // The target never supervises its dialer; named by what the dialer announced. A
-        // supervising dialer is treated like a spawner, so stalls are reported up to it.
-        let _ = pa.registrar.send(PeerRegistration {
-            spawner: supervised,
-            ..PeerRegistration::new(
-                Controller {
-                    events: ev_rx,
-                    ui_tx,
-                },
-                who,
-            )
-        });
+        // Named by what the dialer announced.
+        let _ = pa.registrar.send(PeerRegistration::back(
+            Controller {
+                events: ev_rx,
+                ui_tx,
+            },
+            who,
+            supervised,
+        ));
         rev_ev_tx = Some(ev_tx);
         rev_ui_rx = Some(ui_rx);
     }

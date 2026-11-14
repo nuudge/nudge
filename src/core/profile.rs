@@ -56,6 +56,12 @@ impl ClientProfile {
         }
     }
 
+    // An answerer that can't end the session: an agent approving another session's
+    // prompts, as opposed to its human.
+    pub fn is_supervisor(&self) -> bool {
+        self.may_answer_permissions && !self.may_quit
+    }
+
     pub fn watch_only() -> Self {
         Self {
             may_quit: false,
