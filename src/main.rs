@@ -21,13 +21,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // --list and --connect run before `run::host`: they need no API key or session.
+    // --list and --attach run before `run::host`: they need no API key or session.
     if cli.list {
         return sessions::print_sessions();
     }
 
-    if cli.connect {
-        return run::connect::run(cli).await;
+    if let Some(target) = &cli.attach {
+        return run::attach::run(target, &cli).await;
     }
 
     run::host(cli).await

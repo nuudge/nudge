@@ -53,18 +53,20 @@ OPTIONS:
     --list               List this project's saved sessions (name, id, branch,
                          transcript size, last used), most-recent-first, then exit
     --thinking <mode>    Thinking display: summarized (default) or omitted
-    --daemon             Run the session headless (no TUI); hosts over $NUDGE_RELAY,
-                         or a local Unix socket with --socket
-    --connect            Attach a TUI to a running --daemon (with --pair-code, or
-                         --socket for a local one)
-    --pair-code <code>   (--connect) Attach using a pairing code from the host's QR
-    --socket <path>      Host/attach over a local Unix socket instead of the relay
-                         (for debugging the transport without a relay)
+    --daemon             Run the session headless (no TUI) on its local socket, and
+                         over $NUDGE_RELAY when set
+    --attach <target>    Attach a TUI to a running session: a session id or name on
+                         this machine, or a pairing code from a remote host's QR
+    --connect <target>   At startup, make another session a peer of this one (an id,
+                         name, or pairing code, as with /connect-peer)
+    --watch, --peer      (--daemon, needs $NUDGE_RELAY) Also mint a watch-only /
+                         agent-peer pairing code
     -h, --help           Show help
 ```
 
-The `--daemon` / `--connect` / `--pair-code` flags are about detaching and remote control
-— see [Remote control & relay](remote-and-relay.md).
+The `--daemon` / `--attach` flags are about detaching and remote control — see
+[Remote control & relay](remote-and-relay.md). `--connect` is covered in
+[Peer agents](peers.md).
 
 ## TUI controls
 

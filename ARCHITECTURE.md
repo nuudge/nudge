@@ -105,10 +105,10 @@ graph TD
   tuirun --> sh{SessionHandle}
 
   sh --> inproc["SessionHost<br/>(local TUI / daemon host)<br/>direct channels to broker"]
-  sh --> sock["SocketClient<br/>(--connect --socket)<br/>local Unix socket (debug)"]
-  sh --> relayc["RelayClient<br/>(--connect --pair-code)<br/>E2E-encrypted WebSocket"]
+  sh --> sock["SocketClient<br/>(--attach id|name)<br/>local session socket"]
+  sh --> relayc["RelayClient<br/>(--attach pairing-code)<br/>E2E-encrypted WebSocket"]
 
-  sock -. "newline-JSON frames" .-> daemon["transport daemon<br/>(--daemon --socket)"]
+  sock -. "newline-JSON frames" .-> daemon["session socket<br/>(every host)"]
   relayc -. "sealed Ws frames" .-> relaybox["relay binary"]
   relaybox -. "sealed Ws frames" .-> daemonr["transport relay daemon<br/>(--daemon / $NUDGE_RELAY)"]
   daemon --> brokerd["broker_handle()"]
@@ -121,7 +121,7 @@ The `SessionHandle` trait exposes three operations:
   lock is held elsewhere.
 - **`attach_force`** — same but overrides the lock (local TUI force-takeover,
   so the physically-present machine can reclaim a session a phone left attached).
-  Only `SessionHost` overrides the default; remote `--connect` clients never force.
+  Only `SessionHost` overrides the default; `--attach` clients never force.
 - **`detach`** — release the front-end without ending the session (`/background`);
   the loop keeps running headless and buffers events for the next `attach`.
 
@@ -155,9 +155,9 @@ unsupervised mutual edge, and an unattended one is supervised by its first diale
 `ReverseAttach` tells the dialer which it got. Relay peers are always unsupervised. A
 second host resuming the same session is refused because the socket is live.
 
-`/connect-peer` routes by its argument: a `nudge:` pairing code dials the relay, and
-anything else is resolved as a session id or name (`run::local_peer`) and dialed over
-that session's socket. If nothing listens there, the dialer takes an exclusive lock on
+`/connect-peer` (which `--connect` issues at startup) routes by its argument: a `nudge:` pairing code dials
+the relay, and anything else is resolved as a session id or name (`run::local_peer`) and
+dialed over that session's socket. If nothing listens there, the dialer takes an exclusive lock on
 `~/.nudge/run/<id>.lock`, re-probes, and if the socket is still dead starts a headless
 host for the session in its stored cwd (hidden `--peer-host --resume <id>`, logging to
 `<id>.log`). It holds the lock until its own handshake completes, so the dialer that
@@ -172,10 +172,10 @@ up that edge.
 | Invocation                                   | Topology                                                                                          |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and arms three scoped pairing legs — full-access, watch-only, agent-peer (`w` cycles the QR). |
-| `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR. `--watch` / `--peer` mint and park the watch-only / agent-peer scopes too.    |
-| `nudge --connect --pair-code <code>`         | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
-| `nudge --daemon --socket <path>`             | Headless host on a local Unix socket at `<path>` instead of the session socket, with no relay legs. |
-| `nudge --connect --socket <path>`            | Front-end only (`SocketClient`) over a local Unix socket (debug).                                 |
+| `nudge --daemon`                             | Headless host on its session socket. With `$NUDGE_RELAY` it also dials **out** to the relay, mints a room + key and prints a QR; `--watch` / `--peer` (relay only) mint and park the watch-only / agent-peer scopes too. Without a relay it is local-only and runs until stopped. |
+| `nudge --attach <id\|name>`                  | Front-end only (`SocketClient`) on a live local session's socket; an ended session is not started. |
+| `nudge --attach <pairing-code>`              | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
+| `nudge [--resume <a>] --connect <target>`    | Modifier on a TUI or `--daemon` run: once the host starts, it issues `/connect-peer <target>` to its own loop, so the dial runs in the background and a failure is a Notice. |
 | `nudge --print-prompt`                       | Standalone one-shot action, then exit.                                                            |
 
 Each pairing scope is a distinct room + key mapped daemon-side to a `ClientProfile`
@@ -259,7 +259,7 @@ backend or a non-coding agent could reuse it untouched.
   client; each attach announces an identity, so a shared session attributes every message to
   its sender. The TUI also renders user turns and allow/deny lines *from that stream*, not
   optimistically on the keypress, so one code path serves both live input and replay — and
-  `/background` plus the `--daemon`/`--connect` split fall out of it without the loop knowing
+  `/background` plus the `--daemon`/`--attach` split fall out of it without the loop knowing
   which front-end, if any, is watching.
 - **A subagent is just another client.** There is no bespoke sub-agent runtime: spawning a
   child means standing up a second session and mutually attaching — the parent attaches to

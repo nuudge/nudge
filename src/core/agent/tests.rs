@@ -446,6 +446,68 @@ async fn connect_peer_command_invokes_dialer_and_registers_edge() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+async fn notice_containing(ctrl: &mut Controller, want: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ctrl.events.recv().await {
+                Some(ControllerEvent::Notice { text }) if text.contains(want) => break,
+                Some(_) => continue,
+                None => panic!("the session ended"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no Notice containing {want:?}"));
+}
+
+#[tokio::test]
+async fn a_failed_connect_peer_is_a_notice_and_the_session_carries_on() {
+    use crate::core::{BrokerHandle, PeerDialer, PeerWiring};
+
+    let (session, dir) = mk_session();
+    let dialer: PeerDialer = Box::new(|_target: String, _self: BrokerHandle| {
+        Box::pin(async { Err(anyhow::anyhow!("session worker didn't start")) })
+    });
+    let host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        Vec::new(),
+        PeerWiring {
+            factory: None,
+            initial_peers: PeerSet::default(),
+            register_rx: None,
+            dialer: Some(dialer),
+        },
+    );
+    let mut ctrl = host.attach(ClientIdentity::human("me")).await.unwrap();
+
+    ctrl.ui_tx
+        .send(UiEvent::Command {
+            line: "/connect-peer worker".into(),
+        })
+        .await
+        .unwrap();
+    notice_containing(
+        &mut ctrl,
+        "could not connect to peer: session worker didn't start",
+    )
+    .await;
+
+    ctrl.ui_tx
+        .send(UiEvent::Command {
+            line: "/peers".into(),
+        })
+        .await
+        .unwrap();
+    notice_containing(&mut ctrl, "peer").await;
+
+    host.shutdown().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistration {
     PeerRegistration {
         controller,

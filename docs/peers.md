@@ -133,6 +133,7 @@ driving their own sessions throughout.
 | Surface | What it does |
 | --- | --- |
 | `/connect-peer <id\|name>` | connect a session running on this machine over its socket |
+| `nudge --connect <target>` | start (or `--resume`) a session that runs `/connect-peer <target>` as it opens; works with `--daemon` too |
 | `/connect-peer <code>` | dial an agent-peer code; one call, bidirectional edge |
 | `/peers` | list connected peers and spawned subagents |
 | `w` (background screen) | cycle the pairing QR: full-access → watch-only → agent-peer |
