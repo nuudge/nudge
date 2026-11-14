@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
-use crate::core::store::{SessionState, SessionStore};
+use crate::core::store::{SessionRow, SessionState, SessionStore};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, merge_text_runs,
     ran_code_execution, web_fetch_result, web_fetch_url, web_search_query, web_search_results,
@@ -188,6 +188,14 @@ pub fn open_resume(reference: &str) -> Result<Resumed> {
     let store = open_store()?;
     let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
     Session::open(&id, cwd, store)
+}
+
+// An id resolves from any project; a name only among this cwd's sessions.
+pub fn find_session(reference: &str) -> Result<Option<SessionRow>> {
+    let cwd = std::env::current_dir().context("could not determine cwd")?;
+    let store = open_store()?;
+    let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
+    store.session(&id)
 }
 
 // `state` is best-effort: 'ended' is written only on graceful teardown, so a

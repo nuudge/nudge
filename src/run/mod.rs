@@ -1,6 +1,7 @@
 pub mod connect;
 mod daemon;
 mod local;
+mod local_peer;
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::DirBuilderExt;
@@ -159,16 +160,28 @@ pub async fn host(cli: Cli) -> Result<()> {
     };
     let (peer_reg_tx, peer_reg_rx) =
         tokio::sync::mpsc::unbounded_channel::<core::PeerRegistration>();
-    // Built here because `core` names no transport. The pairing code is
-    // self-contained, so this works with no local relay configured.
+    // Built here because `core` names no transport. A pairing code is self-contained,
+    // so the relay path works with no local relay configured.
     let dialer_registrar = peer_reg_tx.clone();
     let dialer_identity = peer_identity.clone();
+    let dialer_self_id = session.id.clone();
     let dialer: core::PeerDialer =
-        Box::new(move |code: String, self_broker: core::BrokerHandle| {
+        Box::new(move |target: String, self_broker: core::BrokerHandle| {
             let registrar = dialer_registrar.clone();
             let who = dialer_identity.clone();
+            let self_id = dialer_self_id.clone();
             Box::pin(async move {
-                let pairing = transport::Pairing::decode(&code)?;
+                if !transport::Pairing::is_code(&target) {
+                    return local_peer::connect_local(
+                        &target,
+                        &self_id,
+                        self_broker,
+                        registrar,
+                        who,
+                    )
+                    .await;
+                }
+                let pairing = transport::Pairing::decode(&target)?;
                 let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
                 client.dial_peer(self_broker, registrar, who).await
             })

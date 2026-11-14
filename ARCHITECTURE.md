@@ -155,6 +155,10 @@ unsupervised mutual edge, and an unattended one is supervised by its first diale
 `ReverseAttach` tells the dialer which it got. Relay peers are always unsupervised. A
 second host resuming the same session is refused because the socket is live.
 
+`/connect-peer` routes by its argument: a `nudge:` pairing code dials the relay, and
+anything else is resolved as a session id or name (`run::local_peer`) and dialed over
+that session's socket.
+
 ## Run modes (selected in `main.rs`)
 
 | Invocation                                   | Topology                                                                                          |

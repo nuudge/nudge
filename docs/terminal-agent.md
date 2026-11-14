@@ -109,7 +109,7 @@ start with `/`, e.g. a pasted path, still goes to the model):
 | `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
 | `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
 | `/peers` | list connected peer agents and spawned subagents |
-| `/connect-peer <code>` | connect this agent to another session's agent — see [Peer agents](peers.md) |
+| `/connect-peer <id\|name\|code>` | connect this agent to another session's agent: a local session by id or name, a remote one by pairing code — see [Peer agents](peers.md) |
 | `/auto` | toggle auto mode: work is delegated to a supervised subagent — see [Subagents](subagents.md#auto-mode) |
 | `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR (`w` cycles full-access → watch-only → agent-peer) — reattach with `Enter` |
 

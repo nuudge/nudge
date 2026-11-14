@@ -82,7 +82,6 @@ impl SocketClient {
         }))
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
