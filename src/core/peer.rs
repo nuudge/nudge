@@ -68,7 +68,7 @@ pub struct PeerRegistration {
     // Set by local wiring or granted by a same-user socket target, never taken from a
     // relay peer, so a remote side can't claim it.
     pub supervised: bool,
-    // Set only when seeding a child's return edge, like `supervised`.
+    // Set on a child's return edge, or on a socket target's edge back to its supervisor.
     pub spawner: bool,
 }
 

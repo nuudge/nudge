@@ -227,6 +227,8 @@ pub async fn host(cli: Cli) -> Result<()> {
             peer_accept,
         )
         .await
+    } else if cli.peer_host {
+        daemon::run_peer_host(host).await
     } else {
         local::run(host, ui_cfg, who, relay, peer_identity, peer_reg_tx).await
     };

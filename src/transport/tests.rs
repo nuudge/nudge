@@ -213,6 +213,7 @@ async fn socket_peer_of_a_human_attended_session_is_unsupervised() {
         !peer_b.supervised && !peer_a.supervised,
         "both edges unsupervised"
     );
+    assert!(!peer_a.spawner, "a plain peer is not the target's spawner");
 
     let mut peers_a = PeerSet::default();
     let mut peers_b = PeerSet::default();
@@ -251,6 +252,10 @@ async fn socket_peer_of_an_unattended_session_supervises_it() {
     let (peer_b, peer_a) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
     assert!(peer_b.supervised, "the dialer holds a supervised edge");
     assert!(!peer_a.supervised, "the target never supervises its dialer");
+    assert!(
+        peer_a.spawner,
+        "the target reports stalls up to its supervisor"
+    );
 
     let mut forward = peer_b.controller;
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<bool>();
