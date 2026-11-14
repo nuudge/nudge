@@ -1,4 +1,4 @@
-pub mod connect;
+pub mod attach;
 mod daemon;
 mod local;
 mod local_peer;
@@ -32,6 +32,9 @@ pub fn local_identity() -> ClientIdentity {
 
 pub async fn host(cli: Cli) -> Result<()> {
     let config = Config::from_env()?;
+    if cli.daemon && (cli.watch || cli.peer) && config.relay.is_none() {
+        anyhow::bail!("--watch and --peer mint relay pairing codes: set NUDGE_RELAY");
+    }
     // A spawned child builds its own provider with the same key.
     let api_key = config.anthropic_api_key.clone();
 
@@ -106,10 +109,7 @@ pub async fn host(cli: Cli) -> Result<()> {
             .await;
     }
 
-    let socket_path = match cli.socket.clone().filter(|_| cli.daemon) {
-        Some(path) => path,
-        None => session_socket_path(&session.id)?,
-    };
+    let socket_path = session_socket_path(&session.id)?;
     let listener = transport::bind_listener(&socket_path)?;
 
     let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
@@ -160,32 +160,21 @@ pub async fn host(cli: Cli) -> Result<()> {
     };
     let (peer_reg_tx, peer_reg_rx) =
         tokio::sync::mpsc::unbounded_channel::<core::PeerRegistration>();
-    // Built here because `core` names no transport. A pairing code is self-contained,
-    // so the relay path works with no local relay configured.
+    // Built here because `core` names no transport.
     let dialer_registrar = peer_reg_tx.clone();
     let dialer_identity = peer_identity.clone();
     let dialer_self_id = session.id.clone();
     let dialer: core::PeerDialer =
         Box::new(move |target: String, self_broker: core::BrokerHandle| {
-            let registrar = dialer_registrar.clone();
-            let who = dialer_identity.clone();
-            let self_id = dialer_self_id.clone();
-            Box::pin(async move {
-                if !transport::Pairing::is_code(&target) {
-                    return local_peer::connect_local(
-                        &target,
-                        &self_id,
-                        self_broker,
-                        registrar,
-                        who,
-                    )
-                    .await;
-                }
-                let pairing = transport::Pairing::decode(&target)?;
-                let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
-                client.dial_peer(self_broker, registrar, who).await
-            })
+            Box::pin(dial_peer(
+                target,
+                dialer_self_id.clone(),
+                self_broker,
+                dialer_registrar.clone(),
+                dialer_identity.clone(),
+            ))
         });
+    let self_id = session.id.clone();
 
     let host = core::SessionHost::spawn(
         cfg,
@@ -212,21 +201,29 @@ pub async fn host(cli: Cli) -> Result<()> {
         },
     ));
 
-    let result = if cli.daemon {
+    // Before the TUI takes the screen, so a failure prints plainly.
+    let connected = match &cli.connect {
+        Some(target) => dial_peer(
+            target.clone(),
+            self_id,
+            host.broker_handle(),
+            peer_reg_tx.clone(),
+            peer_identity.clone(),
+        )
+        .await
+        .with_context(|| format!("could not connect to {target}")),
+        None => Ok(()),
+    };
+
+    let result = if let Err(e) = connected {
+        let _ = host.shutdown().await;
+        Err(e)
+    } else if cli.daemon {
         let peer_accept = cli.peer.then(|| transport::PeerAccept {
             identity: peer_identity,
             registrar: peer_reg_tx,
         });
-        let socket_only = cli.socket.is_some();
-        daemon::run(
-            host,
-            &socket_path,
-            socket_only,
-            relay,
-            cli.watch,
-            peer_accept,
-        )
-        .await
+        daemon::run(host, &socket_path, relay, cli.watch, peer_accept).await
     } else if cli.peer_host {
         daemon::run_peer_host(host).await
     } else {
@@ -238,6 +235,23 @@ pub async fn host(cli: Cli) -> Result<()> {
     result
 }
 
+// Shared by /connect-peer and --connect. A pairing code is self-contained, so the relay
+// path works with no local relay configured; anything else is a local session.
+async fn dial_peer(
+    target: String,
+    self_id: String,
+    self_broker: core::BrokerHandle,
+    registrar: tokio::sync::mpsc::UnboundedSender<core::PeerRegistration>,
+    who: ClientIdentity,
+) -> Result<()> {
+    if !transport::Pairing::is_code(&target) {
+        return local_peer::connect_local(&target, &self_id, self_broker, registrar, who).await;
+    }
+    let pairing = transport::Pairing::decode(&target)?;
+    let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
+    client.dial_peer(self_broker, registrar, who).await
+}
+
 fn session_socket_path(session_id: &str) -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
     let dir = PathBuf::from(home).join(".nudge").join("run");
@@ -247,4 +261,26 @@ fn session_socket_path(session_id: &str) -> Result<PathBuf> {
         .create(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.join(format!("{session_id}.sock")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dial_peer_routes_a_pairing_code_to_the_relay() {
+        let bb = core::host::spawn_bare_broker(Vec::new());
+        let (registrar, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let err = dial_peer(
+            "nudge:not*base64".into(),
+            "self".into(),
+            bb.handle.clone(),
+            registrar,
+            ClientIdentity::human("h"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("base64"), "{err}");
+        bb.task.abort();
+    }
 }

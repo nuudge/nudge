@@ -37,7 +37,7 @@ pub(super) async fn connect_local(
 
 fn check_target(found: Option<SessionRow>, reference: &str, self_id: &str) -> Result<SessionRow> {
     let target = found.with_context(|| format!("no session matches {reference:?}"))?;
-    anyhow::ensure!(target.id != self_id, "that is this session");
+    anyhow::ensure!(target.id != self_id, "{reference} is this session itself");
     Ok(target)
 }
 
@@ -62,7 +62,7 @@ where
     dial.await
 }
 
-async fn accepts(socket: &Path) -> bool {
+pub(super) async fn accepts(socket: &Path) -> bool {
     UnixStream::connect(socket).await.is_ok()
 }
 
@@ -124,11 +124,9 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
     }
 }
 
-fn label(target: &SessionRow) -> String {
-    match &target.name {
-        Some(name) => name.clone(),
-        None => target.id.chars().take(8).collect(),
-    }
+// The full id, not a prefix, so the label also works as a `--resume` argument.
+pub(super) fn label(target: &SessionRow) -> String {
+    target.name.clone().unwrap_or_else(|| target.id.clone())
 }
 
 fn log_tail(path: &Path) -> String {
