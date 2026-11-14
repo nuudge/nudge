@@ -363,7 +363,8 @@ async fn bridge<R, W>(
                     Ok(Some(ClientFrame::Attach { .. })) => {}
                 }
             }
-            // A closed channel (the PeerSet reaped the return peer) quiets only this arm.
+            // The PeerSet dropped the return peer (a duplicate edge): close so the dialer
+            // reaps its half too.
             rev_ui = recv_opt_ui(&mut rev_ui_rx) => {
                 match rev_ui {
                     Some(ui) => {
@@ -371,7 +372,7 @@ async fn bridge<R, W>(
                             return;
                         }
                     }
-                    None => rev_ui_rx = None,
+                    None => return,
                 }
             }
         }
