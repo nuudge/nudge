@@ -273,7 +273,7 @@ impl BrokerHandle {
                 ack,
             })
             .await?;
-        Some((controller, granted == ClientProfile::supervisor()))
+        Some((controller, granted.is_supervisor()))
     }
 
     pub async fn supervisors(&self) -> Option<watch::Receiver<usize>> {
@@ -607,7 +607,7 @@ async fn broker(
         }
         let count = attached
             .values()
-            .filter(|c| c.profile == ClientProfile::supervisor())
+            .filter(|c| c.profile.is_supervisor())
             .count();
         supervisors.send_if_modified(|n| std::mem::replace(n, count) != count);
     }

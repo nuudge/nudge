@@ -6,7 +6,6 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::coding;
 use crate::core::store::SessionRow;
 use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration};
 use crate::transport::SocketClient;
@@ -19,12 +18,13 @@ const LOG_TAIL_LINES: usize = 10;
 // headless first if it has ended. The edge arrives through `registrar`.
 pub(super) async fn connect_local(
     reference: &str,
+    target: SessionRow,
     self_id: &str,
     self_broker: BrokerHandle,
     registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
 ) -> Result<()> {
-    let target = check_target(coding::find_session(reference)?, reference, self_id)?;
+    check_target(&target, reference, self_id)?;
     let socket = super::session_socket_path(&target.id)?;
     let client = SocketClient::new(socket.clone());
     ensure_running_then(
@@ -35,10 +35,9 @@ pub(super) async fn connect_local(
     .await
 }
 
-fn check_target(found: Option<SessionRow>, reference: &str, self_id: &str) -> Result<SessionRow> {
-    let target = found.with_context(|| format!("no session matches {reference:?}"))?;
+fn check_target(target: &SessionRow, reference: &str, self_id: &str) -> Result<()> {
     anyhow::ensure!(target.id != self_id, "{reference} is this session itself");
-    Ok(target)
+    Ok(())
 }
 
 // The lock is held through `dial`, so the dialer that started the host becomes its
@@ -162,16 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn refuses_its_own_session_and_unknown_references() {
+    fn refuses_its_own_session() {
         let store = SessionStore::open_in_memory().unwrap();
         store
             .insert_session("self-id", "/proj", None, None)
             .unwrap();
-        let own = store.session("self-id").unwrap();
-        let err = check_target(own, "self-id", "self-id").unwrap_err();
+        let own = store.session("self-id").unwrap().unwrap();
+        let err = check_target(&own, "self-id", "self-id").unwrap_err();
         assert!(err.to_string().contains("this session"), "{err}");
-        let err = check_target(None, "ghost", "self-id").unwrap_err();
-        assert!(err.to_string().contains("no session matches"), "{err}");
     }
 
     #[tokio::test]
