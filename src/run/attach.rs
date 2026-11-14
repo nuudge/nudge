@@ -48,20 +48,37 @@ pub async fn run(target: &str, cli: &Cli) -> Result<()> {
             .with_context(|| format!("no session matches {target:?}"))?;
         let socket = super::session_socket_path(&row.id)?;
         let client = SocketClient::new(socket.clone());
-        let controller = attach_local(&client, &socket, &row, who.clone()).await?;
+        let cwd = std::env::current_dir().context("could not determine cwd")?;
+        let controller = attach_local(
+            &client,
+            &socket,
+            &row,
+            &cwd.display().to_string(),
+            who.clone(),
+        )
+        .await?;
         tui::run(&client, ui_cfg, who, controller, None).await
     }
 }
 
+// `cwd` is where the user runs nudge; `--resume` opens a session in the current
+// directory, so a session from elsewhere needs a `cd` first.
 async fn attach_local(
     client: &SocketClient,
     socket: &Path,
     row: &SessionRow,
+    cwd: &str,
     who: ClientIdentity,
 ) -> Result<Controller> {
     if !accepts(socket).await {
         let label = label(row);
-        bail!("session {label} isn't running (resume it with nudge --resume {label})");
+        if row.cwd == cwd {
+            bail!("session {label} isn't running (resume it with nudge --resume {label})");
+        }
+        bail!(
+            "session {label} isn't running (resume it with: cd {} && nudge --resume {label})",
+            row.cwd
+        );
     }
     match client.connect(None, who).await? {
         Some(c) => Ok(c),
@@ -85,20 +102,29 @@ mod tests {
         let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
         let socket = std::env::temp_dir().join(format!("at-{token}.sock"));
 
-        let Err(err) = attach_local(
-            &SocketClient::new(socket.clone()),
-            &socket,
-            &row,
-            ClientIdentity::human("h"),
-        )
-        .await
-        else {
-            panic!("attaching to a dead session must fail");
-        };
-        assert_eq!(
-            err.to_string(),
-            "session worker isn't running (resume it with nudge --resume worker)"
-        );
+        for (cwd, want) in [
+            (
+                "/proj",
+                "session worker isn't running (resume it with nudge --resume worker)",
+            ),
+            (
+                "/elsewhere",
+                "session worker isn't running (resume it with: cd /proj && nudge --resume worker)",
+            ),
+        ] {
+            let Err(err) = attach_local(
+                &SocketClient::new(socket.clone()),
+                &socket,
+                &row,
+                cwd,
+                ClientIdentity::human("h"),
+            )
+            .await
+            else {
+                panic!("attaching to a dead session must fail");
+            };
+            assert_eq!(err.to_string(), want);
+        }
     }
 
     #[tokio::test]

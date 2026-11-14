@@ -56,8 +56,9 @@ pub struct Cli {
     #[arg(long, value_name = "id|name|pairing-code", group = "run_mode")]
     pub attach: Option<String>,
 
-    /// At startup, make another session a peer of this one, as `/connect-peer` does. An
-    /// ended local session is resumed in the background first.
+    /// At startup, make another session a peer of this one, exactly as `/connect-peer`
+    /// does: an ended local session is resumed in the background first, and a failure
+    /// shows up as a notice while the session starts anyway.
     #[arg(
         long,
         value_name = "id|name|pairing-code",

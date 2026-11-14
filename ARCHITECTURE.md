@@ -155,7 +155,7 @@ unsupervised mutual edge, and an unattended one is supervised by its first diale
 `ReverseAttach` tells the dialer which it got. Relay peers are always unsupervised. A
 second host resuming the same session is refused because the socket is live.
 
-`/connect-peer` and `--connect` share one routing function: a `nudge:` pairing code dials
+`/connect-peer` (which `--connect` issues at startup) routes by its argument: a `nudge:` pairing code dials
 the relay, and anything else is resolved as a session id or name (`run::local_peer`) and
 dialed over that session's socket. If nothing listens there, the dialer takes an exclusive lock on
 `~/.nudge/run/<id>.lock`, re-probes, and if the socket is still dead starts a headless
@@ -175,7 +175,7 @@ up that edge.
 | `nudge --daemon`                             | Headless host on its session socket. With `$NUDGE_RELAY` it also dials **out** to the relay, mints a room + key and prints a QR; `--watch` / `--peer` (relay only) mint and park the watch-only / agent-peer scopes too. Without a relay it is local-only and runs until stopped. |
 | `nudge --attach <id\|name>`                  | Front-end only (`SocketClient`) on a live local session's socket; an ended session is not started. |
 | `nudge --attach <pairing-code>`              | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
-| `nudge [--resume <a>] --connect <target>`    | Modifier on a TUI or `--daemon` run: after the host starts, connects `<target>` as a peer through the `/connect-peer` routing; a failure aborts startup. |
+| `nudge [--resume <a>] --connect <target>`    | Modifier on a TUI or `--daemon` run: once the host starts, it issues `/connect-peer <target>` to its own loop, so the dial runs in the background and a failure is a Notice. |
 | `nudge --print-prompt`                       | Standalone one-shot action, then exit.                                                            |
 
 Each pairing scope is a distinct room + key mapped daemon-side to a `ClientProfile`

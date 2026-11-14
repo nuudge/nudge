@@ -174,7 +174,6 @@ pub async fn host(cli: Cli) -> Result<()> {
                 dialer_identity.clone(),
             ))
         });
-    let self_id = session.id.clone();
 
     let host = core::SessionHost::spawn(
         cfg,
@@ -201,24 +200,11 @@ pub async fn host(cli: Cli) -> Result<()> {
         },
     ));
 
-    // Before the TUI takes the screen, so a failure prints plainly.
-    let connected = match &cli.connect {
-        Some(target) => dial_peer(
-            target.clone(),
-            self_id,
-            host.broker_handle(),
-            peer_reg_tx.clone(),
-            peer_identity.clone(),
-        )
-        .await
-        .with_context(|| format!("could not connect to {target}")),
-        None => Ok(()),
-    };
+    if let Some(target) = &cli.connect {
+        request_connect(&host.broker_handle(), who.clone(), target).await;
+    }
 
-    let result = if let Err(e) = connected {
-        let _ = host.shutdown().await;
-        Err(e)
-    } else if cli.daemon {
+    let result = if cli.daemon {
         let peer_accept = cli.peer.then(|| transport::PeerAccept {
             identity: peer_identity,
             registrar: peer_reg_tx,
@@ -235,7 +221,26 @@ pub async fn host(cli: Cli) -> Result<()> {
     result
 }
 
-// Shared by /connect-peer and --connect. A pairing code is self-contained, so the relay
+// The user's own `/connect-peer`, so it dials and fails exactly like one; commands aren't
+// echoed. Non-driving and non-answering, so the brief attach skews no attribution or grant.
+async fn request_connect(broker: &core::BrokerHandle, who: ClientIdentity, target: &str) {
+    let profile = core::ClientProfile {
+        may_drive: false,
+        may_answer_permissions: false,
+        ..core::ClientProfile::human()
+    };
+    // The broker drains a dropped controller's buffered command before reaping it.
+    if let Some(controller) = broker.attach_as(who, profile).await {
+        let _ = controller
+            .ui_tx
+            .send(core::UiEvent::Command {
+                line: format!("/connect-peer {target}"),
+            })
+            .await;
+    }
+}
+
+// A pairing code is self-contained, so the relay
 // path works with no local relay configured; anything else is a local session.
 async fn dial_peer(
     target: String,
@@ -281,6 +286,36 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("base64"), "{err}");
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn startup_connect_reaches_the_loop_as_a_command_and_is_not_echoed() {
+        use std::time::Duration;
+        let mut bb = core::host::spawn_bare_broker(Vec::new());
+        let mut watcher = bb
+            .handle
+            .attach_as(
+                ClientIdentity::human("w"),
+                core::ClientProfile::watch_only(),
+            )
+            .await
+            .unwrap();
+
+        request_connect(&bb.handle, ClientIdentity::human("me"), "nudge:secret").await;
+
+        match tokio::time::timeout(Duration::from_secs(5), bb.loop_ui_rx.recv()).await {
+            Ok(Some((_, core::UiEvent::Command { line }))) => {
+                assert_eq!(line, "/connect-peer nudge:secret")
+            }
+            other => panic!("expected the /connect-peer command, got {other:?}"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), watcher.events.recv())
+                .await
+                .is_err(),
+            "the command must not reach other controllers"
+        );
         bb.task.abort();
     }
 }
