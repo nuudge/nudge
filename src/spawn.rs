@@ -65,17 +65,20 @@ pub fn peer_factory(
             // `attach(who)` announces the ATTACHER, and the broker stamps it on every
             // message through that controller, so a swapped side mislabels the edge.
             // The return edge is seeded at spawn so the child can message its spawner
-            // from turn one; agent_peer can't answer the parent's permission prompts.
+            // from turn one, and the child reports up it when it stalls.
             let parent_ctrl = parent
-                .attach_as(child_who.clone(), core::ClientProfile::agent_peer())
+                .attach_as(
+                    child_who.clone(),
+                    core::PeerRegistration::back_profile(true),
+                )
                 .await
                 .context("child could not attach back to its spawner")?;
             let mut child_peers = core::peer::PeerSet::default();
-            let mut parent_reg = core::PeerRegistration::new(parent_ctrl, parent_who.clone());
-            // Marks the return edge so the child reports up it when it stalls
-            // (e.g. hits its iteration limit) — waking the spawner's model.
-            parent_reg.spawner = true;
-            child_peers.register(parent_reg);
+            child_peers.register(core::PeerRegistration::back(
+                parent_ctrl,
+                parent_who.clone(),
+                true,
+            ));
 
             let child = core::SessionHost::spawn(
                 cfg,
@@ -104,14 +107,10 @@ pub fn peer_factory(
                 .send(core::UiEvent::UserMessage { text: task })
                 .await;
 
+            // The spawner steers this peer's check-ins and may dismiss it.
             Ok(core::PeerRegistration {
-                controller: child_ctrl,
-                who: child_who,
                 host: Some(child),
-                // Direction of creation: the spawner steers this peer's check-ins
-                // and may dismiss it. The child's return edge stays unsupervised.
-                supervised: true,
-                spawner: false,
+                ..core::PeerRegistration::forward(child_ctrl, child_who, true)
             })
         })
     })

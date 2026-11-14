@@ -16,8 +16,8 @@ use super::wire::{
     keepalive_timer,
 };
 use crate::core::{
-    BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, PeerRegistration,
-    SessionHandle, UiEvent,
+    BrokerHandle, ClientIdentity, Controller, ControllerEvent, PeerRegistration, SessionHandle,
+    UiEvent,
 };
 
 // Matches the in-process host's CHANNEL_CAPACITY so backpressure behaves the same
@@ -98,7 +98,7 @@ impl SocketClient {
             self_broker,
             registrar,
             who,
-            true,
+            TargetTrust::SameUser,
         )
         .await
     }
@@ -205,7 +205,7 @@ impl RelayClient {
             self_broker,
             registrar,
             who,
-            false,
+            TargetTrust::Remote,
         )
         .await
     }
@@ -221,16 +221,21 @@ impl SessionHandle for RelayClient {
     fn detach(&self) {}
 }
 
+// Whether the dialer honours the target's `supervised` grant. A relay target is remote,
+// so it must not be able to make itself supervised; a socket target runs as this OS user.
+enum TargetTrust {
+    SameUser,
+    Remote,
+}
+
 // Returns once the pump is spawned so the caller's loop never blocks on I/O.
-// `trust_grant` honours the target's `supervised` grant; only a same-user socket target
-// is trusted, so a remote target can't make itself supervised.
 async fn peer_handshake<R, W>(
     mut reader: R,
     mut writer: W,
     self_broker: BrokerHandle,
     registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
-    trust_grant: bool,
+    trust: TargetTrust,
 ) -> Result<()>
 where
     R: FrameReader<ServerFrame> + 'static,
@@ -250,7 +255,7 @@ where
     }
     let (peer_who, supervised) = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
         Ok(Ok(Some(ServerFrame::ReverseAttach { who, supervised }))) => {
-            (who, trust_grant && supervised)
+            (who, matches!(trust, TargetTrust::SameUser) && supervised)
         }
         _ => anyhow::bail!(
             "the far side offered no return edge — the target must be a `--daemon --peer` session"
@@ -264,23 +269,21 @@ where
         ui_tx: fwd_ui_tx,
     };
     if registrar
-        .send(PeerRegistration {
+        .send(PeerRegistration::forward(
+            forward,
+            peer_who.clone(),
             supervised,
-            ..PeerRegistration::new(forward, peer_who.clone())
-        })
+        ))
         .is_err()
     {
         anyhow::bail!("the dialer's loop is gone");
     }
 
-    // The reverse grant is implied by the user running /connect-peer. A supervised
-    // target gets no command scope back, like a spawned child's return edge.
-    let reverse = if supervised {
-        ClientProfile::agent_peer()
-    } else {
-        ClientProfile::agent()
-    };
-    let ac = match self_broker.attach_as(peer_who, reverse).await {
+    // The reverse grant is implied by the user running /connect-peer.
+    let ac = match self_broker
+        .attach_as(peer_who, PeerRegistration::back_profile(supervised))
+        .await
+    {
         Some(c) => c,
         None => anyhow::bail!("the dialer's broker is gone"),
     };

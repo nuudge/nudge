@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use crate::cli::Cli;
 use crate::coding;
 use crate::config::Config;
+use crate::core::store::SessionRow;
 use crate::core::{self, AgentConfig, Backend, ClientIdentity};
 use crate::llm;
 use crate::models::{MODELS, owned_models, resolve_models};
@@ -240,8 +241,25 @@ async fn request_connect(broker: &core::BrokerHandle, who: ClientIdentity, targe
     }
 }
 
-// A pairing code is self-contained, so the relay
-// path works with no local relay configured; anything else is a local session.
+// What /connect-peer, --connect and --attach accept. A pairing code is self-contained,
+// so the relay path works with no local relay configured; anything else is a local
+// session id (any project) or name (this cwd).
+enum Target {
+    Relay(transport::Pairing),
+    Local(SessionRow),
+}
+
+fn parse_target(reference: &str) -> Result<Target> {
+    if transport::Pairing::is_code(reference) {
+        return Ok(Target::Relay(transport::Pairing::decode(reference)?));
+    }
+    local_target(coding::find_session(reference)?, reference).map(Target::Local)
+}
+
+fn local_target(found: Option<SessionRow>, reference: &str) -> Result<SessionRow> {
+    found.with_context(|| format!("no session matches {reference:?}"))
+}
+
 async fn dial_peer(
     target: String,
     self_id: String,
@@ -249,12 +267,16 @@ async fn dial_peer(
     registrar: tokio::sync::mpsc::UnboundedSender<core::PeerRegistration>,
     who: ClientIdentity,
 ) -> Result<()> {
-    if !transport::Pairing::is_code(&target) {
-        return local_peer::connect_local(&target, &self_id, self_broker, registrar, who).await;
+    match parse_target(&target)? {
+        Target::Local(row) => {
+            local_peer::connect_local(&target, row, &self_id, self_broker, registrar, who).await
+        }
+        Target::Relay(pairing) => {
+            transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher)
+                .dial_peer(self_broker, registrar, who)
+                .await
+        }
     }
-    let pairing = transport::Pairing::decode(&target)?;
-    let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
-    client.dial_peer(self_broker, registrar, who).await
 }
 
 fn session_socket_path(session_id: &str) -> Result<PathBuf> {
@@ -271,6 +293,12 @@ fn session_socket_path(session_id: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_local_reference_is_rejected() {
+        let err = local_target(None, "ghost").unwrap_err();
+        assert!(err.to_string().contains("no session matches"), "{err}");
+    }
 
     #[tokio::test]
     async fn dial_peer_routes_a_pairing_code_to_the_relay() {
