@@ -56,13 +56,22 @@ struct ControllerChannels {
 
 enum HostCommand {
     // `ack` fires after the replay is queued, so the caller only gets its `Controller`
-    // once history is in flight.
+    // once history is in flight. It carries the granted profile.
     Attach {
         ui_rx: mpsc::Receiver<UiEvent>,
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
         who: ClientIdentity,
         profile: ClientProfile,
-        ack: oneshot::Sender<bool>,
+        ack: oneshot::Sender<ClientProfile>,
+    },
+    // A dialing peer: `supervisor` unless an attached controller already answers
+    // permissions, else `agent_peer`. Resolved in the broker so racing dialers can't
+    // both win.
+    AttachPeer {
+        ui_rx: mpsc::Receiver<UiEvent>,
+        event_tx: mpsc::UnboundedSender<ControllerEvent>,
+        who: ClientIdentity,
+        ack: oneshot::Sender<ClientProfile>,
     },
     Quit,
 }
@@ -202,34 +211,44 @@ impl BrokerHandle {
     }
 
     // The ui channel stays bounded: backpressure on one flooding sender is wanted.
+    async fn request_attach(
+        &self,
+        command: impl FnOnce(
+            mpsc::Receiver<UiEvent>,
+            mpsc::UnboundedSender<ControllerEvent>,
+            oneshot::Sender<ClientProfile>,
+        ) -> HostCommand,
+    ) -> Option<(Controller, ClientProfile)> {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.ctl_tx.send(command(ui_rx, event_tx, ack_tx)).is_err() {
+            return None;
+        }
+        let granted = ack_rx.await.ok()?;
+        Some((
+            Controller {
+                events: event_rx,
+                ui_tx,
+            },
+            granted,
+        ))
+    }
+
     async fn attach_inner(
         &self,
         who: ClientIdentity,
         profile: ClientProfile,
     ) -> Option<Controller> {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (ui_tx, ui_rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if self
-            .ctl_tx
-            .send(HostCommand::Attach {
-                ui_rx,
-                event_tx,
-                who,
-                profile,
-                ack: ack_tx,
-            })
-            .is_err()
-        {
-            return None;
-        }
-        match ack_rx.await {
-            Ok(true) => Some(Controller {
-                events: event_rx,
-                ui_tx,
-            }),
-            _ => None,
-        }
+        self.request_attach(|ui_rx, event_tx, ack| HostCommand::Attach {
+            ui_rx,
+            event_tx,
+            who,
+            profile,
+            ack,
+        })
+        .await
+        .map(|(controller, _)| controller)
     }
 
     pub async fn attach_as(
@@ -238,6 +257,19 @@ impl BrokerHandle {
         profile: ClientProfile,
     ) -> Option<Controller> {
         self.attach_inner(who, profile).await
+    }
+
+    // `true` = granted `supervisor`; otherwise `agent_peer`. The broker decides.
+    pub async fn attach_peer(&self, who: ClientIdentity) -> Option<(Controller, bool)> {
+        let (controller, granted) = self
+            .request_attach(|ui_rx, event_tx, ack| HostCommand::AttachPeer {
+                ui_rx,
+                event_tx,
+                who,
+                ack,
+            })
+            .await?;
+        Some((controller, granted == ClientProfile::supervisor()))
     }
 }
 
@@ -429,31 +461,44 @@ async fn broker(
     loop {
         tokio::select! {
             cmd = ctl_rx.recv() => {
-                match cmd {
+                let (ui_rx, event_tx, who, profile, ack) = match cmd {
                     Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
-                        if profile.may_drive && !who.name.is_empty() {
-                            driver_names.insert(who.name.clone());
-                            if driver_names.len() >= 2 {
-                                multi_driver.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        // No await in this handler, so replay strictly precedes live
-                        // events for this controller.
-                        for ev in &buffer {
-                            if let Some(projected) = project(&profile, ev) {
-                                let _ = event_tx.send(projected);
-                            }
-                        }
-                        let id = next_id;
-                        next_id += 1;
-                        attached.insert(id, ControllerChannels { ui_rx, event_tx, who, profile });
-                        let _ = ack.send(true);
+                        (ui_rx, event_tx, who, profile, ack)
+                    }
+                    Some(HostCommand::AttachPeer { ui_rx, event_tx, who, ack }) => {
+                        // A dropped front-end lingers until reaped; it answers nothing.
+                        let answered = attached.values().any(|c| {
+                            c.profile.may_answer_permissions && !c.event_tx.is_closed()
+                        });
+                        let profile = if answered {
+                            ClientProfile::agent_peer()
+                        } else {
+                            ClientProfile::supervisor()
+                        };
+                        (ui_rx, event_tx, who, profile, ack)
                     }
                     Some(HostCommand::Quit) | None => {
                         let _ = loop_ui_tx.send((None, UiEvent::Quit)).await;
                         return;
                     }
+                };
+                if profile.may_drive && !who.name.is_empty() {
+                    driver_names.insert(who.name.clone());
+                    if driver_names.len() >= 2 {
+                        multi_driver.store(true, Ordering::Relaxed);
+                    }
                 }
+                // No await in this handler, so replay strictly precedes live
+                // events for this controller.
+                for ev in &buffer {
+                    if let Some(projected) = project(&profile, ev) {
+                        let _ = event_tx.send(projected);
+                    }
+                }
+                let id = next_id;
+                next_id += 1;
+                attached.insert(id, ControllerChannels { ui_rx, event_tx, who, profile: profile.clone() });
+                let _ = ack.send(profile);
             }
             ev = loop_agent_rx.recv() => {
                 match ev {
@@ -613,7 +658,7 @@ mod tests {
                 ack: ack_tx,
             })
             .unwrap();
-        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        assert!(ack_rx.await.is_ok(), "attach must be admitted");
         (event_rx, ui_tx)
     }
 
@@ -649,7 +694,7 @@ mod tests {
                 ack: ack_tx,
             })
             .unwrap();
-        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        assert!(ack_rx.await.is_ok(), "attach must be admitted");
         (event_rx, ui_tx)
     }
 
@@ -679,7 +724,7 @@ mod tests {
                 ack: ack_tx,
             })
             .unwrap();
-        assert!(ack_rx.await.unwrap_or(false), "attach must be admitted");
+        assert!(ack_rx.await.is_ok(), "attach must be admitted");
         (event_rx, ui_tx)
     }
 
@@ -1482,5 +1527,56 @@ mod tests {
 
         ctl_tx.send(HostCommand::Quit).unwrap();
         broker_task.await.unwrap();
+    }
+
+    fn agent(name: &str) -> ClientIdentity {
+        ClientIdentity {
+            kind: ClientKind::Agent,
+            name: name.into(),
+            session_id: None,
+            task: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_with_a_human_attached_is_not_its_supervisor() {
+        let bb = spawn_bare_broker(Vec::new());
+        let _human = bb.handle.attach(ClientIdentity::human("h")).await.unwrap();
+        let (_peer, supervised) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        assert!(!supervised);
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn only_the_first_peer_of_an_unanswered_session_supervises() {
+        let bb = spawn_bare_broker(Vec::new());
+        let (_first, first) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        let (_second, second) = bb.handle.attach_peer(agent("b")).await.unwrap();
+        assert!(first && !second);
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_departed_answerer_leaves_supervision_open() {
+        let bb = spawn_bare_broker(Vec::new());
+        drop(bb.handle.attach(ClientIdentity::human("h")).await.unwrap());
+        let (_peer, supervised) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        assert!(supervised);
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn racing_peers_yield_exactly_one_supervisor() {
+        let bb = spawn_bare_broker(Vec::new());
+        let attaches = (0..8).map(|i| {
+            let handle = bb.handle.clone();
+            tokio::spawn(async move { handle.attach_peer(agent(&format!("p{i}"))).await })
+        });
+        let mut controllers = Vec::new();
+        for task in attaches.collect::<Vec<_>>() {
+            controllers.push(task.await.unwrap().unwrap());
+        }
+        assert_eq!(controllers.iter().filter(|(_, s)| *s).count(), 1);
+        bb.task.abort();
     }
 }

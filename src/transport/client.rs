@@ -99,6 +99,7 @@ impl SocketClient {
             self_broker,
             registrar,
             who,
+            true,
         )
         .await
     }
@@ -205,6 +206,7 @@ impl RelayClient {
             self_broker,
             registrar,
             who,
+            false,
         )
         .await
     }
@@ -221,12 +223,15 @@ impl SessionHandle for RelayClient {
 }
 
 // Returns once the pump is spawned so the caller's loop never blocks on I/O.
+// `trust_grant` honours the target's `supervised` grant; only a same-user socket target
+// is trusted, so a remote target can't make itself supervised.
 async fn peer_handshake<R, W>(
     mut reader: R,
     mut writer: W,
     self_broker: BrokerHandle,
     registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
+    trust_grant: bool,
 ) -> Result<()>
 where
     R: FrameReader<ServerFrame> + 'static,
@@ -244,8 +249,10 @@ where
         Some(ServerFrame::Busy) => anyhow::bail!("the peer session has ended"),
         other => anyhow::bail!("unexpected handshake response: {other:?}"),
     }
-    let peer_who = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
-        Ok(Ok(Some(ServerFrame::ReverseAttach { who }))) => who,
+    let (peer_who, supervised) = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
+        Ok(Ok(Some(ServerFrame::ReverseAttach { who, supervised }))) => {
+            (who, trust_grant && supervised)
+        }
         _ => anyhow::bail!(
             "the far side offered no return edge — the target must be a `--daemon --peer` session"
         ),
@@ -258,17 +265,23 @@ where
         ui_tx: fwd_ui_tx,
     };
     if registrar
-        .send(PeerRegistration::new(forward, peer_who.clone()))
+        .send(PeerRegistration {
+            supervised,
+            ..PeerRegistration::new(forward, peer_who.clone())
+        })
         .is_err()
     {
         anyhow::bail!("the dialer's loop is gone");
     }
 
-    // The reverse grant is implied by the user running /connect-peer.
-    let ac = match self_broker
-        .attach_as(peer_who, ClientProfile::agent())
-        .await
-    {
+    // The reverse grant is implied by the user running /connect-peer. A supervised
+    // target gets no command scope back, like a spawned child's return edge.
+    let reverse = if supervised {
+        ClientProfile::agent_peer()
+    } else {
+        ClientProfile::agent()
+    };
+    let ac = match self_broker.attach_as(peer_who, reverse).await {
         Some(c) => c,
         None => anyhow::bail!("the dialer's broker is gone"),
     };

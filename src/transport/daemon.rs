@@ -58,21 +58,32 @@ pub async fn serve_socket(listener: UnixListener, broker: BrokerHandle, peer_acc
             let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await else {
                 return;
             };
-            // A peer dialer gets the relay agent leg's profile; anything else is kind-derived.
-            let profile = reverse_offer.then(ClientProfile::agent);
+            let grant = if reverse_offer {
+                Grant::Peer
+            } else {
+                Grant::Kind
+            };
             bridge(
                 reader,
                 writer,
                 &broker,
                 after_seq,
                 who,
-                profile,
+                grant,
                 reverse_offer,
                 Some(peer_accept),
             )
             .await;
         });
     }
+}
+
+enum Grant {
+    // From the client's claimed kind.
+    Kind,
+    Fixed(ClientProfile),
+    // `supervisor` or `agent_peer`, decided by the target's broker.
+    Peer,
 }
 
 // Full and watch-only are separate rooms, so the profile follows the room and a
@@ -196,7 +207,7 @@ async fn relay_dial_loop(
                             &broker,
                             after_seq,
                             who,
-                            Some(profile),
+                            Grant::Fixed(profile),
                             reverse_offer,
                             peer_accept,
                         )
@@ -234,8 +245,8 @@ where
     }
 }
 
-// `profile` is `None` for kind-derived rights. Reverse-edge frames are produced only
-// when the dialer offered and this leg has `peer_accept`; otherwise it is forward-only.
+// Reverse-edge frames are produced only when the dialer offered and this leg has
+// `peer_accept`; otherwise it is forward-only.
 #[allow(clippy::too_many_arguments)]
 async fn bridge<R, W>(
     mut reader: R,
@@ -243,16 +254,20 @@ async fn bridge<R, W>(
     broker: &BrokerHandle,
     after_seq: Option<u64>,
     who: ClientIdentity,
-    profile: Option<ClientProfile>,
+    grant: Grant,
     reverse_offer: bool,
     peer_accept: Option<PeerAccept>,
 ) where
     R: FrameReader<ClientFrame>,
     W: FrameWriter<ServerFrame>,
 {
-    let attached = match profile {
-        Some(profile) => broker.attach_as(who.clone(), profile).await,
-        None => broker.attach(who.clone()).await,
+    let (attached, supervised) = match grant {
+        Grant::Kind => (broker.attach(who.clone()).await, false),
+        Grant::Fixed(profile) => (broker.attach_as(who.clone(), profile).await, false),
+        Grant::Peer => match broker.attach_peer(who.clone()).await {
+            Some((controller, supervised)) => (Some(controller), supervised),
+            None => (None, false),
+        },
     };
     let controller = match attached {
         Some(c) => c,
@@ -275,6 +290,7 @@ async fn bridge<R, W>(
         if writer
             .send(&ServerFrame::ReverseAttach {
                 who: pa.identity.clone(),
+                supervised,
             })
             .await
             .is_err()
@@ -283,7 +299,7 @@ async fn bridge<R, W>(
         }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
-        // Unsupervised on both sides, and named by what the dialer announced.
+        // The target never supervises its dialer; named by what the dialer announced.
         let _ = pa.registrar.send(PeerRegistration::new(
             Controller {
                 events: ev_rx,
