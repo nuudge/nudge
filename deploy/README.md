@@ -96,7 +96,7 @@ nudge --daemon
 TUI's pair screen. Either way, attach from another device with the pairing code:
 
 ```sh
-nudge --connect --pair-code 'nudge:...'
+nudge --attach 'nudge:...'
 ```
 
 The pairing code carries the relay address, a one-time rendezvous id, and the

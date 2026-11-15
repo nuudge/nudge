@@ -17,15 +17,16 @@ The session outlives its front-end. Inside the TUI, `/background` (alias `/bg`) 
 — the agent keeps running and buffering output — and pressing `Enter` reattaches, replaying
 the full history.
 
-You can also start a session with no TUI at all: `nudge --daemon` hosts it headless. For
+You can also start a session with no TUI at all: `nudge --daemon` hosts it headless over
+the relay, so it needs `NUDGE_RELAY`; `nudge --daemon --local` serves only this machine. For
 now a backgrounded or daemon session lives only as long as its launching process —
 surviving a closed terminal is planned (see the [Roadmap](roadmap.md)).
 
 ## Phone handoff
 
 When `NUDGE_RELAY` is set, `/background` dials the relay and shows a pairing QR. Scan it
-with the [Android app](mobile-app.md) (or paste the code into `nudge --connect --pair-code
-<code>`) to drive the *live* session from your phone or another machine. Approve an edit
+with the [Android app](mobile-app.md) (or paste the code into `nudge --attach <code>`) to
+drive the *live* session from your phone or another machine. Approve an edit
 from the bus or review a stack trace at dinner — the permission prompt finds you wherever
 you're attached. If no relay is configured, `/background` still pauses the session — it just
 shows no QR.
@@ -60,17 +61,19 @@ co-op mode for a coding agent. Each client announces an identity when it attache
 shared transcript shows who said what — and once a second driver connects, the *agent* sees
 senders named too, so it can tell you and your teammate apart and answer each by name.
 
-## Headless / debug attach without a relay
+## Attaching on the same machine, without a relay
 
-For debugging the transport without a relay, host and attach over a local Unix socket:
+Every session, TUI or `--daemon`, listens on a local socket at
+`~/.nudge/run/<session-id>.sock` that only your OS user can open. Attach another terminal
+by session id or name:
 
 ```bash
-nudge --daemon --socket /tmp/nudge.sock     # host headless on a socket
-nudge --connect --socket /tmp/nudge.sock    # attach a TUI over the socket
+nudge --daemon --local         # headless, with no relay legs
+nudge --attach backend-api     # attach a TUI by name (this directory) or id
 ```
 
-`--socket` also attaches another terminal on the same machine without any relay — you just
-don't get phone or off-box handoff.
+`--attach` doesn't start an ended session; resume it with `nudge --resume <name>`. Without
+a relay there's no phone or off-box handoff.
 
 ## The relay
 

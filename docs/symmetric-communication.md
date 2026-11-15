@@ -118,7 +118,7 @@ into my transcript and wake me up" machinery is needed; it's the human input pat
 unchanged. Supervision stays on the observe channel and never entangles with it.
 
 Control is symmetric the same way. A `/…` line rides the drive channel as
-`Command { line }` and is parsed **server-side** — so a phone, a `--connect` TUI, and a peer
+`Command { line }` and is parsed **server-side** — so a phone, an `--attach` TUI, and a peer
 agent all reach every command by sending the line they typed, with no per-front-end grammar.
 What each client can *render* (a model picker, the MCP catalog) comes back on the observe
 channel as `Capabilities`, seeded into the replay buffer so menus are built from the daemon's

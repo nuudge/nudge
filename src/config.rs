@@ -39,7 +39,7 @@ fn ensure_global_config(path: &Path) -> Result<()> {
 const TEMPLATE: &str = include_str!("../config.env.example");
 
 /// `NUDGE_THINKING` and `NUDGE_NAME` are read outside this struct because the guest
-/// `--connect` path needs them without an API key.
+/// `--attach` path needs them without an API key.
 pub struct Config {
     pub anthropic_api_key: String,
     pub relay: Option<String>,
@@ -63,7 +63,7 @@ impl Config {
     }
 }
 
-/// A free function so the keyless guest `--connect` path resolves it identically.
+/// A free function so the keyless guest `--attach` path resolves it identically.
 pub fn default_model() -> String {
     nonempty_var("NUDGE_MODEL").unwrap_or_else(|| FALLBACK_MODEL.into())
 }
