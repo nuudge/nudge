@@ -3780,3 +3780,75 @@ async fn a_picker_request_queued_mid_turn_is_answered_after_the_turn() {
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// Tool names and joined system text.
+type FirstRequest = (Vec<String>, String);
+
+// Records the first request only.
+struct FirstRequestProvider {
+    seen: std::sync::Arc<std::sync::Mutex<Option<FirstRequest>>>,
+}
+impl Provider for FirstRequestProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.seen.lock().unwrap().get_or_insert_with(|| {
+            let tools = req
+                .tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+                .collect();
+            let system = req.system.iter().map(|b| b.text.as_str()).collect();
+            (tools, system)
+        });
+        Ok(end_turn_response("ok"))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+// A child's return edge and its task are both queued when its loop starts and select!
+// takes either first, so the race is repeated until both orders have surely occurred.
+#[tokio::test]
+async fn an_edge_queued_with_the_task_is_usable_from_the_first_request() {
+    for _ in 0..16 {
+        let (session, dir) = mk_session();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(64);
+        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let (parent_ctrl, _ev_tx, _ui_rx) = fake_peer();
+        reg_tx
+            .send(PeerRegistration::back(
+                parent_ctrl,
+                agent_who("parent"),
+                true,
+            ))
+            .unwrap();
+        ui_tx
+            .send((
+                Some(agent_who("parent")),
+                UiEvent::UserMessage {
+                    text: "task".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            FirstRequestProvider { seen: seen.clone() },
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+        ));
+        drain_until(&mut agent_rx, |ev| matches!(ev, AgentEvent::TurnComplete)).await;
+
+        let (tools, system) = seen.lock().unwrap().take().unwrap();
+        assert!(tools.iter().any(|t| t == "MessagePeer"), "tools: {tools:?}");
+        assert!(system.contains("parent (your parent)"), "system: {system}");
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
