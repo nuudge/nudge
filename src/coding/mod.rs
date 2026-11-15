@@ -177,10 +177,52 @@ pub fn open_new() -> Result<Session> {
     Session::create(cwd, store)
 }
 
-pub fn open_new_spawned(spawned_by: &str, spawn_task: &str) -> Result<Session> {
+pub fn new_child(parent: &str, task: &str) -> Result<SessionRow> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
+    new_child_in(&open_store()?, &cwd.display().to_string(), parent, task)
+}
+
+fn new_child_in(store: &SessionStore, cwd: &str, parent: &str, task: &str) -> Result<SessionRow> {
+    let id = uuid::Uuid::new_v4().to_string();
+    store.insert_session(&id, cwd, Some(parent), Some(task))?;
+    store.set_name(&id, &format!("child-{}", &id[..8]), None)?;
+    store
+        .session(&id)?
+        .with_context(|| format!("no session {id} in the store"))
+}
+
+// `reference` is a child's id or name; only `parent`'s own children match.
+pub fn find_child(parent: &str, reference: &str) -> Result<SessionRow> {
+    let cwd = std::env::current_dir().context("could not determine cwd")?;
+    find_child_in(
+        &open_store()?,
+        &cwd.display().to_string(),
+        parent,
+        reference,
+    )
+}
+
+fn find_child_in(
+    store: &SessionStore,
+    cwd: &str,
+    parent: &str,
+    reference: &str,
+) -> Result<SessionRow> {
+    let id = store.resolve_reference(cwd, reference)?;
+    store
+        .session(&id)?
+        .filter(|row| row.spawned_by.as_deref() == Some(parent))
+        .with_context(|| {
+            format!("{reference} is not a child of this session; use /connect-peer to reach it")
+        })
+}
+
+pub fn parent_of(session_id: &str) -> Result<Option<SessionRow>> {
     let store = open_store()?;
-    Session::create_spawned(cwd, store, spawned_by, spawn_task)
+    match store.session(session_id)?.and_then(|row| row.spawned_by) {
+        Some(parent) => store.session(&parent),
+        None => Ok(None),
+    }
 }
 
 // `reference` is a session uuid or a name, resolved against this cwd's sessions.
@@ -476,6 +518,46 @@ mod tests {
             "otherwise the newest"
         );
         assert!(pick_named(Vec::new(), |_| true).is_none());
+    }
+
+    #[test]
+    fn a_new_child_records_its_parent_and_is_named_by_its_short_id() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store.insert_session("parent", "/proj", None, None).unwrap();
+        let child = new_child_in(&store, "/proj", "parent", "fix the bug").unwrap();
+        assert_eq!(child.spawned_by.as_deref(), Some("parent"));
+        assert_eq!(child.spawn_task.as_deref(), Some("fix the bug"));
+        assert_eq!(child.cwd, "/proj");
+        assert_eq!(child.name, Some(format!("child-{}", &child.id[..8])));
+    }
+
+    #[test]
+    fn only_this_sessions_own_children_are_found_by_id_or_name() {
+        let store = SessionStore::open_in_memory().unwrap();
+        for id in ["parent", "other"] {
+            store.insert_session(id, "/proj", None, None).unwrap();
+        }
+        let mine = new_child_in(&store, "/proj", "parent", "a").unwrap();
+        let theirs = new_child_in(&store, "/proj", "other", "b").unwrap();
+        let name = mine.name.clone().unwrap();
+
+        assert_eq!(
+            find_child_in(&store, "/proj", "parent", &mine.id)
+                .unwrap()
+                .id,
+            mine.id
+        );
+        assert_eq!(
+            find_child_in(&store, "/proj", "parent", &name).unwrap().id,
+            mine.id
+        );
+        for reference in [theirs.id.as_str(), "other", "ghost"] {
+            let err = find_child_in(&store, "/proj", "parent", reference).unwrap_err();
+            assert!(
+                err.to_string().contains("not a child of this session"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

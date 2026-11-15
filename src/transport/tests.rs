@@ -174,19 +174,13 @@ async fn dial_socket_peer(
     path: &std::path::Path,
     reg_b_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>,
 ) -> (PeerRegistration, PeerRegistration) {
-    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
-    timeout(
+    let peer_b = timeout(
         Duration::from_secs(5),
-        SocketClient::new(path.to_path_buf()).dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
+        SocketClient::new(path.to_path_buf()).dial_peer(a.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
     .expect("dial_peer failed");
-
-    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
-        .await
-        .expect("A registrar timeout")
-        .expect("A received peer B");
     let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
         .await
         .expect("B registrar timeout")
@@ -804,7 +798,6 @@ async fn dial_relay_peer(
     let port = spawn_test_relay().await;
     let url = format!("ws://127.0.0.1:{port}/peerroom");
     let cipher = Cipher::generate();
-    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let (reg_b_tx, mut reg_b_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
 
     let daemon = tokio::spawn(run_relay_daemon(
@@ -821,18 +814,13 @@ async fn dial_relay_peer(
     ));
 
     let client = RelayClient::new(url, cipher);
-    timeout(
+    let peer_b = timeout(
         Duration::from_secs(5),
-        client.dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
+        client.dial_peer(a.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
     .expect("dial_peer failed");
-
-    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
-        .await
-        .expect("A registrar timeout")
-        .expect("A received peer B");
     let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
         .await
         .expect("B registrar timeout")
@@ -986,22 +974,17 @@ async fn dial_peer_without_return_edge_fails_closed() {
         bb.handle.clone(),
     ));
 
-    let (reg_tx, mut reg_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let bb_dialer = spawn_bare_broker(Vec::new());
     let client = RelayClient::new(url, cipher);
     let result = timeout(
         Duration::from_secs(20),
-        client.dial_peer(bb_dialer.handle.clone(), reg_tx, agent_id("peer-a")),
+        client.dial_peer(bb_dialer.handle.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer must fail closed, not hang");
     assert!(
         result.is_err(),
-        "dialing a leg without a return edge must fail, got {result:?}"
-    );
-    assert!(
-        reg_rx.try_recv().is_err(),
-        "no forward peer may be registered on a failed dial"
+        "dialing a leg without a return edge must yield no edge"
     );
 
     daemon.abort();

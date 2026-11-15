@@ -14,10 +14,6 @@ mod inspect_session;
 mod read;
 mod todo_write;
 
-// Lets a core::agent test drive `run` against a scratch store instead of the real one.
-#[cfg(test)]
-pub(crate) use inspect_session::run as inspect_session_run;
-
 pub async fn dispatch(
     name: &str,
     input: &Value,

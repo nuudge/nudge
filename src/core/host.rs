@@ -175,20 +175,6 @@ impl SessionHost {
         let _ = self.broker_task.await;
         loop_result
     }
-
-    // Dropping a `SessionHost` only detaches its JoinHandles and the loop holds its own
-    // broker handle, so without this a dismissed child would idle forever.
-    pub(crate) fn request_quit(&self) {
-        let _ = self.ctl_tx.send(HostCommand::Quit);
-    }
-    // For callers that know the edge's provenance and assign rights directly.
-    pub async fn attach_as(
-        &self,
-        who: ClientIdentity,
-        profile: ClientProfile,
-    ) -> Option<Controller> {
-        self.broker_handle().attach_as(who, profile).await
-    }
 }
 
 impl SessionHandle for SessionHost {

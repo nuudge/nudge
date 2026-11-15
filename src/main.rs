@@ -9,7 +9,6 @@ mod llm;
 mod models;
 mod run;
 mod sessions;
-mod spawn;
 mod transport;
 mod tui;
 

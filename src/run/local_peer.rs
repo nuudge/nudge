@@ -5,11 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
 
 use crate::coding;
 use crate::core::store::SessionRow;
-use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration};
+use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration, SpawnRequest, UiEvent};
 use crate::transport::SocketClient;
 
 // Covers the MCP bootstrap, which runs before the host binds its socket.
@@ -18,24 +17,77 @@ const LOG_TAIL_LINES: usize = 10;
 const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // Makes a session on this machine a peer of this one over its socket, starting it
-// headless first if it has ended. The edge arrives through `registrar`.
+// headless first if it has ended.
 pub(super) async fn connect_local(
     reference: &str,
     target: SessionRow,
     self_id: &str,
     self_broker: BrokerHandle,
-    registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
-) -> Result<()> {
+) -> Result<PeerRegistration> {
     check_target(&target, reference, self_id)?;
     let socket = coding::session_socket_path(&target.id)?;
     let client = SocketClient::new(socket.clone());
     ensure_running_then(
         &socket,
         || start_host(&target, &socket),
-        client.dial_peer(self_broker, registrar, who),
+        client.dial_peer(self_broker, who),
     )
     .await
+}
+
+// A child is a normal session in its own process, supervised by whoever claims it; it
+// outlives this session and is revived by starting or reconnecting to it the same way.
+pub(super) async fn spawn_child(
+    request: SpawnRequest,
+    parent_id: String,
+    self_broker: BrokerHandle,
+    who: ClientIdentity,
+) -> Result<PeerRegistration> {
+    let (row, task) = match request {
+        SpawnRequest::New { task } => (coding::new_child(&parent_id, &task)?, Some(task)),
+        SpawnRequest::Revive { child, task } => (coding::find_child(&parent_id, &child)?, task),
+    };
+    let socket = coding::session_socket_path(&row.id)?;
+    let client = SocketClient::new(socket.clone());
+    claim(
+        &row,
+        &socket,
+        || start_host(&row, &socket),
+        client.dial_peer(self_broker, who),
+        task,
+    )
+    .await
+}
+
+// The target grants supervision only when nothing else answers its prompts, so a refused
+// grant means the child is taken; the dropped edge closes its connection.
+async fn claim<S, SF>(
+    row: &SessionRow,
+    socket: &Path,
+    start: S,
+    dial: impl Future<Output = Result<PeerRegistration>>,
+    task: Option<String>,
+) -> Result<PeerRegistration>
+where
+    S: FnOnce() -> SF,
+    SF: Future<Output = Result<()>>,
+{
+    let mut reg = ensure_running_then(socket, start, dial).await?;
+    anyhow::ensure!(
+        reg.supervised,
+        "{} is already taken: someone else answers its prompts; use /connect-peer to reach it",
+        label(row)
+    );
+    reg.who.task = row.spawn_task.clone();
+    if let Some(text) = task {
+        reg.controller
+            .ui_tx
+            .send(UiEvent::UserMessage { text })
+            .await
+            .context("the child's connection closed")?;
+    }
+    Ok(reg)
 }
 
 fn check_target(target: &SessionRow, reference: &str, self_id: &str) -> Result<()> {
@@ -45,11 +97,11 @@ fn check_target(target: &SessionRow, reference: &str, self_id: &str) -> Result<(
 
 // The lock is held through `dial`, so the dialer that started the host becomes its
 // supervisor; a racing dialer waits, then finds it live and gets a plain peer edge.
-async fn ensure_running_then<S, SF>(
+async fn ensure_running_then<T, S, SF>(
     socket: &Path,
     start: S,
-    dial: impl Future<Output = Result<()>>,
-) -> Result<()>
+    dial: impl Future<Output = Result<T>>,
+) -> Result<T>
 where
     S: FnOnce() -> SF,
     SF: Future<Output = Result<()>>,
@@ -194,6 +246,7 @@ mod tests {
     use crate::transport::{PeerAccept, bind_listener, serve_socket};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     fn agent(name: &str) -> ClientIdentity {
@@ -335,6 +388,148 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn child_row() -> SessionRow {
+        let store = SessionStore::open_in_memory().unwrap();
+        store.insert_session("parent", "/proj", None, None).unwrap();
+        store
+            .insert_session("child", "/proj", Some("parent"), Some("count files"))
+            .unwrap();
+        store.session("child").unwrap().unwrap()
+    }
+
+    // The receiver holds the child's back edge; dropping it would close the connection.
+    fn serve_child(
+        socket: &Path,
+        broker: BrokerHandle,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<PeerRegistration>,
+    ) {
+        let (registrar, back) = mpsc::unbounded_channel();
+        let serve = tokio::spawn(serve_socket(
+            bind_listener(socket).unwrap(),
+            broker,
+            PeerAccept {
+                identity: agent("child-x"),
+                registrar,
+            },
+        ));
+        (serve, back)
+    }
+
+    #[tokio::test]
+    async fn an_ended_child_is_started_then_claimed_and_given_its_task() {
+        let socket = temp_socket();
+        let mut child = spawn_bare_broker(Vec::new());
+        let bb_self = spawn_bare_broker(Vec::new());
+        let served = std::sync::Mutex::new(None);
+        let starts = AtomicUsize::new(0);
+        let start = || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            *served.lock().unwrap() = Some(serve_child(&socket, child.handle.clone()));
+            async { Ok(()) }
+        };
+
+        let reg = claim(
+            &child_row(),
+            &socket,
+            start,
+            SocketClient::new(socket.clone()).dial_peer(bb_self.handle.clone(), agent("parent")),
+            Some("count files".into()),
+        )
+        .await
+        .expect("claim the started child");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(reg.supervised);
+        assert_eq!(reg.who.name, "child-x");
+        assert_eq!(reg.who.task.as_deref(), Some("count files"));
+        match timeout(Duration::from_secs(5), child.loop_ui_rx.recv()).await {
+            Ok(Some((_, UiEvent::UserMessage { text }))) => assert_eq!(text, "count files"),
+            other => panic!("expected the task as the child's first message, got {other:?}"),
+        }
+
+        let (serve, _back) = served.lock().unwrap().take().unwrap();
+        serve.abort();
+        child.task.abort();
+        bb_self.task.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn a_live_child_with_no_answerer_is_reclaimed_without_starting_it() {
+        let socket = temp_socket();
+        let mut child = spawn_bare_broker(Vec::new());
+        let (serve, _back) = serve_child(&socket, child.handle.clone());
+        let bb_self = spawn_bare_broker(Vec::new());
+
+        let reg = claim(
+            &child_row(),
+            &socket,
+            || async { anyhow::bail!("a live child must not be started") },
+            SocketClient::new(socket.clone()).dial_peer(bb_self.handle.clone(), agent("parent")),
+            None,
+        )
+        .await
+        .expect("reclaim the live child");
+        assert!(reg.supervised);
+        assert!(
+            timeout(Duration::from_millis(200), child.loop_ui_rx.recv())
+                .await
+                .is_err(),
+            "a revive with no task sends nothing"
+        );
+
+        serve.abort();
+        child.task.abort();
+        bb_self.task.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn a_child_someone_else_answers_is_taken_and_the_edge_dropped() {
+        let socket = temp_socket();
+        let child = spawn_bare_broker(Vec::new());
+        let _human = child
+            .handle
+            .attach_as(
+                ClientIdentity::human("h"),
+                crate::core::ClientProfile::human(),
+            )
+            .await
+            .unwrap();
+        let (serve, mut back) = serve_child(&socket, child.handle.clone());
+        let bb_self = spawn_bare_broker(Vec::new());
+
+        let err = claim(
+            &child_row(),
+            &socket,
+            || async { anyhow::bail!("a live child must not be started") },
+            SocketClient::new(socket.clone()).dial_peer(bb_self.handle.clone(), agent("parent")),
+            Some("ignored".into()),
+        )
+        .await
+        .err()
+        .expect("a refused grant must fail the claim");
+        assert!(err.to_string().contains("already taken"), "{err}");
+        assert!(err.to_string().contains("/connect-peer"), "{err}");
+
+        let mut edge = timeout(Duration::from_secs(5), back.recv())
+            .await
+            .expect("the child registered its back edge")
+            .unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), edge.controller.events.recv())
+                .await
+                .expect("the dropped edge must close the connection")
+                .is_none()
+        );
+
+        serve.abort();
+        child.task.abort();
+        bb_self.task.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
     // The target has no human attached, so the step-2 grant makes the dialer its supervisor.
     #[tokio::test]
     async fn a_live_unattended_session_is_dialed_and_supervised() {
@@ -351,19 +546,14 @@ mod tests {
         ));
 
         let bb_self = spawn_bare_broker(Vec::new());
-        let (registrar, mut reg_rx) = mpsc::unbounded_channel();
         let client = SocketClient::new(path.clone());
-        ensure_running_then(
+        let edge = ensure_running_then(
             &path,
             || async { anyhow::bail!("a live session must not be started") },
-            client.dial_peer(bb_self.handle.clone(), registrar, agent("self")),
+            client.dial_peer(bb_self.handle.clone(), agent("self")),
         )
         .await
         .expect("dial a live session");
-        let edge = timeout(Duration::from_secs(5), reg_rx.recv())
-            .await
-            .expect("registration timed out")
-            .expect("an edge was registered");
         assert_eq!(edge.who.name, "target");
         assert!(edge.supervised);
 

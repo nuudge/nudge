@@ -32,26 +32,8 @@ pub struct Resumed {
 
 impl Session {
     pub fn create(cwd: PathBuf, store: SessionStore) -> Result<Self> {
-        Self::create_with(cwd, store, None, None)
-    }
-
-    pub fn create_spawned(
-        cwd: PathBuf,
-        store: SessionStore,
-        spawned_by: &str,
-        spawn_task: &str,
-    ) -> Result<Self> {
-        Self::create_with(cwd, store, Some(spawned_by), Some(spawn_task))
-    }
-
-    fn create_with(
-        cwd: PathBuf,
-        store: SessionStore,
-        spawned_by: Option<&str>,
-        spawn_task: Option<&str>,
-    ) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
-        store.insert_session(&id, &cwd.display().to_string(), spawned_by, spawn_task)?;
+        store.insert_session(&id, &cwd.display().to_string(), None, None)?;
         Ok(Self {
             id,
             cwd,
@@ -352,23 +334,6 @@ mod tests {
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 0);
         assert_eq!(resumed.entries.len(), 2);
-
-        std::fs::remove_file(&db).ok();
-    }
-
-    #[test]
-    fn create_spawned_records_provenance_edge() {
-        let db = temp_db();
-        let parent = Session::create(cwd(), store_at(&db)).unwrap();
-        let child =
-            Session::create_spawned(cwd(), store_at(&db), &parent.id, "fix the bug").unwrap();
-
-        let row = store_at(&db).session(&child.id).unwrap().unwrap();
-        assert_eq!(row.spawned_by.as_deref(), Some(parent.id.as_str()));
-        assert_eq!(row.spawn_task.as_deref(), Some("fix the bug"));
-        let row = store_at(&db).session(&parent.id).unwrap().unwrap();
-        assert!(row.spawned_by.is_none());
-        assert!(row.spawn_task.is_none());
 
         std::fs::remove_file(&db).ok();
     }

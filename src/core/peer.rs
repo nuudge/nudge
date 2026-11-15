@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 
 use super::events::{ControllerEvent, UiEvent};
-use super::host::{BrokerHandle, Controller, SessionHost};
+use super::host::{BrokerHandle, Controller};
 use super::identity::ClientIdentity;
 use super::profile::ClientProfile;
 
@@ -12,11 +12,18 @@ use super::profile::ClientProfile;
 // Unrelated to the broker's `ControllerId`.
 pub type PeerId = u64;
 
-// Supplied by the composition root because building an agent needs things `core` must
+#[derive(Debug, PartialEq)]
+pub enum SpawnRequest {
+    New { task: String },
+    // `child` is a session id or name; `task` is sent once the child is reclaimed.
+    Revive { child: String, task: Option<String> },
+}
+
+// Supplied by the composition root because starting a child needs things `core` must
 // not construct. Gets the spawner's own broker so the child can attach back.
 pub type PeerFactory = Box<
     dyn Fn(
-            String,
+            SpawnRequest,
             BrokerHandle,
         )
             -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<PeerRegistration>> + Send>>
@@ -47,8 +54,6 @@ pub type SessionLister = Box<
 struct Peer {
     who: ClientIdentity,
     controller: Controller,
-    // Owns a locally spawned child's tasks, so dropping the Peer ends the child.
-    _host: Option<SessionHost>,
     // True = this agent spawned the peer. The return edge stays unsupervised so a
     // child can't answer its parent's gated calls ahead of the human.
     supervised: bool,
@@ -59,22 +64,12 @@ struct Peer {
     recent: VecDeque<String>,
 }
 
-// The child's loop holds its own broker handle, so only an explicit Quit ends it.
-impl Drop for Peer {
-    fn drop(&mut self) {
-        if let Some(host) = &self._host {
-            host.request_quit();
-        }
-    }
-}
-
 const RECENT_LINES_CAP: usize = 10;
 const RECENT_LINE_CHARS_CAP: usize = 120;
 
 pub struct PeerRegistration {
     pub controller: Controller,
     pub who: ClientIdentity,
-    pub host: Option<SessionHost>,
     // Set by local wiring or granted by a same-user socket target, never taken from a
     // relay peer, so a remote side can't claim it.
     pub supervised: bool,
@@ -96,7 +91,6 @@ impl PeerRegistration {
         Self {
             controller,
             who,
-            host: None,
             supervised: false,
             spawner: false,
         }
@@ -172,7 +166,6 @@ impl PeerSet {
             Peer {
                 who: reg.who,
                 controller: reg.controller,
-                _host: reg.host,
                 supervised: reg.supervised,
                 spawner: reg.spawner,
                 recent: VecDeque::new(),

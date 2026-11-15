@@ -85,9 +85,8 @@ impl SocketClient {
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
-        registrar: mpsc::UnboundedSender<PeerRegistration>,
         who: ClientIdentity,
-    ) -> Result<()> {
+    ) -> Result<PeerRegistration> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| format!("connecting to session at {}", self.socket_path.display()))?;
@@ -96,7 +95,6 @@ impl SocketClient {
             LineReader(BufReader::new(read_half)),
             LineWriter(write_half),
             self_broker,
-            registrar,
             who,
         )
         .await
@@ -191,9 +189,8 @@ impl RelayClient {
     pub async fn dial_peer(
         &self,
         self_broker: BrokerHandle,
-        registrar: mpsc::UnboundedSender<PeerRegistration>,
         who: ClientIdentity,
-    ) -> Result<()> {
+    ) -> Result<PeerRegistration> {
         let (ws, _resp) = connect_async(self.relay_url.as_str())
             .await
             .with_context(|| format!("dialing peer relay at {}", self.relay_url))?;
@@ -202,7 +199,6 @@ impl RelayClient {
             WsReader::new(stream, self.cipher.clone()),
             WsWriter::new(sink, self.cipher.clone()),
             self_broker,
-            registrar,
             who,
         )
         .await
@@ -219,14 +215,14 @@ impl SessionHandle for RelayClient {
     fn detach(&self) {}
 }
 
-// Returns once the pump is spawned so the caller's loop never blocks on I/O.
+// Returns the forward edge once the pump is spawned; its `supervised` is the far side's
+// grant.
 async fn peer_handshake<R, W>(
     mut reader: R,
     mut writer: W,
     self_broker: BrokerHandle,
-    registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
-) -> Result<()>
+) -> Result<PeerRegistration>
 where
     R: FrameReader<ServerFrame> + 'static,
     W: FrameWriter<ClientFrame> + 'static,
@@ -256,20 +252,10 @@ where
         events: fwd_ev_rx,
         ui_tx: fwd_ui_tx,
     };
-    if registrar
-        .send(PeerRegistration::forward(
-            forward,
-            peer_who.clone(),
-            supervised,
-        ))
-        .is_err()
-    {
-        anyhow::bail!("the dialer's loop is gone");
-    }
 
     // The reverse grant is implied by the user running /connect-peer.
     let ac = match self_broker
-        .attach_as(peer_who, PeerRegistration::back_profile(supervised))
+        .attach_as(peer_who.clone(), PeerRegistration::back_profile(supervised))
         .await
     {
         Some(c) => c,
@@ -277,7 +263,7 @@ where
     };
 
     tokio::spawn(dial_pump(reader, writer, fwd_ev_tx, fwd_ui_rx, ac));
-    Ok(())
+    Ok(PeerRegistration::forward(forward, peer_who, supervised))
 }
 
 async fn pump_reads<R: FrameReader<ServerFrame> + 'static>(
