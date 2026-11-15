@@ -129,6 +129,9 @@ impl PeerRegistration {
 pub struct PeerSet {
     peers: HashMap<PeerId, Peer>,
     next_id: PeerId,
+    // Identities of edges that dropped (not ones dismissed or replaced), so a reference
+    // to a peer that went away reads as a disconnect rather than a wrong name.
+    disconnected: Vec<ClientIdentity>,
 }
 
 // Each carries the id of the edge that survived.
@@ -160,6 +163,10 @@ impl PeerSet {
     }
 
     fn insert(&mut self, reg: PeerRegistration) -> PeerId {
+        self.disconnected.retain(|gone| {
+            gone.name != reg.who.name
+                && (gone.session_id.is_none() || gone.session_id != reg.who.session_id)
+        });
         let id = self.next_id;
         self.next_id += 1;
         self.peers.insert(
@@ -227,7 +234,7 @@ impl PeerSet {
     }
 
     // Pends forever when empty (`select_all` panics on an empty iterator). `None` means
-    // that peer's stream closed; the caller reaps it with `remove`.
+    // that peer's stream closed; the caller reaps it with `disconnect`.
     pub async fn recv(&mut self) -> (PeerId, Option<ControllerEvent>) {
         if self.peers.is_empty() {
             std::future::pending().await
@@ -263,12 +270,34 @@ impl PeerSet {
             .collect();
         closed
             .into_iter()
-            .filter_map(|id| self.peers.remove(&id).map(|p| p.who.name))
+            .filter_map(|id| self.disconnect(id))
             .collect()
+    }
+
+    // For an edge whose far side went away; returns its name.
+    pub fn disconnect(&mut self, id: PeerId) -> Option<String> {
+        let who = self.peers.remove(&id)?.who;
+        let name = who.name.clone();
+        self.disconnected.push(who);
+        Some(name)
     }
 
     pub fn remove(&mut self, id: PeerId) {
         self.peers.remove(&id);
+    }
+
+    // The name of a dropped edge `reference` matches by the `find` rule, if any.
+    pub fn find_disconnected(&self, reference: &str) -> Option<String> {
+        let candidates = self
+            .disconnected
+            .iter()
+            .map(|who| Candidate {
+                id: who.session_id.clone(),
+                name: Some(who.name.clone()),
+                item: who.name.clone(),
+            })
+            .collect();
+        reference::resolve(reference, candidates).ok()?.pop()
     }
 
     pub fn is_empty(&self) -> bool {

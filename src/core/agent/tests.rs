@@ -3952,3 +3952,44 @@ async fn message_to_a_peer_gone_mid_turn_fails_and_the_peer_is_reaped() {
     task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn a_reference_to_a_dropped_peer_says_it_disconnected() {
+    let self_handle = crate::core::host::spawn_bare_broker(Vec::new()).handle;
+    let mut peers = PeerSet::default();
+    for name in ["gone", "dismissed"] {
+        let (ctrl, _ev, _ui) = fake_peer();
+        peers.register(supervised_reg(ctrl, agent_who(name)));
+    }
+    let gone = peers.find("gone").unwrap().unwrap();
+    peers.disconnect(gone);
+    let dismissed = serde_json::json!({"peer": "dismissed"});
+    super::peer_tools::execute("DismissPeer", &dismissed, &mut peers, &None, &self_handle)
+        .await
+        .unwrap();
+
+    for tool in ["MessagePeer", "DismissPeer"] {
+        let mut error = async |peer: &str| {
+            let input = serde_json::json!({"peer": peer, "message": "hi"});
+            super::peer_tools::execute(tool, &input, &mut peers, &None, &self_handle)
+                .await
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(error("gone").await, "peer gone has disconnected", "{tool}");
+        for unknown in ["dismissed", "never-seen"] {
+            let err = error(unknown).await;
+            assert!(err.starts_with("no peer named"), "{tool} {unknown}: {err}");
+        }
+    }
+
+    let (ctrl, _ev, _ui) = fake_peer();
+    peers.register(supervised_reg(ctrl, agent_who("gone")));
+    let back = peers.find("gone").unwrap().unwrap();
+    peers.remove(back);
+    assert_eq!(
+        peers.find_disconnected("gone"),
+        None,
+        "a peer that came back and was then dismissed is forgotten"
+    );
+}

@@ -64,7 +64,7 @@ pub(super) async fn supervise_peer_event(
     let name = peers.display_name(pid);
     match ev {
         None => {
-            peers.remove(pid);
+            peers.disconnect(pid);
             let _ = agent_tx
                 .send(AgentEvent::Notice {
                     text: format!("[peer {name}] disconnected"),

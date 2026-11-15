@@ -327,6 +327,9 @@ pub(super) async fn execute(
                 bail!("DismissPeer requires a 'peer' string");
             };
             let Some(id) = peers.find(peer)? else {
+                if let Some(name) = peers.find_disconnected(peer) {
+                    bail!("peer {name} has disconnected");
+                }
                 bail!(
                     "no peer named '{peer}'; current peers: {}",
                     peers.roster().join(", ")
@@ -348,6 +351,9 @@ pub(super) async fn execute(
                 bail!("MessagePeer requires a 'message' string");
             };
             let Some(id) = peers.find(peer)? else {
+                if let Some(name) = peers.find_disconnected(peer) {
+                    bail!("peer {name} has disconnected");
+                }
                 let roster = peers.roster();
                 if roster.is_empty() {
                     bail!("no peer named '{peer}': you currently hold no peers");
