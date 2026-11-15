@@ -93,7 +93,7 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
             .args([
                 "--daemon",
                 "--local",
-                "--needs-supervisor",
+                "--needs-answerer",
                 "--resume",
                 &target.id,
             ])

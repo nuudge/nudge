@@ -62,7 +62,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "id|name|pairing-code",
-        conflicts_with_all = ["attach", "needs_supervisor"]
+        conflicts_with_all = ["attach", "needs_answerer"]
     )]
     pub connect: Option<String>,
 
@@ -81,10 +81,11 @@ pub struct Cli {
     #[arg(long, requires = "daemon", conflicts_with_all = ["watch", "peer"])]
     pub local: bool,
 
-    /// Internal: exit when the last supervisor leaves, or when none attaches within a
-    /// grace period. Set on the host `/connect-peer` starts for an ended session.
+    /// Internal: exit when no one is left who can answer its permission prompts (a human
+    /// TUI or a supervising agent), or when none attaches within a grace period. Set on
+    /// the host `/connect-peer` starts for an ended session.
     #[arg(long, hide = true, requires_all = ["daemon", "resume"])]
-    pub needs_supervisor: bool,
+    pub needs_answerer: bool,
 }
 
 #[cfg(test)]
@@ -121,7 +122,7 @@ mod tests {
                 "--daemon",
                 "--resume",
                 "me",
-                "--needs-supervisor",
+                "--needs-answerer",
                 "--connect",
                 "w"
             ])
@@ -130,14 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn local_and_needs_supervisor_flag_rules() {
-        assert!(parse(&["--daemon", "--local", "--needs-supervisor", "--resume", "x"]).is_ok());
+    fn local_and_needs_answerer_flag_rules() {
+        assert!(parse(&["--daemon", "--local", "--needs-answerer", "--resume", "x"]).is_ok());
         assert!(parse(&["--local"]).is_err());
         for relay_only in ["--watch", "--peer"] {
             assert!(parse(&["--daemon", "--local", relay_only]).is_err());
         }
-        assert!(parse(&["--daemon", "--needs-supervisor"]).is_err());
-        assert!(parse(&["--needs-supervisor", "--resume", "x"]).is_err());
+        assert!(parse(&["--daemon", "--needs-answerer"]).is_err());
+        assert!(parse(&["--needs-answerer", "--resume", "x"]).is_err());
     }
 
     #[test]

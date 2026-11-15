@@ -76,8 +76,8 @@ enum HostCommand {
         who: ClientIdentity,
         ack: oneshot::Sender<ClientProfile>,
     },
-    // Replies with a live count of attached `supervisor` controllers.
-    Supervisors {
+    // Replies with a live count of attached controllers that can answer permissions.
+    Answerers {
         reply: oneshot::Sender<watch::Receiver<usize>>,
     },
     Quit,
@@ -280,9 +280,9 @@ impl BrokerHandle {
         Some((controller, granted.is_supervisor()))
     }
 
-    pub async fn supervisors(&self) -> Option<watch::Receiver<usize>> {
+    pub async fn answerers(&self) -> Option<watch::Receiver<usize>> {
         let (reply, rx) = oneshot::channel();
-        self.ctl_tx.send(HostCommand::Supervisors { reply }).ok()?;
+        self.ctl_tx.send(HostCommand::Answerers { reply }).ok()?;
         rx.await.ok()
     }
 }
@@ -475,7 +475,7 @@ async fn broker(
     // The loop takes commands in the order they're forwarded and answers each bare
     // `/connect-peer` with exactly one SessionPicker, so replies pop in order.
     let mut picker_requesters: std::collections::VecDeque<ControllerId> = Default::default();
-    let (supervisors, _) = watch::channel(0usize);
+    let (answerers, _) = watch::channel(0usize);
 
     loop {
         tokio::select! {
@@ -484,16 +484,12 @@ async fn broker(
                     Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
                         (ui_rx, event_tx, who, profile, ack)
                     }
-                    Some(HostCommand::Supervisors { reply }) => {
-                        let _ = reply.send(supervisors.subscribe());
+                    Some(HostCommand::Answerers { reply }) => {
+                        let _ = reply.send(answerers.subscribe());
                         continue;
                     }
                     Some(HostCommand::AttachPeer { ui_rx, event_tx, who, ack }) => {
-                        // A dropped front-end lingers until reaped; it answers nothing.
-                        let answered = attached.values().any(|c| {
-                            c.profile.may_answer_permissions && !c.event_tx.is_closed()
-                        });
-                        let profile = if answered {
+                        let profile = if attached.values().any(answers) {
                             ClientProfile::agent_peer()
                         } else {
                             ClientProfile::supervisor()
@@ -628,12 +624,14 @@ async fn broker(
                 }
             }
         }
-        let count = attached
-            .values()
-            .filter(|c| c.profile.is_supervisor())
-            .count();
-        supervisors.send_if_modified(|n| std::mem::replace(n, count) != count);
+        let count = attached.values().filter(|c| answers(c)).count();
+        answerers.send_if_modified(|n| std::mem::replace(n, count) != count);
     }
+}
+
+// A dropped front-end lingers until reaped; it answers nothing.
+fn answers(c: &ControllerChannels) -> bool {
+    c.profile.may_answer_permissions && !c.event_tx.is_closed()
 }
 
 // A real broker with no agent loop, so other modules' tests can inject `AgentEvent`s
@@ -1767,9 +1765,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_supervisor_count_follows_attach_and_detach() {
+    async fn the_answerer_count_follows_attach_and_detach() {
         let bb = spawn_bare_broker(Vec::new());
-        let count = bb.handle.supervisors().await.unwrap();
+        let count = bb.handle.answerers().await.unwrap();
         let wait = |count: &watch::Receiver<usize>, want: usize| {
             let mut count = count.clone();
             async move {
@@ -1788,9 +1786,24 @@ mod tests {
         wait(&count, 1).await;
         let (peer, granted) = bb.handle.attach_peer(agent("b")).await.unwrap();
         assert!(!granted);
+        let watcher = bb
+            .handle
+            .attach_as(ClientIdentity::human("w"), ClientProfile::watch_only())
+            .await
+            .unwrap();
         drop(peer);
-        assert_eq!(*count.borrow(), 1, "an unsupervised peer doesn't count");
+        drop(watcher);
+        assert_eq!(*count.borrow(), 1, "plain peers and watchers don't answer");
+
+        let human = bb
+            .handle
+            .attach_as(ClientIdentity::human("h"), ClientProfile::human())
+            .await
+            .unwrap();
+        wait(&count, 2).await;
         drop(supervisor);
+        wait(&count, 1).await;
+        drop(human);
         wait(&count, 0).await;
         bb.task.abort();
     }

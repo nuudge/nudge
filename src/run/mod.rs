@@ -230,7 +230,7 @@ pub async fn host(cli: Cli) -> Result<()> {
             relay,
             cli.watch,
             peer_accept,
-            cli.needs_supervisor,
+            cli.needs_answerer,
         )
         .await
     } else {
