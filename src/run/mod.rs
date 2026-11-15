@@ -107,7 +107,7 @@ pub async fn host(cli: Cli) -> Result<()> {
     let socket_path = coding::session_socket_path(&session.id)?;
     let listener = transport::bind_listener(&socket_path)?;
 
-    let role = subagent_role(coding::parent_of(&session.id)?.as_ref());
+    let role = subagent_role(coding::parent_of(&session.id)?.is_some());
     let mut backend =
         coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
 
@@ -273,10 +273,9 @@ fn peer_name(name: Option<&str>, id: &str) -> String {
         .unwrap_or_else(|| id.chars().take(8).collect())
 }
 
-// A session whose row records a parent is a child, however it was started; its role
-// note names the parent as the parent names itself on the edge.
-fn subagent_role(parent: Option<&SessionRow>) -> Option<String> {
-    parent.map(|p| coding::prompt::subagent_role(&peer_name(p.name.as_deref(), &p.id)))
+// A session whose row records a parent is a child, however it was started.
+fn subagent_role(has_parent: bool) -> Option<String> {
+    has_parent.then(|| coding::prompt::SUBAGENT_ROLE.to_string())
 }
 
 // What /connect-peer, --connect and --attach accept. A pairing code is self-contained,
@@ -326,27 +325,19 @@ mod tests {
 
     #[test]
     fn only_a_session_with_a_parent_gets_the_subagent_role() {
-        let store = core::store::SessionStore::open_in_memory().unwrap();
-        store
-            .insert_session("0123456789abcdef", "/proj", None, None)
-            .unwrap();
-        let unnamed = store.session("0123456789abcdef").unwrap().unwrap();
-        store
-            .set_name("0123456789abcdef", "auth-fix", None)
-            .unwrap();
-        let named = store.session("0123456789abcdef").unwrap().unwrap();
-
         assert!(
-            subagent_role(None).is_none(),
+            subagent_role(false).is_none(),
             "a normal session is unchanged"
         );
-        let role = subagent_role(Some(&unnamed)).unwrap();
+        let role = subagent_role(true).unwrap();
         assert!(
-            role.contains("spawned by another agent, 01234567,"),
+            role.contains("marked 'your parent' in your peer roster"),
             "{role}"
         );
-        let role = subagent_role(Some(&named)).unwrap();
-        assert!(role.contains("peer: \"auth-fix\""), "{role}");
+        assert!(
+            !role.contains("{{"),
+            "no parent name or id is baked in: {role}"
+        );
     }
 
     #[test]

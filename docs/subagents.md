@@ -21,20 +21,21 @@ subagent spends tokens autonomously). The child it creates is not a stripped-dow
 runner; it is **a full nudge session in its own process**, with the same capabilities as
 its parent: the same tools, the project's `.mcp.json` servers and skills, and its own
 conversation and session log (it shows up in `nudge --list` and the `/connect-peer`
-picker, live while it runs). It runs in the same directory, named `child-<short id>`,
-under a role prompt that tells it who spawned it and that its one obligation is to deliver
-its result back. The only differences from a normal session are that its parent
-supervises it and that it cannot spawn subagents of its own. It follows the project's `AGENTS.md`, with one adjustment: wherever those
-instructions say to ask the user, it asks its parent instead.
+picker, live while it runs). It runs in the same directory under a role prompt that
+tells it who spawned it and that its one obligation is to deliver its result back. The
+only differences from a normal session are that its parent supervises it and that it
+cannot spawn subagents of its own. It follows the project's `AGENTS.md`, with one
+adjustment: wherever those instructions say to ask the user, it asks its parent instead.
 
 While the child works:
 
-- **You watch** — its activity streams into your TUI as `[peer child-…]` notices.
+- **You watch** — its activity streams into your TUI as `[peer ab12cd34]` notices, named
+  by its short session id until it's renamed.
 - **The parent supervises** — the child's gated tool calls (shell, file writes) check in
   with the parent, which decides each one *with its full conversation as context*: routine
   calls are approved, wrong turns are **denied with a corrective instruction** the child
   picks up as its next input, and anything the parent can't judge — destructive,
-  irreversible, off-task — is **escalated to your permission prompt**, named (`peer child-…
+  irreversible, off-task — is **escalated to your permission prompt**, named (`peer ab12cd34
   — rm -rf …`), exactly like the parent's own gated calls. The parent cannot approve a
   spawn's way around you: escalations and spawns always terminate at a human. If the
   parent fails to reach a verdict at all (an API error, or no answer after a retry), the

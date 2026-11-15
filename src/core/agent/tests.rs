@@ -1561,6 +1561,80 @@ async fn spawn_maps_task_and_revive_to_factory_requests() {
 }
 
 #[tokio::test]
+async fn reviving_a_held_child_reuses_its_edge_without_the_factory() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response(
+                "Spawn",
+                serde_json::json!({"revive": "child-sess", "task": "one more thing"}),
+            ),
+            tool_use_response("Spawn", serde_json::json!({"revive": "x"})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: Default::default(),
+    };
+    let mut peers = PeerSet::default();
+    let (held, _held_ev, mut held_ui) = fake_peer();
+    peers.register(supervised_reg(held, session_who("child-sess")));
+    let (unused, _unused_ev, _unused_ui) = fake_peer();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(unused)));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            peer_factory: Some(stub_factory(slot.clone())),
+            ..mk_io(ui_rx, agent_tx, peers, None)
+        },
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    assert!(slot.lock().unwrap().is_some(), "the factory must not run");
+    match held_ui.try_recv() {
+        Ok(UiEvent::UserMessage { text }) => assert_eq!(text, "one more thing"),
+        other => panic!("expected the task over the held edge, got {other:?}"),
+    }
+    let results: Vec<String> = seen_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m.content.clone())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        results.contains(&"already supervising x; it is now working on: one more thing".into())
+            && results.contains(&"already supervising x".into()),
+        "revive by session id and by name: {results:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn spawn_tool_gates_then_registers_the_child() {
     let (session, dir) = mk_session();
     let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2165,6 +2239,18 @@ fn roster_system_text_lists_held_peers() {
     assert!(
         text.contains("mate (peer)"),
         "unsupervised peer labelled: {text}"
+    );
+
+    let (p_ctrl, _p_ev, _p_ui) = fake_peer();
+    peers.register(PeerRegistration::back(p_ctrl, agent_who("3014903e"), true));
+    let text = roster_system_text(&peers).unwrap();
+    assert!(
+        text.contains("3014903e (your parent)"),
+        "spawner edge labelled: {text}"
+    );
+    assert!(
+        text.contains("mate (peer)"),
+        "only the spawner is the parent: {text}"
     );
 }
 

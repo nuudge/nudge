@@ -25,9 +25,12 @@ pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
         "You are connected to these peer agents. Address one by its exact \
              name with the MessagePeer tool:",
     );
+    let parent = peers.spawner_id().map(|id| peers.display_name(id));
     for p in infos {
         let role = if p.supervised {
             "subagent you spawned"
+        } else if parent.as_ref() == Some(&p.name) {
+            "your parent"
         } else {
             "peer"
         };
@@ -109,7 +112,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
             "name": SPAWN,
             "description": "Spawn a subagent: a full peer agent in this directory with \
                 the same tools, skills and project instructions as you, started on the \
-                given task. The result reports its name (e.g. 'child-ab12cd34') and \
+                given task. The result reports its name (e.g. 'ab12cd34') and \
                 session id — the spawn is now part of your conversation, so you can refer \
                 to it later. A subagent runs as its own process and outlives this \
                 session: after a restart, or once you hold no edge to it, pass its name \
@@ -159,7 +162,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
                 "properties": {
                     "peer": {
                         "type": "string",
-                        "description": "The peer's name, e.g. 'child-ab12cd34'."
+                        "description": "The peer's name, e.g. 'ab12cd34'."
                     },
                     "message": {
                         "type": "string",
@@ -219,7 +222,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
                 "properties": {
                     "peer": {
                         "type": "string",
-                        "description": "The subagent's name, e.g. 'child-ab12cd34'."
+                        "description": "The subagent's name, e.g. 'ab12cd34'."
                     }
                 },
                 "required": ["peer"]
@@ -284,6 +287,22 @@ pub(super) async fn execute(
             let Some(factory) = factory else {
                 bail!("this agent cannot spawn subagents");
             };
+            // Reclaiming would be refused anyway: this session is already its answerer.
+            if let SpawnRequest::Revive { child, task } = &request
+                && let Some(id) = peers.find_by_name_or_session(child)
+                && peers.is_supervised(id)
+            {
+                let name = peers.display_name(id);
+                let Some(text) = task.clone() else {
+                    return Ok(format!("already supervising {name}"));
+                };
+                peers
+                    .drive(id, UiEvent::UserMessage { text: text.clone() })
+                    .await;
+                return Ok(format!(
+                    "already supervising {name}; it is now working on: {text}"
+                ));
+            }
             let revived = matches!(request, SpawnRequest::Revive { .. });
             let reg = factory(request, self_handle.clone()).await?;
             let peer_name = reg.who.name.clone();

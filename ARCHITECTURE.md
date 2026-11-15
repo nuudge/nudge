@@ -173,12 +173,13 @@ last one leaving. A target that grants `supervised` registers its edge back to t
 as its spawner, so it reports stalls up that edge.
 
 `Spawn` uses the same path (`run::local_peer::spawn_child`). A new child gets a session
-row with `spawned_by`/`spawn_task`, named `child-<short id>`; a revive looks up one of this
+row with `spawned_by`/`spawn_task`; a revive looks up one of this
 session's own children by id or name. Either way the factory runs `ensure_running_then`
 with `start_host` and the socket dial, requires the returned edge to be `supervised`
 (otherwise it drops the edge and fails as taken), sends the task, and hands the edge to
 the `Spawn` tool to register. A session whose row has `spawned_by` is hosted with no
-factory and with the subagent role note naming its parent, however it was started.
+factory and with the subagent role note, however it was started. The note names no one:
+the roster marks the spawner edge as "your parent", so a rename can't make them disagree.
 
 ## Run modes (selected in `main.rs`)
 

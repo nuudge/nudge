@@ -262,6 +262,15 @@ impl PeerSet {
             .map(|(id, _)| *id)
     }
 
+    pub fn find_by_name_or_session(&self, reference: &str) -> Option<PeerId> {
+        self.peers
+            .iter()
+            .find(|(_, p)| {
+                p.who.name == reference || p.who.session_id.as_deref() == Some(reference)
+            })
+            .map(|(id, _)| *id)
+    }
+
     // Sorted so the wording is deterministic.
     pub fn roster(&self) -> Vec<String> {
         let mut names: Vec<String> = self.peers.values().map(|p| p.who.name.clone()).collect();

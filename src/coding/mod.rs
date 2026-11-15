@@ -185,7 +185,6 @@ pub fn new_child(parent: &str, task: &str) -> Result<SessionRow> {
 fn new_child_in(store: &SessionStore, cwd: &str, parent: &str, task: &str) -> Result<SessionRow> {
     let id = uuid::Uuid::new_v4().to_string();
     store.insert_session(&id, cwd, Some(parent), Some(task))?;
-    store.set_name(&id, &format!("child-{}", &id[..8]), None)?;
     store
         .session(&id)?
         .with_context(|| format!("no session {id} in the store"))
@@ -521,14 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn a_new_child_records_its_parent_and_is_named_by_its_short_id() {
+    fn a_new_child_records_its_parent_and_task_and_is_unnamed() {
         let store = SessionStore::open_in_memory().unwrap();
         store.insert_session("parent", "/proj", None, None).unwrap();
         let child = new_child_in(&store, "/proj", "parent", "fix the bug").unwrap();
         assert_eq!(child.spawned_by.as_deref(), Some("parent"));
         assert_eq!(child.spawn_task.as_deref(), Some("fix the bug"));
         assert_eq!(child.cwd, "/proj");
-        assert_eq!(child.name, Some(format!("child-{}", &child.id[..8])));
+        assert!(child.name.is_none());
     }
 
     #[test]
@@ -539,7 +538,8 @@ mod tests {
         }
         let mine = new_child_in(&store, "/proj", "parent", "a").unwrap();
         let theirs = new_child_in(&store, "/proj", "other", "b").unwrap();
-        let name = mine.name.clone().unwrap();
+        store.set_name(&mine.id, "worker", None).unwrap();
+        let name = "worker";
 
         assert_eq!(
             find_child_in(&store, "/proj", "parent", &mine.id)
@@ -548,7 +548,7 @@ mod tests {
             mine.id
         );
         assert_eq!(
-            find_child_in(&store, "/proj", "parent", &name).unwrap().id,
+            find_child_in(&store, "/proj", "parent", name).unwrap().id,
             mine.id
         );
         for reference in [theirs.id.as_str(), "other", "ghost"] {
