@@ -98,7 +98,6 @@ impl SocketClient {
             self_broker,
             registrar,
             who,
-            TargetTrust::SameUser,
         )
         .await
     }
@@ -205,7 +204,6 @@ impl RelayClient {
             self_broker,
             registrar,
             who,
-            TargetTrust::Remote,
         )
         .await
     }
@@ -221,13 +219,6 @@ impl SessionHandle for RelayClient {
     fn detach(&self) {}
 }
 
-// Whether the dialer honours the target's `supervised` grant. A relay target is remote,
-// so it must not be able to make itself supervised; a socket target runs as this OS user.
-enum TargetTrust {
-    SameUser,
-    Remote,
-}
-
 // Returns once the pump is spawned so the caller's loop never blocks on I/O.
 async fn peer_handshake<R, W>(
     mut reader: R,
@@ -235,7 +226,6 @@ async fn peer_handshake<R, W>(
     self_broker: BrokerHandle,
     registrar: mpsc::UnboundedSender<PeerRegistration>,
     who: ClientIdentity,
-    trust: TargetTrust,
 ) -> Result<()>
 where
     R: FrameReader<ServerFrame> + 'static,
@@ -254,9 +244,7 @@ where
         other => anyhow::bail!("unexpected handshake response: {other:?}"),
     }
     let (peer_who, supervised) = match timeout(REVERSE_ATTACH_TIMEOUT, reader.recv()).await {
-        Ok(Ok(Some(ServerFrame::ReverseAttach { who, supervised }))) => {
-            (who, matches!(trust, TargetTrust::SameUser) && supervised)
-        }
+        Ok(Ok(Some(ServerFrame::ReverseAttach { who, supervised }))) => (who, supervised),
         _ => anyhow::bail!(
             "the far side offered no return edge — the target must be a `--daemon --peer` session"
         ),

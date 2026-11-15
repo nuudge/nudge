@@ -44,7 +44,7 @@ decides what its holder can do:
 | --- | --- | --- |
 | **full-access** | see everything, drive, answer permission prompts | yourself (your phone), a trusted co-driver |
 | **watch-only** | see everything; cannot drive, run commands, or answer prompts | a teammate who should observe, not steer |
-| **agent-peer** | connect another nudge session's *agent* as a peer | another human, for their session to `/connect-peer` — see [Peer agents](peers.md) |
+| **agent-peer** | connect another nudge session's *agent* as a peer; if no one attached can answer prompts, that agent answers them | another human, for their session to `/connect-peer` — see [Peer agents](peers.md) |
 
 On the `/background` pair screen, press `w` to cycle which code is shown. Headless, `nudge
 --daemon` prints the full-access code; add `--watch` and/or `--peer` for the others. The
