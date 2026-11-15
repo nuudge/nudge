@@ -40,22 +40,26 @@ its context, and the mediation is the contract, not a limitation.
 repos — connected laterally because their work is related. Neither supervises the other;
 both can talk; each is driven (and gated) by its own human. Peer A consults peer B before
 implementing something that touches B's area: here you buy the peer's *context* — its
-knowledge of its own recent work — not a delegated result.
+knowledge of its own recent work — not a delegated result. The exception is a peer with no
+one to answer its prompts, such as a headless `--daemon` or an ended session resumed in the
+background: the first session to connect supervises it, as a parent would a child.
 
-In the code, the seed of this distinction already exists: the `supervised: bool` on every
-peer edge (`core/peer.rs`) *is* the model-1/model-2 bit, set by direction of creation and
-never claimable over the wire.
+In the code, this distinction is the `supervised: bool` on every peer edge
+(`core/peer.rs`). Spawning sets it. On a dialed edge the *target* grants it, and only when
+no attached controller can answer its permission prompts. A dialer can't claim it.
 
 ## What the two-model framing resolves
 
 **The tree-vs-graph anxiety.** Adding lateral edges looks like it degrades a clean tree
 into a general graph with cycles and no root. The resolution: separate the **supervision
-tree** (who spawned whom — carries authority: steering, dismissal, escalation) from the
+relation** (who supervises whom — carries authority: steering, dismissal, escalation) from
+the
 **communication graph** (who holds an edge to whom). The communication graph was never a
 tree — mutual attach is already a 2-cycle, multi-client attach already a fan — and cycles
-in it are harmless chatter loops, managed by identity-aware routing at the broker. The
-supervision relation stays a strict tree because supervised edges are only ever created by
-spawning. Authority never flows across peer edges, so no authority cycles can form.
+in it are harmless chatter loops, managed by identity-aware routing at the broker.
+Supervised edges come from spawning, or from a target that has no one to answer its
+prompts granting supervision to its first dialer. Authority never crosses an edge to a
+session that has an answerer, so a session with a human in it is never supervised.
 
 **The `/message` ventriloquism problem.** A human verb that relays speech into a child
 (`/message <peer> <text>`, cut from #51) is wrong in both models. In model 1, the relayed
@@ -80,11 +84,12 @@ peer has its own human.
    `MessagePeer` is conversation; is that enough, or do peers eventually need a richer
    exchange (transcript excerpts, file-state summaries, capability discovery across the
    edge)? Nothing designed yet.
-4. **Cross-machine supervision.** A dialed peer is an unsupervised conversation edge
-   (pure model 2) unless its target has no one to answer prompts; then the dialer
-   supervises it, over the socket or the relay. Is supervised *spawning* across machines
-   (model 1 over the relay) ever wanted? It would need the pairing to carry the supervision
-   grant — a bigger trust decision than a watch-only scope.
+4. **Supervision cycles among headless sessions.** Supervision is granted, not only created
+   by spawning, so sessions with no human in them could supervise each other in a ring
+   (A supervises B, B supervises C, C supervises A), approving each other's tool calls
+   with no human in the loop. Only one edge per session pair is kept (#112), which rules
+   out a two-session cycle; longer rings are possible if every member is headless. Should
+   the broker refuse a grant that would close a cycle?
 5. **Peer-edge policy.** Model-2 edges carry `UserMessage` both ways between autonomous
    agents. Consecutive same-sender messages now coalesce into one turn, and the MessagePeer
    prompt teaches batching — but nothing *enforces* a budget; two agents can still ping-pong
@@ -92,6 +97,12 @@ peer has its own human.
 
 ## Resolved since first written
 
+- **Cross-machine supervision** (was open question 4): connecting to a session that has no
+  one to answer its prompts makes you its supervisor, over the local socket or the relay.
+  Start `nudge --daemon --peer` on a server and `/connect-peer <agent code>` from your
+  laptop, and your session approves the daemon's tool calls. That gives supervised remote
+  delegation without spawning children on another machine. The trust it requires is
+  holding the agent pairing code.
 - **Identity across machines** (was open question 6): a peer announces its **session name**
   (the `/session-rename` label, else the short session id) at attach; the far side records
   it as-is, never derives it. Rename-after-connect doesn't propagate — acceptable, documented.
