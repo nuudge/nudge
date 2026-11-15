@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::future::Future;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -182,8 +183,7 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
         prune_logs(dir, SystemTime::now());
     }
     let log_path = socket.with_extension("log");
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating {}", log_path.display()))?;
+    let log = open_run_log(&log_path, chrono::Local::now())?;
     let mut child =
         tokio::process::Command::new(std::env::current_exe().context("locating the nudge binary")?)
             .args([
@@ -231,10 +231,30 @@ pub(super) fn label(target: &SessionRow) -> String {
     target.name.clone().unwrap_or_else(|| target.id.clone())
 }
 
+const RUN_SEPARATOR: &str = "--- started ";
+
+// Appended, so a revived session's log still shows how its previous run ended.
+fn open_run_log(path: &Path, now: chrono::DateTime<chrono::Local>) -> Result<std::fs::File> {
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    writeln!(log, "{RUN_SEPARATOR}{} ---", now.to_rfc3339())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(log)
+}
+
+// Only the current run: earlier runs' lines would misreport why this one failed.
 fn log_tail(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
-    lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
+    let run_start = lines
+        .iter()
+        .rposition(|l| l.starts_with(RUN_SEPARATOR))
+        .map_or(0, |i| i + 1);
+    let run = &lines[run_start..];
+    run[run.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }
 
 #[cfg(test)]
@@ -357,6 +377,28 @@ mod tests {
             locker.await.unwrap();
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_restart_appends_to_the_log_and_the_tail_is_the_current_run() {
+        let path =
+            std::env::temp_dir().join(format!("lp-log-{}.log", uuid::Uuid::new_v4().simple()));
+        let mut first = open_run_log(&path, chrono::Local::now()).unwrap();
+        writeln!(
+            first,
+            "[daemon] no one left to answer its prompts; stopping"
+        )
+        .unwrap();
+        drop(first);
+        let mut second = open_run_log(&path, chrono::Local::now()).unwrap();
+        writeln!(second, "error: bad config").unwrap();
+        drop(second);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("stopping"), "the earlier run is kept: {text}");
+        assert_eq!(text.matches(RUN_SEPARATOR).count(), 2, "{text}");
+        assert_eq!(log_tail(&path), "error: bad config");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

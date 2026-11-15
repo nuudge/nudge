@@ -48,7 +48,9 @@ If the target has ended, nudge resumes it in the background, in its own director
 its own `.mcp.json` and skills, and your session becomes its supervisor. It keeps running
 only while someone answers its prompts: once your session disconnects and nobody returns
 within 60 seconds, it stops and is marked ended again. Its output goes to `~/.nudge/run/<session-id>.log` (logs older than 7 days
-are deleted), and if it fails to start you get the end of that log in the error.
+are deleted). Each start appends to it after a `--- started <time> ---` line, so earlier
+runs stay readable, and if it fails to start you get the end of this run's output in the
+error.
 
 The rest of this page covers peers on other machines, which connect over the relay.
 
