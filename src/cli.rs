@@ -1,5 +1,4 @@
 use clap::{Parser, ValueEnum};
-use std::path::PathBuf;
 
 /// Thinking display mode.
 #[derive(Clone, ValueEnum)]
@@ -24,9 +23,9 @@ impl Thinking {
 ///
 /// With no mode flag it runs an interactive TUI in-process; /background then dials
 /// the relay from $NUDGE_RELAY and shows a QR for a phone to attach. `--daemon` hosts
-/// the session headless over that relay (a `--connect --pair-code` client attaches).
-/// `--daemon --socket` / `--connect --socket` host / attach over a local Unix socket
-/// instead — kept for debugging the transport without a relay.
+/// the session headless on its local session socket and over that relay, or only on the
+/// socket with `--local`. `--attach` opens a TUI on a running session, local or remote.
+/// `--connect` makes another session a peer of this one at startup.
 #[derive(Parser)]
 #[command(name = "nudge", version)]
 pub struct Cli {
@@ -47,43 +46,38 @@ pub struct Cli {
     #[arg(long)]
     pub print_prompt: bool,
 
-    /// Host the session headless; clients attach with --connect. Serves the session's
-    /// local socket and $NUDGE_RELAY (only the socket with --local), or a local Unix
-    /// socket at a custom path when --socket is given.
+    /// Host the session headless on its local socket and over $NUDGE_RELAY, which must
+    /// be set unless --local is given. Runs until stopped; clients attach with --attach.
     #[arg(long, group = "run_mode")]
     pub daemon: bool,
 
-    /// Attach a TUI to a running --daemon (with --pair-code, or --socket for a local one).
-    #[arg(long, group = "run_mode")]
-    pub connect: bool,
+    /// Attach a TUI to a running session: a session id (any project) or name (this
+    /// directory) on this machine, or a pairing code from a remote host's QR.
+    #[arg(long, value_name = "id|name|pairing-code", group = "run_mode")]
+    pub attach: Option<String>,
 
-    /// Host / attach over a local Unix socket at this path instead of the relay
-    /// (debugging: exercise the transport without a relay).
-    #[arg(long, value_name = "path")]
-    pub socket: Option<PathBuf>,
-
-    /// (--connect) Attach using a pairing code scanned from the host's QR; self-contained.
+    /// At startup, make another session a peer of this one, as `/connect-peer` does. An
+    /// ended local session is resumed in the background first.
     #[arg(
         long,
-        value_name = "code",
-        requires = "connect",
-        conflicts_with = "socket"
+        value_name = "id|name|pairing-code",
+        conflicts_with_all = ["attach", "needs_supervisor"]
     )]
-    pub pair_code: Option<String>,
+    pub connect: Option<String>,
 
-    /// (--daemon, relay) Also mint a watch-only pairing code: a second QR whose holder
-    /// observes the session but cannot drive it, run commands, answer prompts, or quit.
-    #[arg(long, requires = "daemon", conflicts_with = "socket")]
+    /// (--daemon) Also mint a watch-only pairing code: a second QR whose holder observes
+    /// the session but cannot drive it, run commands, answer prompts, or quit.
+    #[arg(long, requires = "daemon")]
     pub watch: bool,
 
-    /// (--daemon, relay) Also mint an agent-peer pairing code: a remote nudge session
-    /// dials it with `/connect-peer` to form a mutual, unsupervised peer edge.
-    #[arg(long, requires = "daemon", conflicts_with = "socket")]
+    /// (--daemon) Also mint an agent-peer pairing code: a remote nudge session dials it
+    /// with `/connect-peer` to form a mutual, unsupervised peer edge.
+    #[arg(long, requires = "daemon")]
     pub peer: bool,
 
     /// (--daemon) Serve only the session's local socket and open no relay legs, even
     /// with $NUDGE_RELAY set. Peers on this machine connect by session id or name.
-    #[arg(long, requires = "daemon", conflicts_with_all = ["socket", "watch", "peer"])]
+    #[arg(long, requires = "daemon", conflicts_with_all = ["watch", "peer"])]
     pub local: bool,
 
     /// Internal: exit when the last supervisor leaves, or when none attaches within a
@@ -96,25 +90,58 @@ pub struct Cli {
 mod tests {
     use super::*;
 
-    fn parses(args: &[&str]) -> bool {
-        Cli::try_parse_from(std::iter::once("nudge").chain(args.iter().copied())).is_ok()
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("nudge").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn attach_takes_one_target() {
+        assert_eq!(
+            parse(&["--attach", "worker"]).unwrap().attach.as_deref(),
+            Some("worker")
+        );
+        assert!(parse(&["--attach"]).is_err());
+        assert!(parse(&["--attach", "a", "--daemon"]).is_err());
+    }
+
+    #[test]
+    fn connect_modifies_a_fresh_resumed_or_daemon_run() {
+        assert_eq!(
+            parse(&["--connect", "worker"]).unwrap().connect.as_deref(),
+            Some("worker")
+        );
+        let cli = parse(&["--resume", "me", "--connect", "worker"]).unwrap();
+        assert_eq!(cli.resume.as_deref(), Some("me"));
+        assert!(parse(&["--daemon", "--connect", "worker"]).unwrap().daemon);
+        assert!(parse(&["--connect"]).is_err());
+        assert!(parse(&["--connect", "w", "--attach", "x"]).is_err());
+        assert!(
+            parse(&[
+                "--daemon",
+                "--resume",
+                "me",
+                "--needs-supervisor",
+                "--connect",
+                "w"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn local_and_needs_supervisor_flag_rules() {
-        assert!(parses(&[
-            "--daemon",
-            "--local",
-            "--needs-supervisor",
-            "--resume",
-            "x"
-        ]));
-        assert!(!parses(&["--local"]));
+        assert!(parse(&["--daemon", "--local", "--needs-supervisor", "--resume", "x"]).is_ok());
+        assert!(parse(&["--local"]).is_err());
         for relay_only in ["--watch", "--peer"] {
-            assert!(!parses(&["--daemon", "--local", relay_only]));
+            assert!(parse(&["--daemon", "--local", relay_only]).is_err());
         }
-        assert!(!parses(&["--daemon", "--local", "--socket", "/tmp/s"]));
-        assert!(!parses(&["--daemon", "--needs-supervisor"]));
-        assert!(!parses(&["--needs-supervisor", "--resume", "x"]));
+        assert!(parse(&["--daemon", "--needs-supervisor"]).is_err());
+        assert!(parse(&["--needs-supervisor", "--resume", "x"]).is_err());
+    }
+
+    #[test]
+    fn the_old_attach_flags_are_gone() {
+        assert!(parse(&["--pair-code", "nudge:x"]).is_err());
+        assert!(parse(&["--daemon", "--socket", "/tmp/s"]).is_err());
     }
 }
