@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
@@ -14,6 +15,7 @@ use crate::transport::SocketClient;
 // Covers the MCP bootstrap, which runs before the host binds its socket.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_TAIL_LINES: usize = 10;
+const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // Makes a session on this machine a peer of this one over its socket, starting it
 // headless first if it has ended. The edge arrives through `registrar`.
@@ -66,25 +68,67 @@ pub(super) async fn accepts(socket: &Path) -> bool {
     UnixStream::connect(socket).await.is_ok()
 }
 
-// Released when the returned file is dropped.
-async fn lock(path: PathBuf) -> Result<std::fs::File> {
+// `drop` runs before the fields drop, so the path is unlinked while `_file` still holds
+// the lock; a waiter on the old inode then sees it's stale (see `lock`).
+struct RunLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+async fn lock(path: PathBuf) -> Result<RunLock> {
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("locking {}", path.display()))?;
-        Ok(file)
+        loop {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            file.lock()
+                .with_context(|| format!("locking {}", path.display()))?;
+            // A holder unlinks the file before releasing it, so a lock won on an inode
+            // no longer at the path excludes no one; retry on the current file.
+            let held = file.metadata()?;
+            if let Ok(current) = std::fs::metadata(&path)
+                && (held.dev(), held.ino()) == (current.dev(), current.ino())
+            {
+                return Ok(RunLock { _file: file, path });
+            }
+        }
     })
     .await
     .context("lock task panicked")?
 }
 
+// Best-effort: housekeeping must never stop a session from starting.
+fn prune_logs(dir: &Path, now: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "log")
+            && let Ok(modified) = entry.metadata().and_then(|m| m.modified())
+            && now
+                .duration_since(modified)
+                .is_ok_and(|age| age > LOG_RETENTION)
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
     let label = label(target);
+    if let Some(dir) = socket.parent() {
+        prune_logs(dir, SystemTime::now());
+    }
     let log_path = socket.with_extension("log");
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
@@ -202,9 +246,93 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(!socket.with_extension("lock").exists());
 
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_file(socket.with_extension("lock"));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_on_an_unlinked_lock_retries_on_the_fresh_file() {
+        let path = temp_socket().with_extension("lock");
+        let first = lock(path.clone()).await.unwrap();
+        let waiter = tokio::spawn(lock(path.clone()));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must block on the held lock"
+        );
+
+        drop(first);
+        let second = timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter never acquired")
+            .unwrap()
+            .unwrap();
+        let at_path = std::fs::File::open(&path).expect("the waiter recreated the file");
+        assert!(
+            at_path.try_lock().is_err(),
+            "the waiter must hold the file now at the path, not the unlinked one"
+        );
+
+        drop(second);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_lockers_never_overlap() {
+        let path = temp_socket().with_extension("lock");
+        let inside = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let inside = inside.clone();
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        let _lock = lock(path.clone()).await.unwrap();
+                        assert_eq!(
+                            inside.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "overlapping holders"
+                        );
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for locker in lockers {
+            locker.await.unwrap();
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prune_logs_removes_only_old_logs() {
+        let dir = std::env::temp_dir().join(format!("lp-prune-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        let now = SystemTime::now();
+        let old = now - LOG_RETENTION - Duration::from_secs(60);
+        for (name, modified) in [
+            ("old.log", old),
+            ("new.log", now),
+            ("old.lock", old),
+            ("old.sock", old),
+        ] {
+            std::fs::File::create(dir.join(name))
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+
+        prune_logs(&dir, now);
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["new.log", "old.lock", "old.sock"]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // The target has no human attached, so the step-2 grant makes the dialer its supervisor.

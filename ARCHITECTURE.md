@@ -162,8 +162,10 @@ the relay, and anything else is resolved as a session id or name (`run::local_pe
 dialed over that session's socket. If nothing listens there, the dialer takes an exclusive lock on
 `~/.nudge/run/<id>.lock`, re-probes, and if the socket is still dead starts a headless
 host for the session in its stored cwd (`--daemon --local --needs-answerer --resume
-<id>`, logging to `<id>.log`). It holds the lock until its own handshake completes, so
-the dialer that started the host becomes its supervisor and a racing dialer gets a plain
+<id>`, logging to `<id>.log`; logs older than 7 days are pruned then). It holds the lock
+until its own handshake completes, then unlinks the lock file before releasing it; a
+locker that wins an unlinked file retries on the current one. So the dialer that started
+the host becomes its supervisor and a racing dialer gets a plain
 peer edge. The hidden `--needs-answerer` makes the daemon exit, marking the session
 ended, when no attached controller can answer its permission prompts (a human TUI or a
 supervising agent), or none attaches within a grace period. A target that grants
