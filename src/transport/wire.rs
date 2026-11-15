@@ -48,7 +48,8 @@ pub enum ServerFrame {
     // The session is gone (broker shut down); no `Event` frames will follow.
     Busy,
     // `seq` counts every event the session ever emitted (replay and live share one
-    // sequence), so it is a stable resume cursor across reconnects.
+    // sequence), so it is a stable resume cursor across reconnects. Peer edges carry
+    // live events only and never resume.
     Event {
         seq: u64,
         event: ControllerEvent,

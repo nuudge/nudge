@@ -255,7 +255,7 @@ where
 
     // The reverse grant is implied by the user running /connect-peer.
     let ac = match self_broker
-        .attach_as(peer_who.clone(), PeerRegistration::back_profile(supervised))
+        .attach_live(peer_who.clone(), PeerRegistration::back_profile(supervised))
         .await
     {
         Some(c) => c,

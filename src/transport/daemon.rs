@@ -316,8 +316,9 @@ async fn bridge<R, W>(
 
     let mut events = controller.events;
     let ui_tx = controller.ui_tx;
-    // The broker replays its whole buffer from index 0 on every attach, so the
-    // receive index is a stable resume cursor across reconnects.
+    // A fixed grant replays the broker's whole buffer from index 0, so the receive
+    // index is a stable resume cursor across reconnects. A peer grant gets live events
+    // only, which is fine because a peer dialer never resumes.
     let mut seq: u64 = 0;
     let out = spawn_writer(writer);
 

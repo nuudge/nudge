@@ -65,11 +65,12 @@ enum HostCommand {
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
         who: ClientIdentity,
         profile: ClientProfile,
+        replay: bool,
         ack: oneshot::Sender<ClientProfile>,
     },
     // A dialing peer: `supervisor` unless an attached controller already answers
     // permissions, else `agent_peer`. Resolved in the broker so racing dialers can't
-    // both win.
+    // both win. Never replayed.
     AttachPeer {
         ui_rx: mpsc::Receiver<UiEvent>,
         event_tx: mpsc::UnboundedSender<ControllerEvent>,
@@ -233,12 +234,14 @@ impl BrokerHandle {
         &self,
         who: ClientIdentity,
         profile: ClientProfile,
+        replay: bool,
     ) -> Option<Controller> {
         self.request_attach(|ui_rx, event_tx, ack| HostCommand::Attach {
             ui_rx,
             event_tx,
             who,
             profile,
+            replay,
             ack,
         })
         .await
@@ -250,7 +253,17 @@ impl BrokerHandle {
         who: ClientIdentity,
         profile: ClientProfile,
     ) -> Option<Controller> {
-        self.attach_inner(who, profile).await
+        self.attach_inner(who, profile, true).await
+    }
+
+    // For an agent peer: history is useless to its model and floods its clients, so it
+    // gets live events only.
+    pub async fn attach_live(
+        &self,
+        who: ClientIdentity,
+        profile: ClientProfile,
+    ) -> Option<Controller> {
+        self.attach_inner(who, profile, false).await
     }
 
     // `true` = granted `supervisor`; otherwise `agent_peer`. The broker decides.
@@ -285,7 +298,7 @@ fn default_profile(who: &ClientIdentity) -> ClientProfile {
 impl SessionHandle for BrokerHandle {
     async fn attach(&self, who: ClientIdentity) -> Option<Controller> {
         let profile = default_profile(&who);
-        self.attach_inner(who, profile).await
+        self.attach_inner(who, profile, true).await
     }
 
     // Detach is drop-based: the broker reaps a dropped `Controller` on its next poll.
@@ -466,9 +479,9 @@ async fn broker(
     loop {
         tokio::select! {
             cmd = ctl_rx.recv() => {
-                let (ui_rx, event_tx, who, profile, ack) = match cmd {
-                    Some(HostCommand::Attach { ui_rx, event_tx, who, profile, ack }) => {
-                        (ui_rx, event_tx, who, profile, ack)
+                let (ui_rx, event_tx, who, profile, replay, ack) = match cmd {
+                    Some(HostCommand::Attach { ui_rx, event_tx, who, profile, replay, ack }) => {
+                        (ui_rx, event_tx, who, profile, replay, ack)
                     }
                     Some(HostCommand::Answerers { reply }) => {
                         let _ = reply.send(answerers.subscribe());
@@ -480,7 +493,7 @@ async fn broker(
                         } else {
                             ClientProfile::supervisor()
                         };
-                        (ui_rx, event_tx, who, profile, ack)
+                        (ui_rx, event_tx, who, profile, false, ack)
                     }
                     Some(HostCommand::Quit) | None => {
                         let _ = loop_ui_tx.send((None, UiEvent::Quit)).await;
@@ -494,9 +507,13 @@ async fn broker(
                     }
                 }
                 // No await in this handler, so replay strictly precedes live
-                // events for this controller.
+                // events for this controller. A prompt still awaiting an answer is live
+                // state, so even an unreplayed attach gets it, or a newly attached
+                // supervisor could never answer it.
                 for ev in &buffer {
-                    if let Some(projected) = project(&profile, ev) {
+                    let open_prompt = matches!(ev, ControllerEvent::PermissionRequest { tool_use_id, .. }
+                        if pending.contains_key(tool_use_id));
+                    if (replay || open_prompt) && let Some(projected) = project(&profile, ev) {
                         let _ = event_tx.send(projected);
                     }
                 }
@@ -825,6 +842,7 @@ mod tests {
                 event_tx,
                 who,
                 profile,
+                replay: true,
                 ack: ack_tx,
             })
             .unwrap();
@@ -861,6 +879,7 @@ mod tests {
                 event_tx,
                 who,
                 profile,
+                replay: true,
                 ack: ack_tx,
             })
             .unwrap();
@@ -891,6 +910,7 @@ mod tests {
                 event_tx,
                 who,
                 profile,
+                replay: true,
                 ack: ack_tx,
             })
             .unwrap();
@@ -1791,6 +1811,94 @@ mod tests {
         wait(&count, 1).await;
         drop(human);
         wait(&count, 0).await;
+        bb.task.abort();
+    }
+
+    fn text(ev: Option<ControllerEvent>) -> String {
+        match ev {
+            Some(ControllerEvent::AssistantText { text }) => text,
+            other => panic!("expected AssistantText, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_peer_attach_gets_live_events_only_and_a_human_the_replay() {
+        let bb = spawn_bare_broker(vec![ControllerEvent::AssistantText { text: "old".into() }]);
+        let (mut dialer, _) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        let mut back = bb
+            .handle
+            .attach_live(agent("b"), ClientProfile::agent())
+            .await
+            .unwrap();
+        let mut human = bb.handle.attach(ClientIdentity::human("h")).await.unwrap();
+
+        bb.agent_tx
+            .send(AgentEvent::AssistantText { text: "new".into() })
+            .await
+            .unwrap();
+        assert_eq!(text(human.events.recv().await), "old");
+        for ctrl in [&mut human, &mut dialer, &mut back] {
+            assert_eq!(text(ctrl.events.recv().await), "new");
+        }
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_peer_attach_still_gets_a_prompt_awaiting_an_answer() {
+        let bb = spawn_bare_broker(Vec::new());
+        let ask = |id: &str| {
+            let (respond, _) = oneshot::channel();
+            AgentEvent::PermissionRequest {
+                tool_use_id: id.into(),
+                tool_name: "Bash".into(),
+                summary: id.into(),
+                respond,
+            }
+        };
+        let human = bb.handle.attach(ClientIdentity::human("h")).await.unwrap();
+        let mut watcher = bb
+            .handle
+            .attach_as(ClientIdentity::human("w"), ClientProfile::watch_only())
+            .await
+            .unwrap();
+        let mut next = async || {
+            tokio::time::timeout(std::time::Duration::from_secs(5), watcher.events.recv())
+                .await
+                .expect("watcher timeout")
+                .unwrap()
+        };
+        bb.agent_tx.send(ask("answered")).await.unwrap();
+        assert!(matches!(
+            next().await,
+            ControllerEvent::PermissionRequest { .. }
+        ));
+        human
+            .ui_tx
+            .send(UiEvent::PermissionResponse {
+                tool_use_id: "answered".into(),
+                allow: true,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            next().await,
+            ControllerEvent::PermissionResolved { .. }
+        ));
+        drop(human);
+        bb.agent_tx.send(ask("open")).await.unwrap();
+        assert!(matches!(
+            next().await,
+            ControllerEvent::PermissionRequest { .. }
+        ));
+
+        let (mut peer, _) = bb.handle.attach_peer(agent("a")).await.unwrap();
+        match peer.events.recv().await {
+            Some(ControllerEvent::PermissionRequest { tool_use_id, .. }) => {
+                assert_eq!(tool_use_id, "open")
+            }
+            other => panic!("expected the open prompt, got {other:?}"),
+        }
+        assert!(peer.events.try_recv().is_err(), "nothing else is replayed");
         bb.task.abort();
     }
 }
