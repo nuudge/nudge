@@ -316,6 +316,52 @@ async fn dropping_either_half_of_a_socket_peer_edge_closes_the_other() {
     let _ = std::fs::remove_file(&path);
 }
 
+// Both ends of one socket write megabytes at once, far past the kernel buffers; a
+// pump that stops reading while its write is pending stalls the edge for good.
+#[tokio::test]
+async fn a_socket_peer_edge_flooded_both_ways_still_delivers() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+    let (peer_b, peer_a) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
+
+    let bulk = "x".repeat(4096);
+    for tx in [bb_a.agent_tx.clone(), bb_b.agent_tx.clone()] {
+        let bulk = bulk.clone();
+        tokio::spawn(async move {
+            for _ in 0..2000 {
+                tx.send(AgentEvent::AssistantText { text: bulk.clone() })
+                    .await
+                    .unwrap();
+            }
+            tx.send(AgentEvent::AssistantText {
+                text: "marker".into(),
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    for mut ctrl in [peer_b.controller, peer_a.controller] {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match ctrl.events.recv().await {
+                    Some(ControllerEvent::AssistantText { text }) if text == "marker" => break,
+                    Some(_) => {}
+                    None => panic!("the edge closed before the marker"),
+                }
+            }
+        })
+        .await
+        .expect("the marker never crossed the flooded edge");
+    }
+
+    serve.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 // Pipes the first two WebSocket connections together verbatim, ignoring the path.
 async fn spawn_test_relay() -> u16 {
     use futures::{SinkExt, StreamExt};
@@ -996,7 +1042,7 @@ async fn dial_peer_without_return_edge_fails_closed() {
 // that the next buffered event carries.
 #[tokio::test]
 async fn a_session_picker_reply_reuses_the_previous_seq() {
-    use super::wire::{read_frame, write_frame};
+    use super::wire::{FrameReader, LineReader, write_frame};
     use tokio::io::BufReader;
 
     let mut bb = spawn_bare_broker(vec![ControllerEvent::AssistantText {
@@ -1005,9 +1051,9 @@ async fn a_session_picker_reply_reuses_the_previous_seq() {
     let (path, serve, _reg_rx) = spawn_socket_host(bb.handle.clone(), agent_id("host"));
     let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = LineReader::new(BufReader::new(read_half));
     let mut next = async || -> ServerFrame {
-        timeout(Duration::from_secs(5), read_frame(&mut reader))
+        timeout(Duration::from_secs(5), reader.recv())
             .await
             .expect("frame timeout")
             .unwrap()

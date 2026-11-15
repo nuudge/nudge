@@ -6,6 +6,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, Interval, interval_at, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -76,21 +77,6 @@ where
     Ok(())
 }
 
-// `Ok(None)` is a clean EOF, distinct from a transport fault.
-pub async fn read_frame<R, T>(r: &mut R) -> Result<Option<T>>
-where
-    R: AsyncBufReadExt + Unpin,
-    T: DeserializeOwned,
-{
-    let mut line = String::new();
-    let n = r.read_line(&mut line).await?;
-    if n == 0 {
-        return Ok(None);
-    }
-    let frame = serde_json::from_str(line.trim_end())?;
-    Ok(Some(frame))
-}
-
 // Frame-level seam so the same session logic drives either codec: newline-framed
 // for a Unix byte stream, one-frame-per-message for a WebSocket.
 pub trait FrameReader<F>: Send {
@@ -119,8 +105,49 @@ pub fn keepalive_timer() -> Interval {
     interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL)
 }
 
-pub struct LineReader<R>(pub R);
+// Owns the writer and its keepalives so a pending write never stops the connection's
+// reader: if both ends of one socket block writing into full buffers, neither reads again.
+// Sends fail once a write has failed.
+pub fn spawn_writer<F, W>(mut writer: W) -> mpsc::UnboundedSender<F>
+where
+    F: Send + 'static,
+    W: FrameWriter<F> + 'static,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<F>();
+    tokio::spawn(async move {
+        let mut ping = keepalive_timer();
+        loop {
+            let sent = tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(frame) => writer.send(&frame).await,
+                    None => return,
+                },
+                _ = ping.tick() => writer.keepalive().await,
+            };
+            if sent.is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
+// `recv` runs as a `select!` arm, so a partial line must survive the future being
+// dropped: `read_until` appends to `line`, which outlives each call.
+pub struct LineReader<R> {
+    inner: R,
+    line: Vec<u8>,
+}
 pub struct LineWriter<W>(pub W);
+
+impl<R> LineReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            line: Vec::new(),
+        }
+    }
+}
 
 impl<R, F> FrameReader<F> for LineReader<R>
 where
@@ -128,7 +155,12 @@ where
     F: DeserializeOwned,
 {
     async fn recv(&mut self) -> Result<Option<F>> {
-        read_frame(&mut self.0).await
+        if self.inner.read_until(b'\n', &mut self.line).await? == 0 {
+            return Ok(None);
+        }
+        let frame = serde_json::from_slice(self.line.trim_ascii_end());
+        self.line.clear();
+        Ok(Some(frame?))
     }
 }
 
@@ -307,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn framed_write_then_read_in_order() {
         let (client, server) = tokio::io::duplex(256);
-        let mut reader = BufReader::new(server);
+        let mut reader = LineReader::new(BufReader::new(server));
 
         let writer = tokio::spawn(async move {
             let mut w = client;
@@ -323,7 +355,7 @@ mod tests {
             write_frame(&mut w, &ServerFrame::Attached).await.unwrap();
         });
 
-        match read_frame::<_, ServerFrame>(&mut reader).await.unwrap() {
+        match FrameReader::<ServerFrame>::recv(&mut reader).await.unwrap() {
             Some(ServerFrame::Event { seq, event }) => {
                 assert_eq!(seq, 0);
                 assert!(matches!(event, ControllerEvent::AssistantText { text } if text == "hi"));
@@ -331,11 +363,11 @@ mod tests {
             other => panic!("expected first Event frame, got {other:?}"),
         }
         assert!(matches!(
-            read_frame::<_, ServerFrame>(&mut reader).await.unwrap(),
+            FrameReader::<ServerFrame>::recv(&mut reader).await.unwrap(),
             Some(ServerFrame::Attached)
         ));
         assert!(
-            read_frame::<_, ServerFrame>(&mut reader)
+            FrameReader::<ServerFrame>::recv(&mut reader)
                 .await
                 .unwrap()
                 .is_none(),
@@ -348,7 +380,7 @@ mod tests {
     #[tokio::test]
     async fn client_frame_round_trip() {
         let (a, b) = tokio::io::duplex(256);
-        let mut reader = BufReader::new(b);
+        let mut reader = LineReader::new(BufReader::new(b));
         let mut writer = a;
 
         write_frame(
@@ -371,14 +403,14 @@ mod tests {
         .await
         .unwrap();
 
-        match read_frame::<_, ClientFrame>(&mut reader).await.unwrap() {
+        match FrameReader::<ClientFrame>::recv(&mut reader).await.unwrap() {
             Some(ClientFrame::Command(UiEvent::PermissionResponse { tool_use_id, allow })) => {
                 assert_eq!(tool_use_id, "t1");
                 assert!(allow);
             }
             other => panic!("expected Command(PermissionResponse), got {other:?}"),
         }
-        match read_frame::<_, ClientFrame>(&mut reader).await.unwrap() {
+        match FrameReader::<ClientFrame>::recv(&mut reader).await.unwrap() {
             Some(ClientFrame::Attach { after_seq, who, .. }) => {
                 assert_eq!(after_seq, Some(7));
                 assert_eq!(who.name, "alice");

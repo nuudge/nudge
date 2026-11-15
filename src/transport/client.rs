@@ -13,7 +13,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
-    keepalive_timer,
+    keepalive_timer, spawn_writer,
 };
 use crate::core::{
     BrokerHandle, ClientIdentity, Controller, ControllerEvent, PeerRegistration, SessionHandle,
@@ -53,7 +53,7 @@ impl SocketClient {
             .await
             .with_context(|| format!("connecting to daemon at {}", self.socket_path.display()))?;
         let (read_half, write_half) = stream.into_split();
-        let mut reader = LineReader(BufReader::new(read_half));
+        let mut reader = LineReader::new(BufReader::new(read_half));
         let mut writer = LineWriter(write_half);
 
         writer
@@ -92,7 +92,7 @@ impl SocketClient {
             .with_context(|| format!("connecting to session at {}", self.socket_path.display()))?;
         let (read_half, write_half) = stream.into_split();
         peer_handshake(
-            LineReader(BufReader::new(read_half)),
+            LineReader::new(BufReader::new(read_half)),
             LineWriter(write_half),
             self_broker,
             who,
@@ -434,7 +434,7 @@ async fn redial(
 // the PeerSet reap the forward peer, and dropping `ac` detaches the reverse controller.
 async fn dial_pump<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     fwd_ev_tx: mpsc::UnboundedSender<ControllerEvent>,
     mut fwd_ui_rx: mpsc::Receiver<UiEvent>,
     mut ac: Controller,
@@ -443,19 +443,18 @@ async fn dial_pump<R, W>(
     W: FrameWriter<ClientFrame> + 'static,
 {
     let mut rev_seq: u64 = 0;
-    let mut ping = keepalive_timer();
+    let out = spawn_writer(writer);
     loop {
         tokio::select! {
-            _ = ping.tick() => if writer.keepalive().await.is_err() { break },
             ui = fwd_ui_rx.recv() => match ui {
-                Some(ui) => if writer.send(&ClientFrame::Command(ui)).await.is_err() { break },
+                Some(ui) => if out.send(ClientFrame::Command(ui)).is_err() { break },
                 None => break,
             },
             ev = ac.events.recv() => match ev {
                 Some(event) => {
                     let seq = rev_seq;
                     rev_seq += 1;
-                    if writer.send(&ClientFrame::ReverseEvent { seq, event }).await.is_err() { break }
+                    if out.send(ClientFrame::ReverseEvent { seq, event }).is_err() { break }
                 }
                 None => break,
             },
