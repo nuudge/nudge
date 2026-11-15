@@ -29,8 +29,8 @@ impl Thinking {
 #[derive(Parser)]
 #[command(name = "nudge", version)]
 pub struct Cli {
-    /// Resume a previous session by id or name from ~/.nudge/projects/<cwd>/.
-    /// A name (set via /session-rename) is resolved to its session id.
+    /// Resume a previous session by id, short id (its first 8 characters) or name. A name
+    /// (set via /session-rename) matches only this directory's sessions.
     #[arg(long, value_name = "id-or-name")]
     pub resume: Option<String>,
 
@@ -51,8 +51,8 @@ pub struct Cli {
     #[arg(long, group = "run_mode")]
     pub daemon: bool,
 
-    /// Attach a TUI to a running session: a session id (any project) or name (this
-    /// directory) on this machine, or a pairing code from a remote host's QR.
+    /// Attach a TUI to a running session: a session id or short id (any project) or name
+    /// (this directory) on this machine, or a pairing code from a remote host's QR.
     #[arg(long, value_name = "id|name|pairing-code", group = "run_mode")]
     pub attach: Option<String>,
 

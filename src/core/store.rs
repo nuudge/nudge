@@ -479,23 +479,30 @@ impl SessionStore {
         Ok(())
     }
 
-    // Exact id wins, then the most recent same-named session in `cwd`; otherwise the
-    // reference passes through so the caller's open reports not-found.
-    pub fn resolve_reference(&self, cwd: &str, reference: &str) -> Result<String> {
-        if self.session(reference)?.is_some() {
-            return Ok(reference.to_string());
-        }
-        let by_name: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM sessions WHERE cwd = ?1 AND name = ?2
-                 ORDER BY last_activity DESC LIMIT 1",
-                params![cwd, reference],
-                |r| r.get(0),
-            )
-            .optional()
-            .context("resolving session reference by name")?;
-        Ok(by_name.unwrap_or_else(|| reference.to_string()))
+    // Ids starting with `<short>-`, from any project.
+    pub fn sessions_by_short_id(&self, short: &str) -> Result<Vec<SessionRow>> {
+        self.sessions_where("substr(id, 1, length(?1) + 1) = ?1 || '-'", params![short])
+            .context("finding sessions by short id")
+    }
+
+    // Newest first.
+    pub fn sessions_named(&self, cwd: &str, name: &str) -> Result<Vec<SessionRow>> {
+        self.sessions_where("cwd = ?1 AND name = ?2", params![cwd, name])
+            .context("finding sessions by name")
+    }
+
+    fn sessions_where(
+        &self,
+        condition: &str,
+        args: &[&dyn rusqlite::ToSql],
+    ) -> rusqlite::Result<Vec<SessionRow>> {
+        self.conn
+            .prepare(&format!(
+                "SELECT id, cwd, name, branch, created, last_activity, state, spawned_by, spawn_task
+                 FROM sessions WHERE {condition} ORDER BY last_activity DESC"
+            ))?
+            .query_map(args, session_row)?
+            .collect()
     }
 
     pub fn list_by_cwd(&self, cwd: &str) -> Result<Vec<SessionListing>> {
@@ -980,26 +987,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reference_prefers_id_then_scoped_name_then_passthrough() {
+    fn short_id_and_name_queries() {
         let mut s = store();
-        s.insert_session("real-id", "/proj", None, None).unwrap();
+        let ids = |rows: Vec<SessionRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        s.insert_session("0e1b8a08-aaaa", "/proj", None, None)
+            .unwrap();
+        s.insert_session("0e1b8a08-bbbb", "/other", None, None)
+            .unwrap();
+        s.insert_session("0e1b8a080-cccc", "/proj", None, None)
+            .unwrap();
+        let mut by_short = ids(s.sessions_by_short_id("0e1b8a08").unwrap());
+        by_short.sort();
+        assert_eq!(by_short, ["0e1b8a08-aaaa", "0e1b8a08-bbbb"], "any project");
 
-        assert_eq!(s.resolve_reference("/proj", "real-id").unwrap(), "real-id");
-
-        // Two sessions named "dup" in this cwd: the most recently active wins.
         s.insert_session("old", "/proj", None, None).unwrap();
         s.set_name("old", "dup", None).unwrap();
         s.insert_session("new", "/proj", None, None).unwrap();
         s.set_name("new", "dup", None).unwrap();
         s.append_message("new", "user", "{}", None).unwrap();
-        assert_eq!(s.resolve_reference("/proj", "dup").unwrap(), "new");
-
-        // A name in another cwd is out of scope.
         s.insert_session("elsewhere", "/other", None, None).unwrap();
-        s.set_name("elsewhere", "faraway", None).unwrap();
-        assert_eq!(s.resolve_reference("/proj", "faraway").unwrap(), "faraway");
-
-        assert_eq!(s.resolve_reference("/proj", "nope").unwrap(), "nope");
+        s.set_name("elsewhere", "dup", None).unwrap();
+        assert_eq!(
+            ids(s.sessions_named("/proj", "dup").unwrap()),
+            ["new", "old"],
+            "this cwd only, newest first"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use super::super::events::UiEvent;
 use super::super::host::BrokerHandle;
-use super::super::peer::{PeerFactory, PeerSet};
+use super::super::peer::{PeerFactory, PeerSet, SpawnRequest};
 use crate::llm::SystemBlock;
 
 pub(super) const MESSAGE_PEER: &str = "MessagePeer";
@@ -25,9 +25,12 @@ pub(super) fn roster_system_text(peers: &PeerSet) -> Option<String> {
         "You are connected to these peer agents. Address one by its exact \
              name with the MessagePeer tool:",
     );
+    let parent = peers.spawner_id().map(|id| peers.display_name(id));
     for p in infos {
         let role = if p.supervised {
             "subagent you spawned"
+        } else if parent.as_ref() == Some(&p.name) {
+            "your parent"
         } else {
             "peer"
         };
@@ -84,12 +87,18 @@ Deciding check-ins with RespondToPeer (approve or deny — there is no escalate 
 pub(super) fn permission_summary(name: &str, input: &Value) -> String {
     match name {
         SPAWN => {
-            let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
-            format!("spawn a subagent — task: {task}")
+            let task = input.get("task").and_then(Value::as_str);
+            match input.get("revive").and_then(Value::as_str) {
+                Some(child) => format!(
+                    "revive subagent {child}{}",
+                    task.map(|t| format!(" — task: {t}")).unwrap_or_default()
+                ),
+                None => format!("spawn a subagent — task: {}", task.unwrap_or("?")),
+            }
         }
         DISMISS_PEER => {
             let peer = input.get("peer").and_then(Value::as_str).unwrap_or("?");
-            format!("dismiss subagent {peer} (ends its session; log persists)")
+            format!("dismiss subagent {peer} (it exits a minute later; log persists)")
         }
         _ => summary(name, input),
     }
@@ -102,9 +111,14 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
         out.push(json!({
             "name": SPAWN,
             "description": "Spawn a subagent: a full peer agent in this directory with \
-                the same built-in coding tools, started on the given task. The result \
-                reports its name (e.g. 'child-ab12cd34') and session id — the spawn is \
-                now part of your conversation, so you can refer to it later. The \
+                the same tools, skills and project instructions as you, started on the \
+                given task. The result reports its name (e.g. 'ab12cd34') and \
+                session id — the spawn is now part of your conversation, so you can refer \
+                to it later. A subagent runs as its own process and outlives this \
+                session: after a restart, or once you hold no edge to it, pass its name \
+                or session id as 'revive' to supervise it again with its context intact \
+                ('task', if given, is then sent as its next message). Only your own \
+                subagents can be revived. The \
                 subagent works autonomously; its activity surfaces to you as \
                 '[peer …]' notices, and you can address it with MessagePeer. It has a \
                 standing obligation to message you its result when done or blocked — \
@@ -119,10 +133,14 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
                     "task": {
                         "type": "string",
                         "description": "The subagent's assignment. Self-contained and \
-                            specific: it starts with no context beyond this text."
+                            specific: a new subagent starts with no context beyond this text."
+                    },
+                    "revive": {
+                        "type": "string",
+                        "description": "Name, short id or session id of a subagent you spawned \
+                            earlier, to reclaim instead of spawning a new one."
                     }
-                },
-                "required": ["task"]
+                }
             }
         }));
     }
@@ -144,7 +162,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
                 "properties": {
                     "peer": {
                         "type": "string",
-                        "description": "The peer's name, e.g. 'child-ab12cd34'."
+                        "description": "The peer's name, e.g. 'ab12cd34'."
                     },
                     "message": {
                         "type": "string",
@@ -193,17 +211,18 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
         }));
         out.push(json!({
             "name": DISMISS_PEER,
-            "description": "End a subagent you spawned. Its in-memory session ends \
-                (any in-flight work stops); its session log persists on disk and can \
-                be resumed later. Use it when the subagent's task is done and you no \
-                longer need it, or when it is stuck beyond redirection. Only \
-                subagents you spawned can be dismissed.",
+            "description": "Let go of a subagent you spawned. With no one left to \
+                supervise it, it exits about a minute later (any in-flight work stops); \
+                its session log persists on disk, and Spawn with 'revive' reclaims it. \
+                Use it when the subagent's task is done and you no longer need it, or \
+                when it is stuck beyond redirection. Only subagents you spawned can be \
+                dismissed.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "peer": {
                         "type": "string",
-                        "description": "The subagent's name, e.g. 'child-ab12cd34'."
+                        "description": "The subagent's name, e.g. 'ab12cd34'."
                     }
                 },
                 "required": ["peer"]
@@ -215,10 +234,10 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
 
 pub(super) fn summary(name: &str, input: &Value) -> String {
     match name {
-        SPAWN => {
-            let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
-            truncated(task, 80)
-        }
+        SPAWN => match input.get("revive").and_then(Value::as_str) {
+            Some(child) => format!("revive {child}"),
+            None => truncated(input.get("task").and_then(Value::as_str).unwrap_or("?"), 80),
+        },
         RESPOND_TO_PEER => {
             let verdict = input.get("verdict").and_then(Value::as_str).unwrap_or("?");
             verdict.to_string()
@@ -254,28 +273,60 @@ pub(super) async fn execute(
 ) -> Result<String> {
     match name {
         SPAWN => {
-            let Some(task) = input.get("task").and_then(Value::as_str) else {
-                bail!("Spawn requires a 'task' string");
+            let task = input.get("task").and_then(Value::as_str).map(String::from);
+            let request = match input.get("revive").and_then(Value::as_str) {
+                Some(child) => SpawnRequest::Revive {
+                    child: child.to_string(),
+                    task: task.clone(),
+                },
+                None => match &task {
+                    Some(task) => SpawnRequest::New { task: task.clone() },
+                    None => bail!("Spawn requires a 'task' or a 'revive' string"),
+                },
             };
             let Some(factory) = factory else {
                 bail!("this agent cannot spawn subagents");
             };
-            let reg = factory(task.to_string(), self_handle.clone()).await?;
+            // Reclaiming would be refused anyway: this session is already its answerer.
+            if let SpawnRequest::Revive { child, task } = &request
+                && let Some(id) = peers.find(child)?
+                && peers.is_supervised(id)
+            {
+                let name = peers.display_name(id);
+                let Some(text) = task.clone() else {
+                    return Ok(format!("already supervising {name}"));
+                };
+                peers
+                    .drive(id, UiEvent::UserMessage { text: text.clone() })
+                    .await?;
+                return Ok(format!(
+                    "already supervising {name}; it is now working on: {text}"
+                ));
+            }
+            let revived = matches!(request, SpawnRequest::Revive { .. });
+            let reg = factory(request, self_handle.clone()).await?;
             let peer_name = reg.who.name.clone();
             let session_id = reg.who.session_id.clone().unwrap_or_default();
             peers.register(reg);
-            Ok(format!(
-                "spawned peer {peer_name} (session {session_id}); it is now working on: {task}"
-            ))
+            let verb = if revived { "revived" } else { "spawned" };
+            Ok(match task {
+                Some(task) => format!(
+                    "{verb} peer {peer_name} (session {session_id}); it is now working on: {task}"
+                ),
+                None => format!(
+                    "{verb} peer {peer_name} (session {session_id}); you supervise it again"
+                ),
+            })
         }
         // During steering the verdict call is handled by the steering turn, never here.
         RESPOND_TO_PEER => bail!("no pending peer check-in to respond to"),
-        // Dropping the Peer sends its SessionHost a final Quit, ending the child cleanly.
+        // Dropping the edge leaves the child with no answerer, so its process exits after
+        // the linger.
         DISMISS_PEER => {
             let Some(peer) = input.get("peer").and_then(Value::as_str) else {
                 bail!("DismissPeer requires a 'peer' string");
             };
-            let Some(id) = peers.find_by_name(peer) else {
+            let Some(id) = peers.find(peer)? else {
                 bail!(
                     "no peer named '{peer}'; current peers: {}",
                     peers.roster().join(", ")
@@ -286,7 +337,7 @@ pub(super) async fn execute(
             }
             peers.remove(id);
             Ok(format!(
-                "dismissed {peer}; its session ended (the session log persists on disk)"
+                "dismissed {peer}; it exits within a minute unless revived (the session log persists on disk)"
             ))
         }
         _ => {
@@ -296,7 +347,7 @@ pub(super) async fn execute(
             let Some(message) = input.get("message").and_then(Value::as_str) else {
                 bail!("MessagePeer requires a 'message' string");
             };
-            let Some(id) = peers.find_by_name(peer) else {
+            let Some(id) = peers.find(peer)? else {
                 let roster = peers.roster();
                 if roster.is_empty() {
                     bail!("no peer named '{peer}': you currently hold no peers");
@@ -313,7 +364,7 @@ pub(super) async fn execute(
                         text: message.to_string(),
                     },
                 )
-                .await;
+                .await?;
             Ok(format!("message sent to {peer}"))
         }
     }

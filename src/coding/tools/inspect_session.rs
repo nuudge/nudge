@@ -51,7 +51,7 @@ pub fn schema() -> Value {
                 },
                 "session": {
                     "type": "string",
-                    "description": "inspect mode (required) or search mode (optional): session id, or a session name (resolved within the current project). In search mode, scopes the search to that one session."
+                    "description": "inspect mode (required) or search mode (optional): session id, its 8-character short id, or a session name (resolved within the current project). In search mode, scopes the search to that one session."
                 },
                 "last_n": {
                     "type": "integer",
@@ -162,10 +162,8 @@ fn inspect(
     around_ordinal: Option<i64>,
     include_superseded: bool,
 ) -> Result<String> {
-    let id = store.resolve_reference(cwd, reference)?;
-    let Some(row) = store.session(&id)? else {
-        bail!("no session {reference:?} in the store (by id or name in this project)");
-    };
+    let row = crate::coding::resolve_session(store, cwd, reference, |_| false)?;
+    let id = row.id.clone();
     let turns = store.turn_count(&id)?;
 
     let mut out = String::new();
@@ -347,11 +345,7 @@ fn search(
 ) -> Result<String> {
     let session_id = match session {
         Some(reference) => {
-            let id = store.resolve_reference(cwd, reference)?;
-            if store.session(&id)?.is_none() {
-                bail!("no session {reference:?} in the store (by id or name in this project)");
-            }
-            Some(id)
+            Some(crate::coding::resolve_session(store, cwd, reference, |_| false)?.id)
         }
         None => None,
     };

@@ -8,7 +8,7 @@ use super::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use crate::core::events::{AgentEvent, ControllerEvent, UiEvent};
 use crate::core::host::Controller;
 use crate::core::identity::{ClientIdentity, ClientKind};
-use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet, Registered};
+use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet, SpawnRequest};
 use crate::core::session::Session;
 use crate::core::store::{SessionState, SessionStore};
 use crate::core::{SessionHandle, SessionHost};
@@ -516,7 +516,6 @@ fn supervised_reg(controller: Controller, who: ClientIdentity) -> PeerRegistrati
     PeerRegistration {
         controller,
         who,
-        host: None,
         supervised: true,
         spawner: false,
     }
@@ -966,7 +965,7 @@ async fn unsupervised_check_in_is_not_answered() {
 }
 
 #[tokio::test]
-async fn dismiss_peer_ends_the_supervised_child() {
+async fn dismiss_peer_drops_the_supervised_edge() {
     let (session, dir) = mk_session();
     let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1077,224 +1076,6 @@ async fn session_state_ends_on_teardown_and_runs_again_on_open() {
     assert_eq!(state(&dir), SessionState::Running);
     drop(resumed);
 
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-// Dropping the parent's Peer sends the child's host a Quit.
-#[tokio::test]
-async fn dismissed_child_session_row_reads_ended() {
-    let (parent_session, parent_dir) = mk_session();
-    let (child_session, child_dir) = mk_session();
-    let child_id = child_session.id.clone();
-    let child_host = SessionHost::spawn(
-        mk_cfg(),
-        FakeProvider,
-        FakeBackend,
-        child_session,
-        Vec::new(),
-        Vec::new(),
-        crate::core::PeerWiring::default(),
-    );
-    let child_ctrl = child_host
-        .attach(agent_who("parent"))
-        .await
-        .expect("attach to child");
-
-    let mut peers = PeerSet::default();
-    peers.register(PeerRegistration {
-        controller: child_ctrl,
-        who: agent_who("child-1"),
-        host: Some(child_host),
-        supervised: true,
-        spawner: false,
-    });
-
-    let provider = ScriptedProvider {
-        responses: std::sync::Mutex::new(vec![
-            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
-            end_turn_response("done"),
-        ]),
-        seen_messages: Default::default(),
-        seen_tools: Default::default(),
-    };
-    let (ui_tx, ui_rx) = mpsc::channel(16);
-    let (agent_tx, mut agent_rx) = mpsc::channel(16);
-    let task = tokio::spawn(run_agent(
-        mk_cfg(),
-        provider,
-        FakeBackend,
-        parent_session,
-        Vec::new(),
-        mk_io(ui_rx, agent_tx, peers, None),
-    ));
-
-    ui_tx
-        .send((
-            None,
-            UiEvent::UserMessage {
-                text: "dismiss the child".into(),
-            },
-        ))
-        .await
-        .unwrap();
-    loop {
-        match agent_rx.recv().await {
-            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
-            Some(AgentEvent::TurnComplete) => break,
-            Some(_) => {}
-            None => panic!("loop ended early"),
-        }
-    }
-
-    // The child's loop processes its Quit asynchronously; poll briefly.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let state = SessionStore::open(&child_dir.join("nudge.db"))
-            .unwrap()
-            .session(&child_id)
-            .unwrap()
-            .unwrap()
-            .state;
-        if state == SessionState::Ended {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "dismissed child's row never read 'ended'"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-
-    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
-    task.await.unwrap().unwrap();
-    std::fs::remove_dir_all(&parent_dir).ok();
-    std::fs::remove_dir_all(&child_dir).ok();
-}
-
-#[tokio::test]
-async fn dismissed_child_is_answerable_from_inspect_session_alone() {
-    let (parent_session, dir) = mk_session();
-    let parent_id = parent_session.id.clone();
-    let db = dir.join("nudge.db");
-
-    // The child shares the parent's store, so the spawned_by FK edge is real.
-    let child_session = Session::create_spawned(
-        dir.clone(),
-        SessionStore::open(&db).unwrap(),
-        &parent_id,
-        "count the files",
-    )
-    .unwrap();
-    let child_id = child_session.id.clone();
-    let child_host = SessionHost::spawn(
-        mk_cfg(),
-        FakeProvider,
-        FakeBackend,
-        child_session,
-        Vec::new(),
-        Vec::new(),
-        crate::core::PeerWiring::default(),
-    );
-
-    // Drive one child turn so its transcript has content to inspect.
-    let mut driver = child_host
-        .attach(ClientIdentity::human("tester"))
-        .await
-        .expect("attach driver to child");
-    driver
-        .ui_tx
-        .send(UiEvent::UserMessage {
-            text: "count the files".into(),
-        })
-        .await
-        .unwrap();
-    loop {
-        match driver.events.recv().await {
-            Some(ControllerEvent::TurnComplete) => break,
-            Some(_) => {}
-            None => panic!("child stream ended before its turn completed"),
-        }
-    }
-    drop(driver);
-
-    let child_ctrl = child_host
-        .attach(agent_who("parent"))
-        .await
-        .expect("attach parent edge to child");
-    let mut peers = PeerSet::default();
-    peers.register(PeerRegistration {
-        controller: child_ctrl,
-        who: agent_who("child-1"),
-        host: Some(child_host),
-        supervised: true,
-        spawner: false,
-    });
-    let provider = ScriptedProvider {
-        responses: std::sync::Mutex::new(vec![
-            tool_use_response("DismissPeer", serde_json::json!({"peer": "child-1"})),
-            end_turn_response("done"),
-        ]),
-        seen_messages: Default::default(),
-        seen_tools: Default::default(),
-    };
-    let (ui_tx, ui_rx) = mpsc::channel(16);
-    let (agent_tx, mut agent_rx) = mpsc::channel(16);
-    let task = tokio::spawn(run_agent(
-        mk_cfg(),
-        provider,
-        FakeBackend,
-        parent_session,
-        Vec::new(),
-        mk_io(ui_rx, agent_tx, peers, None),
-    ));
-    ui_tx
-        .send((
-            None,
-            UiEvent::UserMessage {
-                text: "dismiss the child".into(),
-            },
-        ))
-        .await
-        .unwrap();
-    loop {
-        match agent_rx.recv().await {
-            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
-            Some(AgentEvent::TurnComplete) => break,
-            Some(_) => {}
-            None => panic!("loop ended early"),
-        }
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let state = SessionStore::open(&db)
-            .unwrap()
-            .session(&child_id)
-            .unwrap()
-            .unwrap()
-            .state;
-        if state == SessionState::Ended {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "child never ended");
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-
-    let out = crate::coding::tools::inspect_session_run(
-        &serde_json::json!({"mode": "inspect", "session": child_id}),
-        &SessionStore::open(&db).unwrap(),
-        &dir.display().to_string(),
-    )
-    .unwrap();
-    assert!(out.contains(&format!("session {child_id}")), "{out}");
-    assert!(out.contains("state: ended"), "{out}");
-    assert!(out.contains(&format!("spawned by: {parent_id}")), "{out}");
-    assert!(out.contains("task: count the files"), "{out}");
-    assert!(out.contains("live turns: 2"), "{out}");
-    assert!(out.contains("count the files"), "{out}");
-    assert!(out.contains("ok"), "the child's reply is visible: {out}");
-
-    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
-    task.await.unwrap().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1680,7 +1461,7 @@ async fn message_peer_unknown_name_lists_roster() {
 
 // Running the factory empties the slot, so a test can tell whether it ran.
 fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> PeerFactory {
-    Box::new(move |task, _self_handle| {
+    Box::new(move |_request, _self_handle| {
         let slot = slot.clone();
         Box::pin(async move {
             let controller = slot
@@ -1690,16 +1471,167 @@ fn stub_factory(slot: std::sync::Arc<std::sync::Mutex<Option<Controller>>>) -> P
                 .expect("factory called more than once");
             let mut who = agent_who("child-test");
             who.session_id = Some("sess-1".into());
-            who.task = Some(task);
-            Ok(PeerRegistration {
-                controller,
-                who,
-                host: None,
-                supervised: true,
-                spawner: false,
-            })
+            Ok(PeerRegistration::forward(controller, who, true))
         })
     })
+}
+
+#[tokio::test]
+async fn spawn_maps_task_and_revive_to_factory_requests() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response("Spawn", serde_json::json!({"task": "count files"})),
+            tool_use_response(
+                "Spawn",
+                serde_json::json!({"revive": "child-old", "task": "carry on"}),
+            ),
+            tool_use_response("Spawn", serde_json::json!({})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: Default::default(),
+    };
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let factory: PeerFactory = Box::new(move |request, _self_handle| {
+        recorded.lock().unwrap().push(request);
+        Box::pin(async {
+            let (controller, _ev, _ui) = fake_peer();
+            Ok(PeerRegistration::forward(
+                controller,
+                session_who("child-sess"),
+                true,
+            ))
+        })
+    });
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            peer_factory: Some(factory),
+            ..mk_io(ui_rx, agent_tx, PeerSet::default(), None)
+        },
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    assert_eq!(
+        *requests.lock().unwrap(),
+        [
+            SpawnRequest::New {
+                task: "count files".into()
+            },
+            SpawnRequest::Revive {
+                child: "child-old".into(),
+                task: Some("carry on".into())
+            },
+        ]
+    );
+    let transcript = seen_messages.lock().unwrap().clone();
+    assert!(
+        transcript.iter().any(|m| m.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, is_error: true, .. }
+                if content.contains("requires a 'task' or a 'revive'")
+        ))),
+        "neither argument is an error: {transcript:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reviving_a_held_child_reuses_its_edge_without_the_factory() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response(
+                "Spawn",
+                serde_json::json!({"revive": "child-sess", "task": "one more thing"}),
+            ),
+            tool_use_response("Spawn", serde_json::json!({"revive": "x"})),
+            end_turn_response("done"),
+        ]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: Default::default(),
+    };
+    let mut peers = PeerSet::default();
+    let (held, _held_ev, mut held_ui) = fake_peer();
+    peers.register(supervised_reg(held, session_who("child-sess")));
+    let (unused, _unused_ev, _unused_ui) = fake_peer();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(unused)));
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            peer_factory: Some(stub_factory(slot.clone())),
+            ..mk_io(ui_rx, agent_tx, peers, None)
+        },
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::PermissionRequest { respond, .. }) => respond.send(true).unwrap(),
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+
+    assert!(slot.lock().unwrap().is_some(), "the factory must not run");
+    match held_ui.try_recv() {
+        Ok(UiEvent::UserMessage { text }) => assert_eq!(text, "one more thing"),
+        other => panic!("expected the task over the held edge, got {other:?}"),
+    }
+    let results: Vec<String> = seen_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m.content.clone())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        results.contains(&"already supervising x; it is now working on: one more thing".into())
+            && results.contains(&"already supervising x".into()),
+        "revive by session id and by name: {results:?}"
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -2307,6 +2239,18 @@ fn roster_system_text_lists_held_peers() {
     assert!(
         text.contains("mate (peer)"),
         "unsupervised peer labelled: {text}"
+    );
+
+    let (p_ctrl, _p_ev, _p_ui) = fake_peer();
+    peers.register(PeerRegistration::back(p_ctrl, agent_who("3014903e"), true));
+    let text = roster_system_text(&peers).unwrap();
+    assert!(
+        text.contains("3014903e (your parent)"),
+        "spawner edge labelled: {text}"
+    );
+    assert!(
+        text.contains("mate (peer)"),
+        "only the spawner is the parent: {text}"
     );
 }
 
@@ -3642,48 +3586,6 @@ fn session_who(session_id: &str) -> ClientIdentity {
     }
 }
 
-// Rejecting rather than replacing keeps the child alive: dropping its Peer would quit it.
-#[tokio::test]
-async fn a_duplicate_edge_to_a_spawned_child_is_rejected() {
-    let (child_session, dir) = mk_session();
-    let child_id = child_session.id.clone();
-    let child_host = SessionHost::spawn(
-        mk_cfg(),
-        FakeProvider,
-        FakeBackend,
-        child_session,
-        Vec::new(),
-        Vec::new(),
-        crate::core::PeerWiring::default(),
-    );
-    let child_ctrl = child_host
-        .attach(agent_who("parent"))
-        .await
-        .expect("attach to child");
-
-    let mut peers = PeerSet::default();
-    peers.register(PeerRegistration {
-        host: Some(child_host),
-        ..supervised_reg(child_ctrl, session_who(&child_id))
-    });
-    for supervised in [false, true] {
-        let (ctrl, _ev, _ui) = fake_peer();
-        assert_eq!(
-            peers.register(PeerRegistration::forward(
-                ctrl,
-                session_who(&child_id),
-                supervised
-            )),
-            Registered::Rejected(0)
-        );
-    }
-    assert_eq!(peers.infos().len(), 1);
-    assert!(peers.is_supervised(0));
-
-    drop(peers);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[tokio::test]
 async fn duplicate_edges_to_one_session_report_replace_and_reject() {
     let (session, dir) = mk_session();
@@ -3873,6 +3775,178 @@ async fn a_picker_request_queued_mid_turn_is_answered_after_the_turn() {
         }
     }
     assert_eq!(pickers, 1);
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// Tool names and joined system text.
+type FirstRequest = (Vec<String>, String);
+
+// Records the first request only.
+struct FirstRequestProvider {
+    seen: std::sync::Arc<std::sync::Mutex<Option<FirstRequest>>>,
+}
+impl Provider for FirstRequestProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.seen.lock().unwrap().get_or_insert_with(|| {
+            let tools = req
+                .tools
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str).map(String::from))
+                .collect();
+            let system = req.system.iter().map(|b| b.text.as_str()).collect();
+            (tools, system)
+        });
+        Ok(end_turn_response("ok"))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+// A child's return edge and its task are both queued when its loop starts and select!
+// takes either first, so the race is repeated until both orders have surely occurred.
+#[tokio::test]
+async fn an_edge_queued_with_the_task_is_usable_from_the_first_request() {
+    for _ in 0..16 {
+        let (session, dir) = mk_session();
+        let (ui_tx, ui_rx) = mpsc::channel(16);
+        let (agent_tx, mut agent_rx) = mpsc::channel(64);
+        let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+        let (parent_ctrl, _ev_tx, _ui_rx) = fake_peer();
+        reg_tx
+            .send(PeerRegistration::back(
+                parent_ctrl,
+                agent_who("parent"),
+                true,
+            ))
+            .unwrap();
+        ui_tx
+            .send((
+                Some(agent_who("parent")),
+                UiEvent::UserMessage {
+                    text: "task".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(run_agent(
+            mk_cfg(),
+            FirstRequestProvider { seen: seen.clone() },
+            FakeBackend,
+            session,
+            Vec::new(),
+            mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+        ));
+        drain_until(&mut agent_rx, |ev| matches!(ev, AgentEvent::TurnComplete)).await;
+
+        let (tools, system) = seen.lock().unwrap().take().unwrap();
+        assert!(tools.iter().any(|t| t == "MessagePeer"), "tools: {tools:?}");
+        assert!(system.contains("parent (your parent)"), "system: {system}");
+
+        ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+// Each request's system text and messages.
+type SeenRequests = Vec<(String, Vec<Message>)>;
+
+// Drops the peer's far end during the first request, so the edge closes mid-turn.
+struct DisconnectingProvider {
+    far_end: std::sync::Mutex<Option<mpsc::Receiver<UiEvent>>>,
+    responses: std::sync::Mutex<Vec<Response>>,
+    seen: std::sync::Arc<std::sync::Mutex<SeenRequests>>,
+}
+impl Provider for DisconnectingProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.far_end.lock().unwrap().take();
+        let system = req.system.iter().map(|b| b.text.as_str()).collect();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((system, req.messages.to_vec()));
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn message_to_a_peer_gone_mid_turn_fails_and_the_peer_is_reaped() {
+    let (session, dir) = mk_session();
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = DisconnectingProvider {
+        far_end: std::sync::Mutex::new(Some(peer_ui)),
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response(
+                "MessagePeer",
+                serde_json::json!({"peer": "child-1", "message": "hi"}),
+            ),
+            end_turn_response("ok"),
+        ]),
+        seen: seen.clone(),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut reaped = false;
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Notice { text }) if text == "[peer child-1] disconnected" => {
+                reaped = true
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+    assert!(reaped, "the reap is announced");
+
+    let requests = seen.lock().unwrap().clone();
+    assert!(requests[0].0.contains("child-1"), "{}", requests[0].0);
+    let result = requests[1]
+        .1
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+    assert_eq!(
+        result,
+        Some((
+            "Tool execution error: peer child-1 has disconnected".into(),
+            true
+        )),
+        "MessagePeer reports the lost send"
+    );
+    assert!(
+        !requests[1].0.contains("child-1"),
+        "the next request's roster drops it: {}",
+        requests[1].0
+    );
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();

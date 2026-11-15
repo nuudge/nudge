@@ -11,7 +11,7 @@ use tokio_tungstenite::connect_async;
 use super::encryption::Cipher;
 use super::wire::{
     ClientFrame, FrameReader, FrameWriter, LineReader, LineWriter, ServerFrame, WsReader, WsWriter,
-    keepalive_timer,
+    keepalive_timer, spawn_writer,
 };
 use crate::core::{
     BrokerHandle, ClientIdentity, ClientProfile, Controller, ControllerEvent, HandoffStatus,
@@ -53,7 +53,7 @@ pub async fn serve_socket(listener: UnixListener, broker: BrokerHandle, peer_acc
         let peer_accept = peer_accept.clone();
         tokio::spawn(async move {
             let (read_half, write_half) = stream.into_split();
-            let mut reader = LineReader(BufReader::new(read_half));
+            let mut reader = LineReader::new(BufReader::new(read_half));
             let writer = LineWriter(write_half);
             let Some((after_seq, who, reverse_offer)) = recv_attach(&mut reader).await else {
                 return;
@@ -262,7 +262,7 @@ async fn bridge<R, W>(
     peer_accept: Option<PeerAccept>,
 ) where
     R: FrameReader<ClientFrame>,
-    W: FrameWriter<ServerFrame>,
+    W: FrameWriter<ServerFrame> + 'static,
 {
     let (attached, supervised) = match grant {
         Grant::Fixed(profile) => (broker.attach_as(who.clone(), profile).await, false),
@@ -316,18 +316,14 @@ async fn bridge<R, W>(
 
     let mut events = controller.events;
     let ui_tx = controller.ui_tx;
-    // The broker replays its whole buffer from index 0 on every attach, so the
-    // receive index is a stable resume cursor across reconnects.
+    // A fixed grant replays the broker's whole buffer from index 0, so the receive
+    // index is a stable resume cursor across reconnects. A peer grant gets live events
+    // only, which is fine because a peer dialer never resumes.
     let mut seq: u64 = 0;
-    let mut ping = keepalive_timer();
+    let out = spawn_writer(writer);
 
     loop {
         tokio::select! {
-            _ = ping.tick() => {
-                if writer.keepalive().await.is_err() {
-                    return;
-                }
-            }
             maybe_ev = events.recv() => {
                 match maybe_ev {
                     Some(event) => {
@@ -342,11 +338,7 @@ async fn bridge<R, W>(
                                     continue;
                                 }
                         }
-                        if writer
-                            .send(&ServerFrame::Event { seq: this_seq, event })
-                            .await
-                            .is_err()
-                        {
+                        if out.send(ServerFrame::Event { seq: this_seq, event }).is_err() {
                             return;
                         }
                     }
@@ -377,7 +369,7 @@ async fn bridge<R, W>(
             rev_ui = recv_opt_ui(&mut rev_ui_rx) => {
                 match rev_ui {
                     Some(ui) => {
-                        if writer.send(&ServerFrame::ReverseCommand(ui)).await.is_err() {
+                        if out.send(ServerFrame::ReverseCommand(ui)).is_err() {
                             return;
                         }
                     }

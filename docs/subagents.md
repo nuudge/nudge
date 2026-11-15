@@ -18,20 +18,24 @@ design behind both. `/peers` lists both kinds.
 Ask for a subagent in plain language — *"spawn a subagent to analyze the largest files in
 this repo"* — and the agent calls its `Spawn` tool (gated: you approve every spawn, since a
 subagent spends tokens autonomously). The child it creates is not a stripped-down task
-runner; it is **a full nudge agent**: same tools, its own conversation and session log (it
-shows up in `nudge --list` and can be `--resume`d later), running in the same directory
-under a role prompt that tells it who spawned it and that its one obligation is to deliver
-its result back. It follows the project's `AGENTS.md`, with one adjustment: wherever those
-instructions say to ask the user, it asks its parent instead.
+runner; it is **a full nudge session in its own process**, with the same capabilities as
+its parent: the same tools, the project's `.mcp.json` servers and skills, and its own
+conversation and session log (it shows up in `nudge --list` and the `/connect-peer`
+picker, live while it runs). It runs in the same directory under a role prompt that
+tells it who spawned it and that its one obligation is to deliver its result back. The
+only differences from a normal session are that its parent supervises it and that it
+cannot spawn subagents of its own. It follows the project's `AGENTS.md`, with one
+adjustment: wherever those instructions say to ask the user, it asks its parent instead.
 
 While the child works:
 
-- **You watch** — its activity streams into your TUI as `[peer child-…]` notices.
+- **You watch** — its activity streams into your TUI as `[peer ab12cd34]` notices, named
+  by its short session id until it's renamed.
 - **The parent supervises** — the child's gated tool calls (shell, file writes) check in
   with the parent, which decides each one *with its full conversation as context*: routine
   calls are approved, wrong turns are **denied with a corrective instruction** the child
   picks up as its next input, and anything the parent can't judge — destructive,
-  irreversible, off-task — is **escalated to your permission prompt**, named (`peer child-…
+  irreversible, off-task — is **escalated to your permission prompt**, named (`peer ab12cd34
   — rm -rf …`), exactly like the parent's own gated calls. The parent cannot approve a
   spawn's way around you: escalations and spawns always terminate at a human. If the
   parent fails to reach a verdict at all (an API error, or no answer after a retry), the
@@ -42,11 +46,34 @@ While the child works:
   or the child ask its parent a clarifying question.
 - **It reports and retires** — the child messages its result back when done (or when
   blocked); the parent can then keep it around for follow-ups or dismiss it (`DismissPeer`,
-  also gated). Dismissal ends the child's process; its session log persists.
+  also gated). Dismissal lets go of the child: with no one left to answer its prompts, its
+  process exits about a minute later. Its session log persists.
 
 The economics are the point: the child burns its own context reading files and running
 commands, and the parent's transcript records only the spawn, compact supervision verdicts,
 and the final report — you get parallel work without paying twice for the same context.
+
+## Reviving a child
+
+A child outlives its parent's process. When the parent quits, crashes or restarts, the
+child keeps going with no one to answer its prompts; it waits 60 seconds for a supervisor
+to return, then exits and is marked ended.
+
+The parent reclaims it with `Spawn` and `revive` set to the child's name, short id or session id
+(optionally with a `task` to send once it's back). Only the parent's own children can be
+revived; for any other session, use `/connect-peer`.
+
+- **Within the 60 seconds** the child is still running, so the parent simply becomes its
+  supervisor again. Nothing is lost, not even a turn that was in flight.
+- **Later**, the child has ended; reviving starts it again in the background from its
+  session log, up to its last completed turn, and the parent supervises it.
+- **If someone else answers its prompts** (you `--attach`ed to it, `--resume`d it, or
+  another agent supervises it), revive fails with an "already taken" error that points at
+  `/connect-peer`.
+
+However a child is started — spawned, revived, `--resume`d or reached with
+`/connect-peer` — it runs under its subagent role and cannot spawn, because its session
+records which session spawned it.
 
 ## In practice
 

@@ -3,7 +3,7 @@ mod daemon;
 mod local;
 mod local_peer;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::cli::Cli;
 use crate::coding;
@@ -12,7 +12,6 @@ use crate::core::store::SessionRow;
 use crate::core::{self, AgentConfig, Backend, ClientIdentity};
 use crate::llm;
 use crate::models::{MODELS, owned_models, resolve_models};
-use crate::spawn;
 use crate::transport;
 use crate::tui;
 
@@ -34,9 +33,6 @@ pub async fn host(cli: Cli) -> Result<()> {
     if cli.daemon && !cli.local && config.relay.is_none() {
         anyhow::bail!("--daemon serves the relay too: set NUDGE_RELAY, or pass --local");
     }
-    // A spawned child builds its own provider with the same key.
-    let api_key = config.anthropic_api_key.clone();
-
     let (session, entries, dropped) = match &cli.resume {
         None => (coding::open_new()?, Vec::new(), 0),
         Some(id) => {
@@ -111,7 +107,9 @@ pub async fn host(cli: Cli) -> Result<()> {
     let socket_path = coding::session_socket_path(&session.id)?;
     let listener = transport::bind_listener(&socket_path)?;
 
-    let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
+    let role = subagent_role(coding::parent_of(&session.id)?.is_some());
+    let mut backend =
+        coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
 
     // Front-ends rebuild history purely from the replayed event stream; the
     // model's conversation is rebuilt separately from the same entries.
@@ -139,23 +137,31 @@ pub async fn host(cli: Cli) -> Result<()> {
             peers: Vec::new(),
         },
     );
-    // Children are built without a factory, so subagents can't spawn their own.
-    let factory = spawn::peer_factory(
-        api_key.clone(),
-        session.id.clone(),
-        config.model.clone(),
-        config.max_iterations,
-        config.web_search,
-    );
-
     let peer_identity = core::ClientIdentity {
         kind: core::ClientKind::Agent,
-        name: session
-            .name
-            .clone()
-            .unwrap_or_else(|| session.id.chars().take(8).collect()),
+        name: peer_name(session.name.as_deref(), &session.id),
         session_id: Some(session.id.clone()),
         task: None,
+    };
+    // A child gets no factory, so subagents can't spawn their own.
+    let factory = match role {
+        Some(role) => {
+            backend = backend.into_subagent(role);
+            None
+        }
+        None => {
+            let self_id = session.id.clone();
+            let who = peer_identity.clone();
+            let factory: core::PeerFactory = Box::new(move |request, self_broker| {
+                Box::pin(local_peer::spawn_child(
+                    request,
+                    self_id.clone(),
+                    self_broker,
+                    who.clone(),
+                ))
+            });
+            Some(factory)
+        }
     };
     let (peer_reg_tx, peer_reg_rx) =
         tokio::sync::mpsc::unbounded_channel::<core::PeerRegistration>();
@@ -182,7 +188,7 @@ pub async fn host(cli: Cli) -> Result<()> {
         initial_messages,
         seed,
         core::PeerWiring {
-            factory: Some(factory),
+            factory,
             initial_peers: Default::default(),
             register_rx: Some(peer_reg_rx),
             dialer: Some(dialer),
@@ -261,6 +267,17 @@ async fn request_connect(broker: &core::BrokerHandle, who: ClientIdentity, targe
     }
 }
 
+// How a session names itself on its peer edges.
+fn peer_name(name: Option<&str>, id: &str) -> String {
+    name.map(String::from)
+        .unwrap_or_else(|| id.chars().take(8).collect())
+}
+
+// A session whose row records a parent is a child, however it was started.
+fn subagent_role(has_parent: bool) -> Option<String> {
+    has_parent.then(|| coding::prompt::SUBAGENT_ROLE.to_string())
+}
+
 // What /connect-peer, --connect and --attach accept. A pairing code is self-contained,
 // so the relay path works with no local relay configured; anything else is a local
 // session id (any project) or name (this cwd).
@@ -273,11 +290,7 @@ fn parse_target(reference: &str) -> Result<Target> {
     if transport::Pairing::is_code(reference) {
         return Ok(Target::Relay(transport::Pairing::decode(reference)?));
     }
-    local_target(coding::find_session(reference)?, reference).map(Target::Local)
-}
-
-fn local_target(found: Option<SessionRow>, reference: &str) -> Result<SessionRow> {
-    found.with_context(|| format!("no session matches {reference:?}"))
+    coding::find_session(reference).map(Target::Local)
 }
 
 async fn dial_peer(
@@ -287,16 +300,19 @@ async fn dial_peer(
     registrar: tokio::sync::mpsc::UnboundedSender<core::PeerRegistration>,
     who: ClientIdentity,
 ) -> Result<()> {
-    match parse_target(&target)? {
+    let reg = match parse_target(&target)? {
         Target::Local(row) => {
-            local_peer::connect_local(&target, row, &self_id, self_broker, registrar, who).await
+            local_peer::connect_local(&target, row, &self_id, self_broker, who).await?
         }
         Target::Relay(pairing) => {
             transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher)
-                .dial_peer(self_broker, registrar, who)
-                .await
+                .dial_peer(self_broker, who)
+                .await?
         }
-    }
+    };
+    registrar
+        .send(reg)
+        .map_err(|_| anyhow::anyhow!("the dialer's loop is gone"))
 }
 
 #[cfg(test)]
@@ -304,9 +320,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unknown_local_reference_is_rejected() {
-        let err = local_target(None, "ghost").unwrap_err();
-        assert!(err.to_string().contains("no session matches"), "{err}");
+    fn only_a_session_with_a_parent_gets_the_subagent_role() {
+        assert!(
+            subagent_role(false).is_none(),
+            "a normal session is unchanged"
+        );
+        let role = subagent_role(true).unwrap();
+        assert!(
+            role.contains("marked 'your parent' in your peer roster"),
+            "{role}"
+        );
+        assert!(
+            !role.contains("{{"),
+            "no parent name or id is baked in: {role}"
+        );
     }
 
     #[tokio::test]

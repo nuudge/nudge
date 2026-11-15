@@ -3,7 +3,9 @@ use anyhow::Result;
 use super::events::{AgentEvent, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerDialer, PeerFactory, PeerSet, Registered, SessionLister};
+use crate::core::peer::{
+    PeerDialer, PeerFactory, PeerRegistration, PeerSet, Registered, SessionLister,
+};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_FETCH_TOOL,
@@ -100,27 +102,7 @@ async fn run_loop<P: Provider, B: Backend>(
                     },
                     reg = recv_registration(&mut peer_register_rx) => {
                         match reg {
-                            Some(reg) => {
-                                // Resolves the "connecting…" line on both sides.
-                                let name = reg.who.name.clone();
-                                let text = match peers.register(reg) {
-                                    Registered::Added(_) => format!("connected to peer {name}"),
-                                    Registered::Replaced(id) => format!(
-                                        "replaced the unsupervised edge to {} with a {} one",
-                                        peers.display_name(id),
-                                        peers.role(id)
-                                    ),
-                                    Registered::Rejected(id) => format!(
-                                        "already connected to {} ({})",
-                                        peers.display_name(id),
-                                        peers.role(id)
-                                    ),
-                                };
-                                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
-                                let _ = agent_tx
-                                    .send(capabilities_event(&cfg, &backend, &peers))
-                                    .await;
-                            }
+                            Some(reg) => take_registration(reg, &mut peers, &agent_tx, &cfg, &backend).await,
                             None => peer_register_rx = None,
                         }
                         continue;
@@ -214,6 +196,24 @@ async fn run_loop<P: Provider, B: Backend>(
         let mut container: Option<String> = None;
         let mut resuming_pause = false;
         for iteration in 0..cfg.max_iterations {
+            // A child's return edge is queued alongside its task, and select! may take
+            // the task first; an edge must be usable from the next request, not next turn.
+            while let Some(reg) = peer_register_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+                take_registration(reg, &mut peers, &agent_tx, &cfg, &backend).await;
+            }
+            let gone = peers.reap_closed();
+            for name in &gone {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: format!("[peer {name}] disconnected"),
+                    })
+                    .await;
+            }
+            if !gone.is_empty() {
+                let _ = agent_tx
+                    .send(capabilities_event(&cfg, &backend, &peers))
+                    .await;
+            }
             let (mut tools, tool_cache_boundary) = backend.tool_schemas();
             tools.extend(peer_tools::schemas(&peers, &peer_factory, auto));
             let mut system = backend.system_blocks();
@@ -491,7 +491,7 @@ async fn run_loop<P: Provider, B: Backend>(
                 // Notices never reach a spawner's model, so wake it with a message or
                 // the child stalls until a human notices.
                 if let Some(spawner) = peers.spawner_id() {
-                    peers
+                    let _ = peers
                         .drive(
                             spawner,
                             UiEvent::UserMessage {
@@ -526,6 +526,32 @@ fn same_sender(a: &Option<ClientIdentity>, b: &Option<ClientIdentity>) -> bool {
         (None, None) => true,
         _ => false,
     }
+}
+
+// Resolves the "connecting…" line on both sides.
+async fn take_registration<B: Backend>(
+    reg: PeerRegistration,
+    peers: &mut PeerSet,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    cfg: &AgentConfig,
+    backend: &B,
+) {
+    let name = reg.who.name.clone();
+    let text = match peers.register(reg) {
+        Registered::Added(_) => format!("connected to peer {name}"),
+        Registered::Replaced(id) => format!(
+            "replaced the unsupervised edge to {} with a {} one",
+            peers.display_name(id),
+            peers.role(id)
+        ),
+        Registered::Rejected(id) => format!(
+            "already connected to {} ({})",
+            peers.display_name(id),
+            peers.role(id)
+        ),
+    };
+    let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+    let _ = agent_tx.send(capabilities_event(cfg, backend, peers)).await;
 }
 
 fn capabilities_event<B: Backend>(cfg: &AgentConfig, backend: &B, peers: &PeerSet) -> AgentEvent {

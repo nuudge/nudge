@@ -163,7 +163,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
 
     // The peer paused on denial, so a redirect message sent right after becomes its
     // next instruction.
-    peers
+    let _ = peers
         .drive(
             checkin.pid,
             UiEvent::PermissionResponse {
@@ -173,7 +173,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         )
         .await;
     if !allow && let Some(m) = message.filter(|m| !m.is_empty()) {
-        peers
+        let _ = peers
             .drive(checkin.pid, UiEvent::UserMessage { text: m })
             .await;
     }
@@ -298,7 +298,7 @@ async fn settle_unjudged(
                 ),
             })
             .await;
-        peers
+        let _ = peers
             .drive(
                 checkin.pid,
                 UiEvent::PermissionResponse {
@@ -307,7 +307,7 @@ async fn settle_unjudged(
                 },
             )
             .await;
-        peers
+        let _ = peers
             .drive(
                 checkin.pid,
                 UiEvent::UserMessage {
@@ -326,7 +326,7 @@ async fn settle_unjudged(
         })
         .await;
     let allow = ask_human(agent_tx, checkin, name).await;
-    peers
+    let _ = peers
         .drive(
             checkin.pid,
             UiEvent::PermissionResponse {

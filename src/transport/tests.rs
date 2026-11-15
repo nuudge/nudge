@@ -174,19 +174,13 @@ async fn dial_socket_peer(
     path: &std::path::Path,
     reg_b_rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>,
 ) -> (PeerRegistration, PeerRegistration) {
-    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
-    timeout(
+    let peer_b = timeout(
         Duration::from_secs(5),
-        SocketClient::new(path.to_path_buf()).dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
+        SocketClient::new(path.to_path_buf()).dial_peer(a.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
     .expect("dial_peer failed");
-
-    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
-        .await
-        .expect("A registrar timeout")
-        .expect("A received peer B");
     let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
         .await
         .expect("B registrar timeout")
@@ -315,6 +309,52 @@ async fn dropping_either_half_of_a_socket_peer_edge_closes_the_other() {
     let (dialer_half, acceptor_half) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
     drop(acceptor_half);
     expect_closed(dialer_half.controller).await;
+
+    serve.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+// Both ends of one socket write megabytes at once, far past the kernel buffers; a
+// pump that stops reading while its write is pending stalls the edge for good.
+#[tokio::test]
+async fn a_socket_peer_edge_flooded_both_ways_still_delivers() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+    let (peer_b, peer_a) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
+
+    let bulk = "x".repeat(4096);
+    for tx in [bb_a.agent_tx.clone(), bb_b.agent_tx.clone()] {
+        let bulk = bulk.clone();
+        tokio::spawn(async move {
+            for _ in 0..2000 {
+                tx.send(AgentEvent::AssistantText { text: bulk.clone() })
+                    .await
+                    .unwrap();
+            }
+            tx.send(AgentEvent::AssistantText {
+                text: "marker".into(),
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    for mut ctrl in [peer_b.controller, peer_a.controller] {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                match ctrl.events.recv().await {
+                    Some(ControllerEvent::AssistantText { text }) if text == "marker" => break,
+                    Some(_) => {}
+                    None => panic!("the edge closed before the marker"),
+                }
+            }
+        })
+        .await
+        .expect("the marker never crossed the flooded edge");
+    }
 
     serve.abort();
     bb_a.task.abort();
@@ -804,7 +844,6 @@ async fn dial_relay_peer(
     let port = spawn_test_relay().await;
     let url = format!("ws://127.0.0.1:{port}/peerroom");
     let cipher = Cipher::generate();
-    let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let (reg_b_tx, mut reg_b_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
 
     let daemon = tokio::spawn(run_relay_daemon(
@@ -821,18 +860,13 @@ async fn dial_relay_peer(
     ));
 
     let client = RelayClient::new(url, cipher);
-    timeout(
+    let peer_b = timeout(
         Duration::from_secs(5),
-        client.dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
+        client.dial_peer(a.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
     .expect("dial_peer failed");
-
-    let peer_b = timeout(Duration::from_secs(5), reg_a_rx.recv())
-        .await
-        .expect("A registrar timeout")
-        .expect("A received peer B");
     let peer_a = timeout(Duration::from_secs(5), reg_b_rx.recv())
         .await
         .expect("B registrar timeout")
@@ -895,7 +929,8 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
                 text: "a-drives".into(),
             },
         )
-        .await;
+        .await
+        .unwrap();
     match timeout(Duration::from_secs(5), bb_b.loop_ui_rx.recv())
         .await
         .expect("B loop timeout")
@@ -931,7 +966,8 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
                 text: "b-drives".into(),
             },
         )
-        .await;
+        .await
+        .unwrap();
     match timeout(Duration::from_secs(5), bb_a.loop_ui_rx.recv())
         .await
         .expect("A loop timeout")
@@ -986,22 +1022,17 @@ async fn dial_peer_without_return_edge_fails_closed() {
         bb.handle.clone(),
     ));
 
-    let (reg_tx, mut reg_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let bb_dialer = spawn_bare_broker(Vec::new());
     let client = RelayClient::new(url, cipher);
     let result = timeout(
         Duration::from_secs(20),
-        client.dial_peer(bb_dialer.handle.clone(), reg_tx, agent_id("peer-a")),
+        client.dial_peer(bb_dialer.handle.clone(), agent_id("peer-a")),
     )
     .await
     .expect("dial_peer must fail closed, not hang");
     assert!(
         result.is_err(),
-        "dialing a leg without a return edge must fail, got {result:?}"
-    );
-    assert!(
-        reg_rx.try_recv().is_err(),
-        "no forward peer may be registered on a failed dial"
+        "dialing a leg without a return edge must yield no edge"
     );
 
     daemon.abort();
@@ -1013,7 +1044,7 @@ async fn dial_peer_without_return_edge_fails_closed() {
 // that the next buffered event carries.
 #[tokio::test]
 async fn a_session_picker_reply_reuses_the_previous_seq() {
-    use super::wire::{read_frame, write_frame};
+    use super::wire::{FrameReader, LineReader, write_frame};
     use tokio::io::BufReader;
 
     let mut bb = spawn_bare_broker(vec![ControllerEvent::AssistantText {
@@ -1022,9 +1053,9 @@ async fn a_session_picker_reply_reuses_the_previous_seq() {
     let (path, serve, _reg_rx) = spawn_socket_host(bb.handle.clone(), agent_id("host"));
     let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = LineReader::new(BufReader::new(read_half));
     let mut next = async || -> ServerFrame {
-        timeout(Duration::from_secs(5), read_frame(&mut reader))
+        timeout(Duration::from_secs(5), reader.recv())
             .await
             .expect("frame timeout")
             .unwrap()

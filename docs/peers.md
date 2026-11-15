@@ -19,8 +19,9 @@ This page is about **peers**. For the design behind both, see
 
 ## Same machine: connect by session id or name
 
-A session running on this machine needs no code and no relay. Pass its id (from any
-project) or its name (within this directory):
+A session running on this machine needs no code and no relay. Pass its id or its short
+id (the first 8 characters, as `/peers` and `--list` show it) from any project, or its
+name within this directory:
 
 ```
 /connect-peer backend-api
@@ -30,6 +31,13 @@ Or type `/connect-peer` alone to pick from this directory's other sessions: each
 shows whether it's live or ended, its turns and last activity, and whether it's already
 a peer. `↑`/`↓` to move, `Enter` to connect, `Esc` to cancel.
 
+Every session reference resolves the same way, in `/connect-peer`, `--connect`,
+`--attach`, `--resume`, `Spawn`'s `revive`, `InspectSession`, and the peer names an
+agent passes to `MessagePeer` and `DismissPeer`. A full id always wins. A short id that
+matches two sessions, or that is also another session's name, is refused with the
+candidates listed: pass the full id. When several sessions share a name, the running one
+is picked for `/connect-peer`, `--connect` and `--attach`, otherwise the most recent.
+
 It connects over the target's local socket, `~/.nudge/run/<session-id>.sock`, which only
 your OS user can open. If the target's human is attached, the edge is an ordinary
 unsupervised peer. A target with no one attached to answer its prompts is
@@ -38,8 +46,8 @@ and the target reports to it when it stalls.
 
 If the target has ended, nudge resumes it in the background, in its own directory with
 its own `.mcp.json` and skills, and your session becomes its supervisor. It keeps running
-only while it has a supervisor: when your session disconnects, it stops and is marked
-ended again. Its output goes to `~/.nudge/run/<session-id>.log` (logs older than 7 days
+only while someone answers its prompts: once your session disconnects and nobody returns
+within 60 seconds, it stops and is marked ended again. Its output goes to `~/.nudge/run/<session-id>.log` (logs older than 7 days
 are deleted), and if it fails to start you get the end of that log in the error.
 
 The rest of this page covers peers on other machines, which connect over the relay.

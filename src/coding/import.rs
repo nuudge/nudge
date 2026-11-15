@@ -362,9 +362,7 @@ mod tests {
         assert_eq!(row.last_activity, "2026-03-03T00:00:00+00:00");
         assert!(store.load_transcript("bbbb").unwrap().is_empty());
         assert_eq!(
-            store
-                .resolve_reference("/proj/alpha", "early-name")
-                .unwrap(),
+            store.sessions_named("/proj/alpha", "early-name").unwrap()[0].id,
             "bbbb"
         );
 
