@@ -143,6 +143,10 @@ sealed class ControllerEvent {
 
     @Serializable
     data class Error(val message: String) : ControllerEvent()
+
+    // Decode-only: a variant from a newer daemon. Throwing instead would fail the
+    // WebSocket and drop the connection.
+    object Unknown : ControllerEvent()
 }
 
 object ControllerEventSerializer : KSerializer<ControllerEvent> {
@@ -166,6 +170,7 @@ object ControllerEventSerializer : KSerializer<ControllerEvent> {
             is ControllerEvent.Notice -> emitTagged(j, "Notice", ControllerEvent.Notice.serializer(), value)
             is ControllerEvent.Warn -> emitTagged(j, "Warn", ControllerEvent.Warn.serializer(), value)
             is ControllerEvent.Error -> emitTagged(j, "Error", ControllerEvent.Error.serializer(), value)
+            ControllerEvent.Unknown -> error("an unknown ControllerEvent can't be encoded")
         }
     }
 
@@ -189,7 +194,7 @@ object ControllerEventSerializer : KSerializer<ControllerEvent> {
             "Notice" -> dec(ControllerEvent.Notice.serializer())
             "Warn" -> dec(ControllerEvent.Warn.serializer())
             "Error" -> dec(ControllerEvent.Error.serializer())
-            else -> error("unknown ControllerEvent variant: $tag")
+            else -> ControllerEvent.Unknown
         }
     }
 }

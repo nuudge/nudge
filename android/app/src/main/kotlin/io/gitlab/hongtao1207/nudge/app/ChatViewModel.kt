@@ -281,6 +281,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 is ControllerEvent.Capabilities -> _state.update { it.copy(capabilities = event) }
                 is ControllerEvent.Usage -> Unit
+                ControllerEvent.Unknown -> Unit
             }
         }
 

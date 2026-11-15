@@ -116,6 +116,15 @@ class FramesTest {
     }
 
     @Test
+    fun unknownControllerEventVariantsDecodeToUnknown() {
+        for (json in listOf("\"FutureUnit\"", """{"FutureVariant":{"items":[1,2]}}""")) {
+            assertEquals(ControllerEvent.Unknown, WireJson.decodeFromString(ControllerEvent.serializer(), json))
+        }
+        val frame = WireJson.decodeFromString(ServerFrame.serializer(), """{"Event":{"seq":3,"event":{"FutureVariant":{}}}}""")
+        assertEquals(ServerFrame.Event(3, ControllerEvent.Unknown), frame)
+    }
+
+    @Test
     fun clientFrameRoundTrips() {
         val frames = listOf(
             ClientFrame.Attach(null, ClientIdentity.human("alice")),
