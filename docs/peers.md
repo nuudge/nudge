@@ -72,7 +72,9 @@ NUDGE_RELAY=wss://your-relay nudge --daemon --peer
 ```
 
 prints a code labeled `agent-peer` (alongside the full-access one). Add `--watch` for a
-watch-only code too.
+watch-only code too. With no one attached to answer its prompts, the daemon is
+supervised by the first session that connects with this code, the same as a local
+target: that agent approves its gated tool calls.
 
 ## Connect
 
@@ -122,9 +124,12 @@ driving their own sessions throughout.
   digested in one turn, not several.
 - **Messages land at turn boundaries.** If your agent is mid-task when a peer message
   arrives, it queues and is handled as the next turn — expect a delay, not a loss.
-- **Permissions stay local.** A peer never approves (or even sees) your tool prompts,
-  and can't end your session. It can run session commands like `/model` — hand the code
-  to people you trust accordingly.
+- **Permissions stay local while someone can answer them.** While you're attached, a
+  peer never approves (or even sees) your tool prompts, can't end your session, and
+  can't run its session commands. A session with no one attached, like a headless
+  `--daemon --peer`, is supervised by its first dialer, which approves its prompts —
+  hand the code to people you trust accordingly. The session you dial can run commands
+  like `/model` on yours, unless you supervise it.
 - **Disconnects are reaped, not repaired.** If the peer exits or the link drops you get
   `[peer <name>] disconnected` and the roster updates. There's no auto-reconnect yet:
   re-run `/connect-peer` with the same code (it stays valid until the target daemon

@@ -152,7 +152,9 @@ offers. The target's broker picks the dialer's profile at attach: if no attached
 controller can answer permissions, the dialer becomes its `supervisor`; otherwise it is
 a plain `agent_peer`. A TUI session (its human is attached) therefore yields an
 unsupervised mutual edge, and an unattended one is supervised by its first dialer.
-`ReverseAttach` tells the dialer which it got. Relay peers are always unsupervised. A
+`ReverseAttach` tells the dialer which it got. A relay agent-scope leg grants a
+reverse-offering dialer the same way, so a headless `--daemon --peer` is supervised by
+its first relay dialer. A
 second host resuming the same session is refused because the socket is live.
 
 `/connect-peer` (which `--connect` issues at startup) routes by its argument: a `nudge:` pairing code dials
