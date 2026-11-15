@@ -80,10 +80,11 @@ peer has its own human.
    `MessagePeer` is conversation; is that enough, or do peers eventually need a richer
    exchange (transcript excerpts, file-state summaries, capability discovery across the
    edge)? Nothing designed yet.
-4. **Cross-machine supervision.** The shipped cut makes a dialed peer an unsupervised
-   conversation edge (pure model 2). Is supervised spawning *across machines* (model 1 over
-   the relay) ever wanted? It would need the pairing to carry the supervision grant — a
-   bigger trust decision than a watch-only scope.
+4. **Cross-machine supervision.** A dialed peer is an unsupervised conversation edge
+   (pure model 2) unless its target has no one to answer prompts; then the dialer
+   supervises it, over the socket or the relay. Is supervised *spawning* across machines
+   (model 1 over the relay) ever wanted? It would need the pairing to carry the supervision
+   grant — a bigger trust decision than a watch-only scope.
 5. **Peer-edge policy.** Model-2 edges carry `UserMessage` both ways between autonomous
    agents. Consecutive same-sender messages now coalesce into one turn, and the MessagePeer
    prompt teaches batching — but nothing *enforces* a budget; two agents can still ping-pong

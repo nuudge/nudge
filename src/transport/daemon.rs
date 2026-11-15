@@ -197,7 +197,11 @@ async fn relay_dial_loop(
                 if let Some((after_seq, who, reverse_offer)) = attach {
                     let broker = broker.clone();
                     // Rights come from the leg the daemon minted, never from the client.
-                    let profile = profile.clone();
+                    let grant = if reverse_offer && peer_accept.is_some() {
+                        Grant::Peer
+                    } else {
+                        Grant::Fixed(profile.clone())
+                    };
                     let peer_accept = peer_accept.clone();
                     tokio::spawn(async move {
                         bridge(
@@ -206,7 +210,7 @@ async fn relay_dial_loop(
                             &broker,
                             after_seq,
                             who,
-                            Grant::Fixed(profile),
+                            grant,
                             reverse_offer,
                             peer_accept,
                         )

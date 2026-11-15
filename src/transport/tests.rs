@@ -791,21 +791,21 @@ fn agent_id(name: &str) -> ClientIdentity {
     }
 }
 
-// B parks an agent leg, A dials it; each lands in the other's PeerSet under the
-// name the other side announced, and all four half-channels work.
-#[tokio::test]
-async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
+// B parks an agent leg and A dials it; returns (A's edge to B, B's edge to A) and the
+// daemon task. Each lands under the name the other side announced.
+async fn dial_relay_peer(
+    a: &BrokerHandle,
+    b: &BrokerHandle,
+) -> (
+    PeerRegistration,
+    PeerRegistration,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
     let port = spawn_test_relay().await;
     let url = format!("ws://127.0.0.1:{port}/peerroom");
     let cipher = Cipher::generate();
-
-    let mut bb_a = spawn_bare_broker(Vec::new());
-    let mut bb_b = spawn_bare_broker(Vec::new());
     let (reg_a_tx, mut reg_a_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
     let (reg_b_tx, mut reg_b_rx) = tokio::sync::mpsc::unbounded_channel::<PeerRegistration>();
-
-    let who_a = agent_id("peer-a");
-    let who_b = agent_id("peer-b");
 
     let daemon = tokio::spawn(run_relay_daemon(
         vec![RelayLeg {
@@ -813,17 +813,17 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
             cipher: cipher.clone(),
             profile: ClientProfile::agent(),
             peer_accept: Some(PeerAccept {
-                identity: who_b.clone(),
+                identity: agent_id("peer-b"),
                 registrar: reg_b_tx,
             }),
         }],
-        bb_b.handle.clone(),
+        b.clone(),
     ));
 
-    let client = RelayClient::new(url.clone(), cipher.clone());
+    let client = RelayClient::new(url, cipher);
     timeout(
         Duration::from_secs(5),
-        client.dial_peer(bb_a.handle.clone(), reg_a_tx, who_a.clone()),
+        client.dial_peer(a.clone(), reg_a_tx, agent_id("peer-a")),
     )
     .await
     .expect("dial_peer timed out")
@@ -845,9 +845,21 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         peer_a.who.name, "peer-a",
         "B holds A under A's announced name"
     );
+    (peer_b, peer_a, daemon)
+}
+
+// A headless relay target with no answerer is supervised by its dialer, as over the
+// socket; all four half-channels work.
+#[tokio::test]
+async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
+    let mut bb_a = spawn_bare_broker(Vec::new());
+    let mut bb_b = spawn_bare_broker(Vec::new());
+    let (peer_b, peer_a, daemon) = dial_relay_peer(&bb_a.handle, &bb_b.handle).await;
+    assert!(peer_b.supervised, "the dialer holds a supervised edge");
+    assert!(!peer_a.supervised, "the target never supervises its dialer");
     assert!(
-        !peer_b.supervised && !peer_a.supervised,
-        "both edges unsupervised"
+        peer_a.spawner,
+        "the target reports stalls up to its supervisor"
     );
 
     let mut peers_a = PeerSet::default();
@@ -930,6 +942,27 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
         }
         other => panic!("A's loop expected B's drive, got {other:?}"),
     }
+
+    daemon.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+}
+
+#[tokio::test]
+async fn relay_peer_of_a_human_attended_session_is_unsupervised() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let _human = bb_b
+        .handle
+        .attach(ClientIdentity::human("h"))
+        .await
+        .unwrap();
+    let (peer_b, peer_a, daemon) = dial_relay_peer(&bb_a.handle, &bb_b.handle).await;
+    assert!(
+        !peer_b.supervised && !peer_a.supervised,
+        "both edges unsupervised"
+    );
+    assert!(!peer_a.spawner, "a plain peer is not the target's spawner");
 
     daemon.abort();
     bb_a.task.abort();
