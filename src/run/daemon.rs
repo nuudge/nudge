@@ -71,7 +71,7 @@ pub(super) async fn run(
     };
     let unattended = async {
         match answerers {
-            Some(a) => wait_for_exit(a, ANSWERER_GRACE).await,
+            Some(a) => wait_for_exit(a, ANSWERER_GRACE, ANSWERER_LINGER).await,
             None => std::future::pending().await,
         }
     };
@@ -94,15 +94,23 @@ pub(super) async fn run(
 // its handshake.
 const ANSWERER_GRACE: Duration = Duration::from_secs(30);
 
+// Long enough for a restarted supervisor to reclaim the session, in-flight turn included.
+const ANSWERER_LINGER: Duration = Duration::from_secs(60);
+
 // An answerer is any controller that can answer permissions: a human TUI or a
-// supervising agent. Resolves when none attached within `grace`, or once the last leaves.
-async fn wait_for_exit(mut answerers: watch::Receiver<usize>, grace: Duration) {
-    let attached = matches!(
-        tokio::time::timeout(grace, answerers.wait_for(|n| *n > 0)).await,
-        Ok(Ok(_))
-    );
-    if attached {
-        let _ = answerers.wait_for(|n| *n == 0).await;
+// supervising agent. Resolves when none attached within `grace`, or when none returns
+// within `linger` of the last one leaving.
+async fn wait_for_exit(mut answerers: watch::Receiver<usize>, grace: Duration, linger: Duration) {
+    let mut wait = grace;
+    loop {
+        let returned = matches!(
+            tokio::time::timeout(wait, answerers.wait_for(|n| *n > 0)).await,
+            Ok(Ok(_))
+        );
+        if !returned || answerers.wait_for(|n| *n == 0).await.is_err() {
+            return;
+        }
+        wait = linger;
     }
 }
 
@@ -157,14 +165,18 @@ mod tests {
     }
 
     const GRACE: Duration = Duration::from_millis(200);
+    const LINGER: Duration = Duration::from_millis(300);
 
     #[tokio::test]
     async fn exits_after_the_grace_period_with_no_answerer() {
         let bb = spawn_bare_broker(Vec::new());
         let answerers = bb.handle.answerers().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), wait_for_exit(answerers, GRACE))
-            .await
-            .expect("must exit once the grace period passes");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_exit(answerers, GRACE, LINGER),
+        )
+        .await
+        .expect("must exit once the grace period passes");
         bb.task.abort();
     }
 
@@ -172,7 +184,7 @@ mod tests {
     async fn exits_when_the_supervisor_leaves_not_when_a_plain_peer_does() {
         let bb = spawn_bare_broker(Vec::new());
         let answerers = bb.handle.answerers().await.unwrap();
-        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE));
+        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE, LINGER));
 
         let (supervisor, granted) = bb.handle.attach_peer(agent("s")).await.unwrap();
         assert!(granted);
@@ -194,10 +206,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exits_only_after_the_linger_once_the_last_answerer_leaves() {
+        let bb = spawn_bare_broker(Vec::new());
+        let answerers = bb.handle.answerers().await.unwrap();
+        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE, LINGER));
+
+        let (supervisor, _) = bb.handle.attach_peer(agent("s")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let left = tokio::time::Instant::now();
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("must exit once the linger passes with no answerer")
+            .unwrap();
+        assert!(left.elapsed() >= LINGER, "exited before the linger");
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_answerer_returning_within_the_linger_keeps_it_up() {
+        let bb = spawn_bare_broker(Vec::new());
+        let answerers = bb.handle.answerers().await.unwrap();
+        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE, LINGER));
+
+        let (first, _) = bb.handle.attach_peer(agent("s")).await.unwrap();
+        drop(first);
+        tokio::time::sleep(LINGER / 2).await;
+        let (back, granted) = bb.handle.attach_peer(agent("s")).await.unwrap();
+        assert!(
+            granted,
+            "the returning supervisor is granted supervision again"
+        );
+        tokio::time::sleep(LINGER * 2).await;
+        assert!(
+            !waiting.is_finished(),
+            "a returned answerer keeps it up past the linger"
+        );
+
+        drop(back);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("must exit after the linger once it leaves again")
+            .unwrap();
+        bb.task.abort();
+    }
+
+    #[tokio::test]
     async fn an_attached_human_keeps_it_up_before_and_after_the_supervisor() {
         let bb = spawn_bare_broker(Vec::new());
         let answerers = bb.handle.answerers().await.unwrap();
-        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE));
+        let waiting = tokio::spawn(wait_for_exit(answerers, GRACE, LINGER));
 
         let human = bb
             .handle
