@@ -3,6 +3,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use crate::core::ControllerEvent;
+use crate::core::reference::{self, Candidate};
 use crate::core::session::{LoggedMessage, Resumed, Session};
 use crate::core::store::{SessionRow, SessionStore};
 use crate::llm::{
@@ -190,7 +191,7 @@ fn new_child_in(store: &SessionStore, cwd: &str, parent: &str, task: &str) -> Re
         .with_context(|| format!("no session {id} in the store"))
 }
 
-// `reference` is a child's id or name; only `parent`'s own children match.
+// Only `parent`'s own children match.
 pub fn find_child(parent: &str, reference: &str) -> Result<SessionRow> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     find_child_in(
@@ -207,13 +208,11 @@ fn find_child_in(
     parent: &str,
     reference: &str,
 ) -> Result<SessionRow> {
-    let id = store.resolve_reference(cwd, reference)?;
-    store
-        .session(&id)?
-        .filter(|row| row.spawned_by.as_deref() == Some(parent))
-        .with_context(|| {
-            format!("{reference} is not a child of this session; use /connect-peer to reach it")
-        })
+    let row = resolve_session(store, cwd, reference, |_| false)?;
+    if row.spawned_by.as_deref() != Some(parent) {
+        anyhow::bail!("{reference} is not a child of this session; use /connect-peer to reach it");
+    }
+    Ok(row)
 }
 
 pub fn parent_of(session_id: &str) -> Result<Option<SessionRow>> {
@@ -224,15 +223,12 @@ pub fn parent_of(session_id: &str) -> Result<Option<SessionRow>> {
     }
 }
 
-// `reference` is a session uuid or a name, resolved against this cwd's sessions.
 pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
-    let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
-    if let Some(row) = store.session(&id)? {
-        check_resume_dir(&row, &cwd.display().to_string())?;
-    }
-    Session::open(&id, cwd, store)
+    let row = resolve_session(&store, &cwd.display().to_string(), reference, |_| false)?;
+    check_resume_dir(&row, &cwd.display().to_string())?;
+    Session::open(&row.id, cwd, store)
 }
 
 // The tools are rooted at the cwd, so resuming elsewhere would point a session's history
@@ -248,29 +244,43 @@ fn check_resume_dir(row: &SessionRow, cwd: &str) -> Result<()> {
     Ok(())
 }
 
-// An id resolves from any project; a name only among this cwd's sessions.
-pub fn find_session(reference: &str) -> Result<Option<SessionRow>> {
+// A running one of several same-named sessions is the one the user means to reach.
+pub fn find_session(reference: &str) -> Result<SessionRow> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
-    let store = open_store()?;
-    if let Some(row) = store.session(reference)? {
-        return Ok(Some(row));
-    }
-    let named = store
-        .list_by_cwd(&cwd.display().to_string())?
-        .into_iter()
-        .map(|l| l.row)
-        .filter(|r| r.name.as_deref() == Some(reference))
-        .collect();
-    Ok(pick_named(named, |id| {
-        session_socket_path(id).is_ok_and(|socket| is_listening(&socket))
-    }))
+    resolve_session(
+        &open_store()?,
+        &cwd.display().to_string(),
+        reference,
+        |id| session_socket_path(id).is_ok_and(|socket| is_listening(&socket)),
+    )
 }
 
-// `named` is newest first. A running one is the session the user means to reach, so it
-// beats a newer one that has ended.
-fn pick_named(mut named: Vec<SessionRow>, live: impl Fn(&str) -> bool) -> Option<SessionRow> {
-    let pick = named.iter().position(|r| live(&r.id)).unwrap_or(0);
-    (!named.is_empty()).then(|| named.swap_remove(pick))
+// Every local session reference resolves here, by the rule in `core::reference`. A name
+// counts only in `cwd`; of several sessions sharing it, the first `live` one wins, else
+// the newest.
+pub(crate) fn resolve_session(
+    store: &SessionStore,
+    cwd: &str,
+    reference: &str,
+    live: impl Fn(&str) -> bool,
+) -> Result<SessionRow> {
+    let candidates = store
+        .session(reference)?
+        .into_iter()
+        .chain(store.sessions_by_short_id(reference)?)
+        .chain(store.sessions_named(cwd, reference)?)
+        .map(|row| Candidate {
+            id: Some(row.id.clone()),
+            name: row.name.clone(),
+            item: row,
+        })
+        .collect();
+    let mut found = reference::resolve(reference, candidates)?;
+    if found.is_empty() {
+        anyhow::bail!("no session matches {reference:?}");
+    }
+    let pick = found.iter().position(|r| live(&r.id)).unwrap_or(0);
+    Ok(found.swap_remove(pick))
 }
 
 pub fn session_socket_path(session_id: &str) -> Result<PathBuf> {
@@ -498,25 +508,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_name_resolves_to_its_running_session_before_a_newer_ended_one() {
-        let store = SessionStore::open_in_memory().unwrap();
-        let row = |id: &str| {
-            store.insert_session(id, "/proj", None, None).unwrap();
-            store.session(id).unwrap().unwrap()
-        };
-        let (newer, older) = (row("newer"), row("older"));
-        let pick = |live: &'static str| {
-            pick_named(vec![newer.clone(), older.clone()], |id| id == live).map(|r| r.id)
-        };
+    const SHARED_A: &str = "0e1b8a08-1111-4000-8000-000000000001";
+    const SHARED_B: &str = "0e1b8a08-2222-4000-8000-000000000002";
+    const LONE: &str = "f4b65f05-3333-4000-8000-000000000003";
 
-        assert_eq!(pick("older").as_deref(), Some("older"), "the live one wins");
-        assert_eq!(
-            pick("none").as_deref(),
-            Some("newer"),
-            "otherwise the newest"
+    fn resolved(store: &SessionStore, reference: &str) -> Result<String> {
+        resolve_session(store, "/proj", reference, |_| false).map(|r| r.id)
+    }
+
+    #[test]
+    fn a_full_or_short_id_resolves_from_any_project_and_a_name_only_here() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store
+            .insert_session(LONE, "/elsewhere", None, None)
+            .unwrap();
+        store.set_name(LONE, "faraway", None).unwrap();
+        store.insert_session("local", "/proj", None, None).unwrap();
+        store.set_name("local", "worker", None).unwrap();
+
+        assert_eq!(resolved(&store, LONE).unwrap(), LONE);
+        assert_eq!(resolved(&store, "f4b65f05").unwrap(), LONE);
+        assert_eq!(resolved(&store, "worker").unwrap(), "local");
+        for reference in ["faraway", "ghost", "f4b65f0"] {
+            let err = resolved(&store, reference).unwrap_err().to_string();
+            assert_eq!(err, format!("no session matches {reference:?}"));
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_short_id_fails_listing_the_sessions() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store.insert_session(SHARED_A, "/proj", None, None).unwrap();
+        store
+            .insert_session(SHARED_B, "/elsewhere", None, None)
+            .unwrap();
+        let err = resolved(&store, "0e1b8a08").unwrap_err().to_string();
+        assert!(
+            err.contains("matches 2 sessions") && err.contains(SHARED_A) && err.contains(SHARED_B),
+            "{err}"
         );
-        assert!(pick_named(Vec::new(), |_| true).is_none());
+        assert_eq!(resolved(&store, SHARED_B).unwrap(), SHARED_B);
+
+        store
+            .insert_session(LONE, "/elsewhere", None, None)
+            .unwrap();
+        store.insert_session("named", "/proj", None, None).unwrap();
+        store.set_name("named", "f4b65f05", None).unwrap();
+        let err = resolved(&store, "f4b65f05").unwrap_err().to_string();
+        assert!(err.contains("matches 2 sessions"), "{err}");
+    }
+
+    #[test]
+    fn of_same_named_sessions_a_running_one_wins_else_the_newest() {
+        let mut store = SessionStore::open_in_memory().unwrap();
+        for id in ["older", "newer"] {
+            store.insert_session(id, "/proj", None, None).unwrap();
+            store.set_name(id, "dup", None).unwrap();
+        }
+        store.append_message("newer", "user", "{}", None).unwrap();
+        let pick = |live: &'static str| {
+            resolve_session(&store, "/proj", "dup", |id| id == live)
+                .unwrap()
+                .id
+        };
+        assert_eq!(pick("older"), "older", "the live one wins");
+        assert_eq!(pick("none"), "newer", "otherwise the newest");
     }
 
     #[test]
@@ -531,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn only_this_sessions_own_children_are_found_by_id_or_name() {
+    fn only_this_sessions_own_children_are_found_by_id_short_id_or_name() {
         let store = SessionStore::open_in_memory().unwrap();
         for id in ["parent", "other"] {
             store.insert_session(id, "/proj", None, None).unwrap();
@@ -539,25 +595,24 @@ mod tests {
         let mine = new_child_in(&store, "/proj", "parent", "a").unwrap();
         let theirs = new_child_in(&store, "/proj", "other", "b").unwrap();
         store.set_name(&mine.id, "worker", None).unwrap();
-        let name = "worker";
 
-        assert_eq!(
-            find_child_in(&store, "/proj", "parent", &mine.id)
-                .unwrap()
-                .id,
-            mine.id
-        );
-        assert_eq!(
-            find_child_in(&store, "/proj", "parent", name).unwrap().id,
-            mine.id
-        );
-        for reference in [theirs.id.as_str(), "other", "ghost"] {
+        for reference in [mine.id.as_str(), &mine.id[..8], "worker"] {
+            assert_eq!(
+                find_child_in(&store, "/proj", "parent", reference)
+                    .unwrap()
+                    .id,
+                mine.id
+            );
+        }
+        for reference in [theirs.id.as_str(), &theirs.id[..8], "other"] {
             let err = find_child_in(&store, "/proj", "parent", reference).unwrap_err();
             assert!(
                 err.to_string().contains("not a child of this session"),
                 "{err}"
             );
         }
+        let err = find_child_in(&store, "/proj", "parent", "ghost").unwrap_err();
+        assert!(err.to_string().contains("no session matches"), "{err}");
     }
 
     #[test]

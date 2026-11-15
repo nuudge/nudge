@@ -4,6 +4,7 @@ pub mod host;
 pub mod identity;
 pub mod peer;
 pub mod profile;
+pub mod reference;
 pub mod session;
 pub mod store;
 

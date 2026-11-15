@@ -19,8 +19,9 @@ This page is about **peers**. For the design behind both, see
 
 ## Same machine: connect by session id or name
 
-A session running on this machine needs no code and no relay. Pass its id (from any
-project) or its name (within this directory):
+A session running on this machine needs no code and no relay. Pass its id or its short
+id (the first 8 characters, as `/peers` and `--list` show it) from any project, or its
+name within this directory:
 
 ```
 /connect-peer backend-api
@@ -29,6 +30,13 @@ project) or its name (within this directory):
 Or type `/connect-peer` alone to pick from this directory's other sessions: each row
 shows whether it's live or ended, its turns and last activity, and whether it's already
 a peer. `↑`/`↓` to move, `Enter` to connect, `Esc` to cancel.
+
+Every session reference resolves the same way, in `/connect-peer`, `--connect`,
+`--attach`, `--resume`, `Spawn`'s `revive`, `InspectSession`, and the peer names an
+agent passes to `MessagePeer` and `DismissPeer`. A full id always wins. A short id that
+matches two sessions, or that is also another session's name, is refused with the
+candidates listed: pass the full id. When several sessions share a name, the running one
+is picked for `/connect-peer`, `--connect` and `--attach`, otherwise the most recent.
 
 It connects over the target's local socket, `~/.nudge/run/<session-id>.sock`, which only
 your OS user can open. If the target's human is attached, the edge is an ordinary

@@ -59,7 +59,7 @@ A child outlives its parent's process. When the parent quits, crashes or restart
 child keeps going with no one to answer its prompts; it waits 60 seconds for a supervisor
 to return, then exits and is marked ended.
 
-The parent reclaims it with `Spawn` and `revive` set to the child's name or session id
+The parent reclaims it with `Spawn` and `revive` set to the child's name, short id or session id
 (optionally with a `task` to send once it's back). Only the parent's own children can be
 revived; for any other session, use `/connect-peer`.
 

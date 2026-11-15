@@ -3,7 +3,7 @@ mod daemon;
 mod local;
 mod local_peer;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::cli::Cli;
 use crate::coding;
@@ -290,11 +290,7 @@ fn parse_target(reference: &str) -> Result<Target> {
     if transport::Pairing::is_code(reference) {
         return Ok(Target::Relay(transport::Pairing::decode(reference)?));
     }
-    local_target(coding::find_session(reference)?, reference).map(Target::Local)
-}
-
-fn local_target(found: Option<SessionRow>, reference: &str) -> Result<SessionRow> {
-    found.with_context(|| format!("no session matches {reference:?}"))
+    coding::find_session(reference).map(Target::Local)
 }
 
 async fn dial_peer(
@@ -338,12 +334,6 @@ mod tests {
             !role.contains("{{"),
             "no parent name or id is baked in: {role}"
         );
-    }
-
-    #[test]
-    fn an_unknown_local_reference_is_rejected() {
-        let err = local_target(None, "ghost").unwrap_err();
-        assert!(err.to_string().contains("no session matches"), "{err}");
     }
 
     #[tokio::test]

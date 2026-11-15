@@ -48,16 +48,16 @@ it's costing you.
 nudge [OPTIONS]
 
 OPTIONS:
-    --resume <id>        Resume a previous session from ~/.nudge/projects/<cwd>/<id>.jsonl
-                         (the id is shown in the TUI title bar)
+    --resume <ref>       Resume a previous session by id, short id, or name (this
+                         directory); the id is shown in the TUI title bar
     --list               List this project's saved sessions (name, id, branch,
                          transcript size, last used), most-recent-first, then exit
     --thinking <mode>    Thinking display: summarized (default) or omitted
     --daemon             Run the session headless (no TUI) on its local socket and
                          over $NUDGE_RELAY, which must be set unless --local is given
     --local              (--daemon) Serve only the local socket; open no relay legs
-    --attach <target>    Attach a TUI to a running session: a session id or name on
-                         this machine, or a pairing code from a remote host's QR
+    --attach <target>    Attach a TUI to a running session: a session id, short id or
+                         name on this machine, or a pairing code from a remote host's QR
     --connect <target>   At startup, make another session a peer of this one (an id,
                          name, or pairing code, as with /connect-peer)
     --watch, --peer      (--daemon) Also mint a watch-only / agent-peer pairing code
@@ -111,7 +111,7 @@ start with `/`, e.g. a pasted path, still goes to the model):
 | `/mcp load <name>` / `/mcp unload <name>` | connect / disconnect a dormant server mid-session |
 | `/session-rename [name]` | rename the session; bare, the agent derives a name (git branch + short id in a repo, else an LLM-suggested summary) |
 | `/peers` | list connected peer agents and spawned subagents |
-| `/connect-peer <id\|name\|code>` | connect this agent to another session's agent: a local session by id or name, a remote one by pairing code — see [Peer agents](peers.md) |
+| `/connect-peer <id\|name\|code>` | connect this agent to another session's agent: a local session by id, short id or name, a remote one by pairing code — see [Peer agents](peers.md) |
 | `/auto` | toggle auto mode: work is delegated to a supervised subagent — see [Subagents](subagents.md#auto-mode) |
 | `/background` (alias `/bg`) | detach and run the agent headless; with `NUDGE_RELAY` set, also shows a pairing QR (`w` cycles full-access → watch-only → agent-peer) — reattach with `Enter` |
 

@@ -291,9 +291,7 @@ mod tests {
             s.id.clone()
         };
         assert_eq!(
-            store_at(&db)
-                .resolve_reference("/proj", "early-name")
-                .unwrap(),
+            store_at(&db).sessions_named("/proj", "early-name").unwrap()[0].id,
             id
         );
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();

@@ -137,7 +137,7 @@ pub(super) fn schemas(peers: &PeerSet, factory: &Option<PeerFactory>, auto: bool
                     },
                     "revive": {
                         "type": "string",
-                        "description": "Name or session id of a subagent you spawned \
+                        "description": "Name, short id or session id of a subagent you spawned \
                             earlier, to reclaim instead of spawning a new one."
                     }
                 }
@@ -289,7 +289,7 @@ pub(super) async fn execute(
             };
             // Reclaiming would be refused anyway: this session is already its answerer.
             if let SpawnRequest::Revive { child, task } = &request
-                && let Some(id) = peers.find_by_name_or_session(child)
+                && let Some(id) = peers.find(child)?
                 && peers.is_supervised(id)
             {
                 let name = peers.display_name(id);
@@ -326,7 +326,7 @@ pub(super) async fn execute(
             let Some(peer) = input.get("peer").and_then(Value::as_str) else {
                 bail!("DismissPeer requires a 'peer' string");
             };
-            let Some(id) = peers.find_by_name(peer) else {
+            let Some(id) = peers.find(peer)? else {
                 bail!(
                     "no peer named '{peer}'; current peers: {}",
                     peers.roster().join(", ")
@@ -347,7 +347,7 @@ pub(super) async fn execute(
             let Some(message) = input.get("message").and_then(Value::as_str) else {
                 bail!("MessagePeer requires a 'message' string");
             };
-            let Some(id) = peers.find_by_name(peer) else {
+            let Some(id) = peers.find(peer)? else {
                 let roster = peers.roster();
                 if roster.is_empty() {
                     bail!("no peer named '{peer}': you currently hold no peers");

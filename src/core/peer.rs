@@ -5,6 +5,7 @@ use super::events::{ControllerEvent, UiEvent};
 use super::host::{BrokerHandle, Controller};
 use super::identity::ClientIdentity;
 use super::profile::ClientProfile;
+use super::reference::{self, Candidate};
 
 // Peers this agent is a client of. Each is an ordinary `Controller`, so local and
 // remote peers are indistinguishable here; the composition root supplies them.
@@ -255,20 +256,20 @@ impl PeerSet {
         self.peers.is_empty()
     }
 
-    pub fn find_by_name(&self, name: &str) -> Option<PeerId> {
-        self.peers
-            .iter()
-            .find(|(_, p)| p.who.name == name)
-            .map(|(id, _)| *id)
-    }
-
-    pub fn find_by_name_or_session(&self, reference: &str) -> Option<PeerId> {
-        self.peers
-            .iter()
-            .find(|(_, p)| {
-                p.who.name == reference || p.who.session_id.as_deref() == Some(reference)
+    // The rule in `core::reference`, over each edge's session id and announced name. Of
+    // several edges sharing a name, the newest wins.
+    pub fn find(&self, reference: &str) -> anyhow::Result<Option<PeerId>> {
+        let mut ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        ids.sort();
+        let candidates = ids
+            .into_iter()
+            .map(|id| Candidate {
+                id: self.peers[&id].who.session_id.clone(),
+                name: Some(self.peers[&id].who.name.clone()),
+                item: id,
             })
-            .map(|(id, _)| *id)
+            .collect();
+        Ok(reference::resolve(reference, candidates)?.into_iter().max())
     }
 
     // Sorted so the wording is deterministic.
@@ -478,5 +479,52 @@ mod tests {
         assert_eq!(peers.register(a), Registered::Added(0));
         assert_eq!(peers.register(b), Registered::Added(1));
         assert_eq!(peers.infos().len(), 2);
+    }
+
+    #[test]
+    fn a_peer_is_found_by_session_id_short_id_or_announced_name() {
+        let mut peers = PeerSet::default();
+        let add = |peers: &mut PeerSet, session_id: Option<&str>, name: &str| {
+            let (ctrl, _ev, _ui) = fake_peer();
+            let who = ClientIdentity {
+                session_id: session_id.map(String::from),
+                ..ClientIdentity::human(name)
+            };
+            let Registered::Added(id) = peers.register(PeerRegistration::new(ctrl, who)) else {
+                unreachable!()
+            };
+            id
+        };
+        let child = add(
+            &mut peers,
+            Some("f4b65f05-3333-4000-8000-000000000003"),
+            "f4b65f05",
+        );
+        let remote = add(&mut peers, None, "worker");
+        let newer_remote = add(&mut peers, None, "worker");
+
+        let find = |r: &str| peers.find(r).unwrap();
+        assert_eq!(find("f4b65f05-3333-4000-8000-000000000003"), Some(child));
+        assert_eq!(find("f4b65f05"), Some(child));
+        assert_eq!(
+            find("worker"),
+            Some(newer_remote),
+            "the newest same-named edge"
+        );
+        assert_ne!(find("worker"), Some(remote));
+        assert_eq!(find("ghost"), None);
+
+        add(
+            &mut peers,
+            Some("0e1b8a08-1111-4000-8000-000000000001"),
+            "a",
+        );
+        add(
+            &mut peers,
+            Some("0e1b8a08-2222-4000-8000-000000000002"),
+            "b",
+        );
+        let err = peers.find("0e1b8a08").unwrap_err().to_string();
+        assert!(err.contains("matches 2 sessions"), "{err}");
     }
 }

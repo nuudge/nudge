@@ -69,7 +69,7 @@ by session id or name:
 
 ```bash
 nudge --daemon --local         # headless, with no relay legs
-nudge --attach backend-api     # attach a TUI by name (this directory) or id
+nudge --attach backend-api     # attach a TUI by name (this directory), id or short id
 ```
 
 `--attach` doesn't start an ended session; resume it with `nudge --resume <name>`. Without
