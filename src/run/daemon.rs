@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use std::time::Duration;
+use tokio::sync::watch;
 
 use crate::core::SessionHost;
 use crate::transport::{self, PairingScope};
 
-// The caller serves `socket`; with `socket_only` (`--socket`) there are no relay legs.
+// The caller serves `socket`; with `socket_only` (`--local`, `--socket`) there are no
+// relay legs.
 pub(super) async fn run(
     host: SessionHost,
     socket: &Path,
@@ -12,10 +15,23 @@ pub(super) async fn run(
     relay: Option<String>,
     watch: bool,
     peer_accept: Option<transport::PeerAccept>,
+    needs_supervisor: bool,
 ) -> Result<()> {
     let broker = host.broker_handle();
+    let supervisors = if needs_supervisor {
+        eprintln!("[daemon] waiting for a supervisor");
+        Some(
+            broker
+                .supervisors()
+                .await
+                .context("the session broker is gone")?,
+        )
+    } else {
+        None
+    };
     eprintln!("[daemon] listening on {}", socket.display());
-    // A controller leaving never ends the daemon; only a process signal does.
+    // Only a process signal or, with `needs_supervisor`, losing supervision ends the
+    // daemon; an ordinary controller leaving never does.
     let run = async move {
         if socket_only {
             broker.closed().await;
@@ -24,9 +40,8 @@ pub(super) async fn run(
         } else {
             // Dial OUT to the relay: the only direction that crosses NAT. Each scope
             // (full, watch, agent) gets its own room + key.
-            let base = relay.context(
-                "set NUDGE_RELAY to host over a relay, or pass --socket <path> for a local debug daemon",
-            )?;
+            let base =
+                relay.context("--daemon serves the relay too: set NUDGE_RELAY, or pass --local")?;
             let full = transport::Pairing::generate(base.clone());
             print_pairing(&full, "full-access")?;
             let mut legs = vec![transport::RelayLeg {
@@ -59,8 +74,18 @@ pub(super) async fn run(
             transport::run_relay_daemon(legs, broker).await
         }
     };
+    let supervised_out = async {
+        match supervisors {
+            Some(s) => wait_for_exit(s, SUPERVISOR_GRACE).await,
+            None => std::future::pending().await,
+        }
+    };
     let daemon_result = tokio::select! {
         r = run => r,
+        _ = supervised_out => {
+            eprintln!("[daemon] no supervisor left; stopping");
+            Ok(())
+        }
         _ = shutdown_signal() => {
             eprintln!("[daemon] shutdown signal received; stopping");
             Ok(())
@@ -68,6 +93,21 @@ pub(super) async fn run(
     };
     let _ = host.shutdown().await;
     daemon_result
+}
+
+// Long enough for the dialer that started this host (`--needs-supervisor`) to finish
+// its handshake.
+const SUPERVISOR_GRACE: Duration = Duration::from_secs(30);
+
+// Resolves when no supervisor attached within `grace`, or once the last one detaches.
+async fn wait_for_exit(mut supervisors: watch::Receiver<usize>, grace: Duration) {
+    let attached = matches!(
+        tokio::time::timeout(grace, supervisors.wait_for(|n| *n > 0)).await,
+        Ok(Ok(_))
+    );
+    if attached {
+        let _ = supervisors.wait_for(|n| *n == 0).await;
+    }
 }
 
 async fn shutdown_signal() {
@@ -103,4 +143,57 @@ fn print_pairing(pairing: &transport::Pairing, label: &str) -> Result<()> {
         pairing.encode()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::host::spawn_bare_broker;
+    use crate::core::{ClientIdentity, ClientKind};
+
+    fn agent(name: &str) -> ClientIdentity {
+        ClientIdentity {
+            kind: ClientKind::Agent,
+            name: name.into(),
+            session_id: None,
+            task: None,
+        }
+    }
+
+    const GRACE: Duration = Duration::from_millis(200);
+
+    #[tokio::test]
+    async fn exits_after_the_grace_period_with_no_supervisor() {
+        let bb = spawn_bare_broker(Vec::new());
+        let supervisors = bb.handle.supervisors().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wait_for_exit(supervisors, GRACE))
+            .await
+            .expect("must exit once the grace period passes");
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn exits_when_the_supervisor_leaves_not_when_a_plain_peer_does() {
+        let bb = spawn_bare_broker(Vec::new());
+        let supervisors = bb.handle.supervisors().await.unwrap();
+        let waiting = tokio::spawn(wait_for_exit(supervisors, GRACE));
+
+        let (supervisor, granted) = bb.handle.attach_peer(agent("s")).await.unwrap();
+        assert!(granted);
+        let (peer, granted) = bb.handle.attach_peer(agent("p")).await.unwrap();
+        assert!(!granted);
+        drop(peer);
+        tokio::time::sleep(GRACE * 2).await;
+        assert!(
+            !waiting.is_finished(),
+            "a held supervisor outlives the grace period and a plain peer's exit"
+        );
+
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("must exit when the last supervisor leaves")
+            .unwrap();
+        bb.task.abort();
+    }
 }

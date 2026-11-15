@@ -299,14 +299,18 @@ async fn bridge<R, W>(
         }
         let (ev_tx, ev_rx) = mpsc::unbounded_channel::<ControllerEvent>();
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(64);
-        // The target never supervises its dialer; named by what the dialer announced.
-        let _ = pa.registrar.send(PeerRegistration::new(
-            Controller {
-                events: ev_rx,
-                ui_tx,
-            },
-            who,
-        ));
+        // The target never supervises its dialer; named by what the dialer announced. A
+        // supervising dialer is treated like a spawner, so stalls are reported up to it.
+        let _ = pa.registrar.send(PeerRegistration {
+            spawner: supervised,
+            ..PeerRegistration::new(
+                Controller {
+                    events: ev_rx,
+                    ui_tx,
+                },
+                who,
+            )
+        });
         rev_ev_tx = Some(ev_tx);
         rev_ui_rx = Some(ui_rx);
     }

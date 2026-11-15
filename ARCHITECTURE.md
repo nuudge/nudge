@@ -157,7 +157,16 @@ second host resuming the same session is refused because the socket is live.
 
 `/connect-peer` routes by its argument: a `nudge:` pairing code dials the relay, and
 anything else is resolved as a session id or name (`run::local_peer`) and dialed over
-that session's socket.
+that session's socket. If nothing listens there, the dialer takes an exclusive lock on
+`~/.nudge/run/<id>.lock`, re-probes, and if the socket is still dead starts a headless
+host for the session in its stored cwd (`--daemon --local --needs-supervisor --resume
+<id>`, logging to `<id>.log`). It holds the lock until its own handshake completes, so
+the dialer that started the host becomes its supervisor and a racing dialer gets a plain
+peer edge. The hidden `--needs-supervisor` makes the daemon exit, marking the session
+ended, when the broker's supervisor count drops to zero or no supervisor attaches within
+a grace period. A target that grants
+`supervised` registers its edge back to the dialer as its spawner, so it reports stalls
+up that edge.
 
 ## Run modes (selected in `main.rs`)
 
@@ -165,6 +174,7 @@ that session's socket.
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `nudge`                                      | In-process `SessionHost` + local TUI. `/background` dials `$NUDGE_RELAY` and arms three scoped pairing legs — full-access, watch-only, agent-peer (`w` cycles the QR). |
 | `nudge --daemon`                             | Headless host that dials **out** to `$NUDGE_RELAY`; mints a room + key and prints a QR. `--watch` / `--peer` mint and park the watch-only / agent-peer scopes too.    |
+| `nudge --daemon --local`                     | Headless host on its session socket only, with no relay legs even if `$NUDGE_RELAY` is set.       |
 | `nudge --connect --pair-code <code>`         | Front-end only (`RelayClient`) over the relay; the code carries relay + room + key.               |
 | `nudge --daemon --socket <path>`             | Headless host on a local Unix socket at `<path>` instead of the session socket, with no relay legs. |
 | `nudge --connect --socket <path>`            | Front-end only (`SocketClient`) over a local Unix socket (debug).                                 |

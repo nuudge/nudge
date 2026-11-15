@@ -29,8 +29,14 @@ project) or its name (within this directory):
 It connects over the target's local socket, `~/.nudge/run/<session-id>.sock`, which only
 your OS user can open. If the target's human is attached, the edge is an ordinary
 unsupervised peer. A target with no one attached to answer its prompts is
-**supervised** by its first dialer instead: your agent answers its permission prompts.
-The target has to be running; otherwise you get `session <name> isn't running`.
+**supervised** by its first dialer instead: your agent answers its permission prompts,
+and the target reports to it when it stalls.
+
+If the target has ended, nudge resumes it in the background, in its own directory with
+its own `.mcp.json` and skills, and your session becomes its supervisor. It keeps running
+only while it has a supervisor: when your session disconnects, it stops and is marked
+ended again. Its output goes to `~/.nudge/run/<session-id>.log`, and if it fails to start
+you get the end of that log in the error.
 
 The rest of this page covers peers on other machines, which connect over the relay.
 
@@ -130,6 +136,7 @@ driving their own sessions throughout.
 | `/connect-peer <code>` | dial an agent-peer code; one call, bidirectional edge |
 | `/peers` | list connected peers and spawned subagents |
 | `w` (background screen) | cycle the pairing QR: full-access → watch-only → agent-peer |
+| `--daemon --local` | headless session that only peers on this machine can connect to |
 | `--daemon --peer` | headless session that prints an agent-peer code |
 | `--daemon --watch` | …and/or a watch-only code |
 
