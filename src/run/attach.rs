@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+use super::Target;
 use super::local_peer::{accepts, label};
 use crate::cli::Cli;
-use crate::coding;
 use crate::core::store::SessionRow;
 use crate::core::{ClientIdentity, Controller};
 use crate::run::local_identity;
@@ -35,29 +35,29 @@ pub async fn run(target: &str, cli: &Cli) -> Result<()> {
     };
     // `connect` rather than the silent `SessionHandle::attach`: this runs before the
     // TUI owns the screen, so a connection failure can surface its cause here.
-    if transport::Pairing::is_code(target) {
-        let pairing = transport::Pairing::decode(target)?;
-        let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
-        let controller = match client.connect(None, who.clone()).await? {
-            Some(c) => c,
-            None => bail!("could not attach: the relay session has ended"),
-        };
-        tui::run(&client, ui_cfg, who, controller, None).await
-    } else {
-        let row = coding::find_session(target)?
-            .with_context(|| format!("no session matches {target:?}"))?;
-        let socket = super::session_socket_path(&row.id)?;
-        let client = SocketClient::new(socket.clone());
-        let cwd = std::env::current_dir().context("could not determine cwd")?;
-        let controller = attach_local(
-            &client,
-            &socket,
-            &row,
-            &cwd.display().to_string(),
-            who.clone(),
-        )
-        .await?;
-        tui::run(&client, ui_cfg, who, controller, None).await
+    match super::parse_target(target)? {
+        Target::Relay(pairing) => {
+            let client = transport::RelayClient::new(pairing.client_dial_url(), pairing.cipher);
+            let controller = match client.connect(None, who.clone()).await? {
+                Some(c) => c,
+                None => bail!("could not attach: the relay session has ended"),
+            };
+            tui::run(&client, ui_cfg, who, controller, None).await
+        }
+        Target::Local(row) => {
+            let socket = super::session_socket_path(&row.id)?;
+            let client = SocketClient::new(socket.clone());
+            let cwd = std::env::current_dir().context("could not determine cwd")?;
+            let controller = attach_local(
+                &client,
+                &socket,
+                &row,
+                &cwd.display().to_string(),
+                who.clone(),
+            )
+            .await?;
+            tui::run(&client, ui_cfg, who, controller, None).await
+        }
     }
 }
 
