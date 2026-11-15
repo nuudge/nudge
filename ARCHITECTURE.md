@@ -167,10 +167,18 @@ until its own handshake completes, then unlinks the lock file before releasing i
 locker that wins an unlinked file retries on the current one. So the dialer that started
 the host becomes its supervisor and a racing dialer gets a plain
 peer edge. The hidden `--needs-answerer` makes the daemon exit, marking the session
-ended, when no attached controller can answer its permission prompts (a human TUI or a
-supervising agent), or none attaches within a grace period. A target that grants
-`supervised` registers its edge back to the dialer as its spawner, so it reports stalls
-up that edge.
+ended, when none of the controllers that can answer its permission prompts (a human TUI or
+a supervising agent) attaches within a grace period, or none returns within 60 s of the
+last one leaving. A target that grants `supervised` registers its edge back to the dialer
+as its spawner, so it reports stalls up that edge.
+
+`Spawn` uses the same path (`run::local_peer::spawn_child`). A new child gets a session
+row with `spawned_by`/`spawn_task`, named `child-<short id>`; a revive looks up one of this
+session's own children by id or name. Either way the factory runs `ensure_running_then`
+with `start_host` and the socket dial, requires the returned edge to be `supervised`
+(otherwise it drops the edge and fails as taken), sends the task, and hands the edge to
+the `Spawn` tool to register. A session whose row has `spawned_by` is hosted with no
+factory and with the subagent role note naming its parent, however it was started.
 
 ## Run modes (selected in `main.rs`)
 
@@ -226,7 +234,7 @@ swapped) on its own:
 
 | Module | Role |
 |---|---|
-| `src/main.rs`, `src/cli.rs`, `src/run/`, `src/spawn.rs` | the composition root: CLI parsing, session create/resume, run-mode wiring (in-process / daemon / connect), and the subagent factory |
+| `src/main.rs`, `src/cli.rs`, `src/run/` | the composition root: CLI parsing, session create/resume, run-mode wiring (in-process / daemon / connect), and the subagent factory |
 | `src/llm/` | provider-agnostic LLM API: a neutral message model + `Provider` trait, with `AnthropicProvider` owning all Anthropic wire shaping (cache-breakpoint placement, the floating breakpoint, the HTTP calls) |
 | `src/core/` | the generic harness: the loop (build request → call provider → dispatch tools → repeat) + a `Backend` trait, the agent↔UI event contract, the multi-client broker that decouples the loop from front-ends, the peer system (holding/steering/messaging other agents), and the session mechanism (JSONL persistence, resume with strict truncation) — knows nothing about concrete tools or prompts |
 | `src/coding/` | the coding agent: implements `Backend` — system prompt, project/env context, the tool registry + dispatch + permission classification, the MCP client, file-state tracking, and the cwd-keyed session path policy |
@@ -268,8 +276,9 @@ backend or a non-coding agent could reuse it untouched.
   `/background` plus the `--daemon`/`--attach` split fall out of it without the loop knowing
   which front-end, if any, is watching.
 - **A subagent is just another client.** There is no bespoke sub-agent runtime: spawning a
-  child means standing up a second session and mutually attaching — the parent attaches to
-  the child the same way your phone attaches to the parent, and the child attaches back.
+  child means starting a second session in its own process and mutually attaching over its
+  socket — the parent attaches to the child the same way your phone attaches to the
+  parent, and the child attaches back.
   Roles (who supervises whom, who may dismiss whom) follow from who spawned whom, not from a
   type in the code, so the same mechanism extends unchanged to peers on other machines.
   Supervision is context-frugal by design: the parent decides a child's permission check-ins
