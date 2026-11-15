@@ -6,8 +6,9 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+use crate::coding;
 use crate::core::store::SessionRow;
-use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration};
+use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration, SessionChoice};
 use crate::transport::SocketClient;
 
 // Covers the MCP bootstrap, which runs before the host binds its socket.
@@ -59,6 +60,25 @@ where
         start().await?;
     }
     dial.await
+}
+
+// Liveness is probed, not read from the stored state, which a crash leaves 'running'.
+pub(super) async fn session_choices(
+    listings: Vec<coding::SessionListing>,
+    run_dir: &Path,
+) -> Vec<SessionChoice> {
+    let mut choices = Vec::with_capacity(listings.len());
+    for l in listings {
+        choices.push(SessionChoice {
+            live: accepts(&run_dir.join(format!("{}.sock", l.id))).await,
+            id: l.id,
+            name: l.name,
+            turns: l.turns.max(0) as u64,
+            last_activity: l.last_activity.timestamp(),
+            connected: false,
+        });
+    }
+    choices
 }
 
 pub(super) async fn accepts(socket: &Path) -> bool {
@@ -164,6 +184,39 @@ mod tests {
     fn temp_socket() -> PathBuf {
         let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
         std::env::temp_dir().join(format!("lp-{token}.sock"))
+    }
+
+    #[tokio::test]
+    async fn session_choices_probe_liveness_from_the_socket_not_the_stored_state() {
+        let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let run_dir = std::env::temp_dir().join(format!("lp-{token}"));
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let _live = bind_listener(&run_dir.join("up.sock")).unwrap();
+        let listing = |id: &str, state| coding::SessionListing {
+            id: id.into(),
+            name: None,
+            branch: None,
+            state,
+            last_activity: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            turns: 3,
+        };
+
+        let choices = session_choices(
+            vec![
+                listing("up", crate::core::store::SessionState::Ended),
+                listing("down", crate::core::store::SessionState::Running),
+            ],
+            &run_dir,
+        )
+        .await;
+
+        let live: Vec<(&str, bool)> = choices.iter().map(|c| (c.id.as_str(), c.live)).collect();
+        assert_eq!(live, [("up", true), ("down", false)]);
+        assert_eq!(
+            (choices[0].turns, choices[0].last_activity),
+            (3, 1_700_000_000)
+        );
+        std::fs::remove_dir_all(&run_dir).ok();
     }
 
     #[test]

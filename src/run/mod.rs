@@ -188,6 +188,12 @@ pub async fn host(cli: Cli) -> Result<()> {
             initial_peers: Default::default(),
             register_rx: Some(peer_reg_rx),
             dialer: Some(dialer),
+            lister: Some(Box::new(|| {
+                Box::pin(async {
+                    let listings = coding::list_sessions()?;
+                    Ok(local_peer::session_choices(listings, &run_dir()?).await)
+                })
+            })),
         },
     );
 
@@ -287,6 +293,10 @@ async fn dial_peer(
 }
 
 fn session_socket_path(session_id: &str) -> Result<PathBuf> {
+    Ok(run_dir()?.join(format!("{session_id}.sock")))
+}
+
+fn run_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
     let dir = PathBuf::from(home).join(".nudge").join("run");
     std::fs::DirBuilder::new()
@@ -294,7 +304,7 @@ fn session_socket_path(session_id: &str) -> Result<PathBuf> {
         .mode(0o700)
         .create(&dir)
         .with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir.join(format!("{session_id}.sock")))
+    Ok(dir)
 }
 
 #[cfg(test)]

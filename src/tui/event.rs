@@ -130,6 +130,9 @@ impl App {
                 self.session_name = session_name;
                 self.auto = auto;
             }
+            ControllerEvent::SessionPicker { sessions } => {
+                self.session_picker = Some((sessions, 0));
+            }
             // The /model picker renders from the daemon's models, not a compiled-in list.
             ControllerEvent::Capabilities { models, .. } => {
                 self.models = models.into_iter().map(|m| (m.label, m.id)).collect();

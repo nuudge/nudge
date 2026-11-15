@@ -55,6 +55,12 @@ pub(crate) fn pre_approves_permissions(line: &str) -> bool {
     matches!(parse(line), Command::Auto)
 }
 
+// A bare `/connect-peer` gets a picker sent only to the controller that typed it, so
+// the broker records who asked.
+pub(crate) fn requests_session_picker(line: &str) -> bool {
+    matches!(parse(line), Command::ConnectPeer(target) if target.is_empty())
+}
+
 pub fn command_catalog() -> Vec<CommandInfo> {
     vec![
         CommandInfo {
@@ -75,7 +81,7 @@ pub fn command_catalog() -> Vec<CommandInfo> {
         },
         CommandInfo {
             name: "/connect-peer".into(),
-            usage: "/connect-peer <session id|name|pairing-code> — make another session a peer"
+            usage: "/connect-peer [session id|name|pairing-code] — make another session a peer (bare = pick one)"
                 .into(),
         },
         CommandInfo {
@@ -113,5 +119,12 @@ mod tests {
         assert!(!pre_approves_permissions("/peers"));
         assert!(!pre_approves_permissions("/automate"));
         assert!(command_catalog().iter().any(|c| c.name == "/auto"));
+    }
+
+    #[test]
+    fn only_a_bare_connect_peer_requests_the_picker() {
+        assert!(requests_session_picker(" /connect-peer  "));
+        assert!(!requests_session_picker("/connect-peer worker"));
+        assert!(!requests_session_picker("/peers"));
     }
 }

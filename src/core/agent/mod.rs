@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::events::{AgentEvent, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerDialer, PeerFactory, PeerSet, Registered};
+use crate::core::peer::{PeerDialer, PeerFactory, PeerSet, Registered, SessionLister};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_FETCH_TOOL,
@@ -22,8 +22,8 @@ mod supervision;
 mod tests;
 mod types;
 
-pub(crate) use command::pre_approves_permissions;
 pub use command::{McpCommand, command_catalog};
+pub(crate) use command::{pre_approves_permissions, requests_session_picker};
 pub use types::{AgentConfig, AgentIo, Backend, LoopInput};
 
 use command::Command;
@@ -62,6 +62,7 @@ async fn run_loop<P: Provider, B: Backend>(
         mut peer_register_rx,
         peer_factory,
         peer_dialer,
+        session_lister,
         self_handle,
         multi_driver,
     } = io;
@@ -168,6 +169,7 @@ async fn run_loop<P: Provider, B: Backend>(
                         &mut last_session_ctx,
                         &self_handle,
                         &peer_dialer,
+                        &session_lister,
                         &peer_factory,
                         &mut auto,
                     )
@@ -440,6 +442,7 @@ async fn run_loop<P: Provider, B: Backend>(
                                 &mut last_session_ctx,
                                 &self_handle,
                                 &peer_dialer,
+                                &session_lister,
                                 &peer_factory,
                                 &mut auto,
                             )
@@ -547,6 +550,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
     last_session_ctx: &mut (String, Option<String>, Option<String>, bool),
     self_handle: &BrokerHandle,
     peer_dialer: &Option<PeerDialer>,
+    session_lister: &Option<SessionLister>,
     peer_factory: &Option<PeerFactory>,
     auto: &mut bool,
 ) {
@@ -682,15 +686,40 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 })
                 .await;
         }
+        // Every path replies exactly once: the broker pairs replies with requesters in order.
+        Command::ConnectPeer(target) if target.is_empty() => {
+            let sessions = match session_lister {
+                Some(list) => list().await,
+                None => Err(anyhow::anyhow!(
+                    "peer connections are not available in this session"
+                )),
+            };
+            let (sessions, notice) = match sessions {
+                Ok(mut sessions) => {
+                    let held: std::collections::HashSet<String> = peers
+                        .infos()
+                        .into_iter()
+                        .filter_map(|p| p.session_id)
+                        .collect();
+                    sessions.retain(|c| c.id != session.id);
+                    for c in &mut sessions {
+                        c.connected = held.contains(&c.id);
+                    }
+                    let notice = sessions
+                        .is_empty()
+                        .then(|| "no other sessions in this directory".to_string());
+                    (sessions, notice)
+                }
+                Err(e) => (Vec::new(), Some(format!("{e:#}"))),
+            };
+            if let Some(text) = notice {
+                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            }
+            let _ = agent_tx.send(AgentEvent::SessionPicker { sessions }).await;
+        }
         // Spawned so the dial never blocks the loop; the edge arrives via `peer_register_rx`.
         Command::ConnectPeer(target) => {
-            if target.trim().is_empty() {
-                let _ = agent_tx
-                    .send(AgentEvent::Notice {
-                        text: "usage: /connect-peer <session id|name|pairing-code>".into(),
-                    })
-                    .await;
-            } else if let Some(dialer) = peer_dialer {
+            if let Some(dialer) = peer_dialer {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
                         text: "connecting to peer…".into(),

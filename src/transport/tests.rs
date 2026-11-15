@@ -975,3 +975,85 @@ async fn dial_peer_without_return_edge_fails_closed() {
     bb.task.abort();
     bb_dialer.task.abort();
 }
+
+// The picker reply is outside the replay buffer, so it must not shift the resume cursor
+// that the next buffered event carries.
+#[tokio::test]
+async fn a_session_picker_reply_reuses_the_previous_seq() {
+    use super::wire::{read_frame, write_frame};
+    use tokio::io::BufReader;
+
+    let mut bb = spawn_bare_broker(vec![ControllerEvent::AssistantText {
+        text: "seed".into(),
+    }]);
+    let (path, serve, _reg_rx) = spawn_socket_host(bb.handle.clone(), agent_id("host"));
+    let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut next = async || -> ServerFrame {
+        timeout(Duration::from_secs(5), read_frame(&mut reader))
+            .await
+            .expect("frame timeout")
+            .unwrap()
+            .expect("socket closed")
+    };
+
+    write_frame(
+        &mut write_half,
+        &ClientFrame::Attach {
+            after_seq: None,
+            who: ClientIdentity::human("h"),
+            reverse_offer: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next().await, ServerFrame::Attached));
+    assert!(matches!(next().await, ServerFrame::Event { seq: 0, .. }));
+
+    write_frame(
+        &mut write_half,
+        &ClientFrame::Command(UiEvent::Command {
+            line: "/connect-peer".into(),
+        }),
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), bb.loop_ui_rx.recv())
+        .await
+        .expect("command never reached the loop")
+        .unwrap();
+    let choice = crate::core::SessionChoice {
+        id: "other".into(),
+        name: None,
+        live: true,
+        turns: 1,
+        last_activity: 0,
+        connected: false,
+    };
+    bb.agent_tx
+        .send(AgentEvent::SessionPicker {
+            sessions: vec![choice],
+        })
+        .await
+        .unwrap();
+    bb.agent_tx
+        .send(AgentEvent::AssistantText {
+            text: "after".into(),
+        })
+        .await
+        .unwrap();
+
+    match next().await {
+        ServerFrame::Event {
+            seq: 0,
+            event: ControllerEvent::SessionPicker { sessions },
+        } => assert_eq!(sessions[0].id, "other"),
+        other => panic!("expected the picker at seq 0, got {other:?}"),
+    }
+    assert!(matches!(next().await, ServerFrame::Event { seq: 1, .. }));
+
+    serve.abort();
+    bb.task.abort();
+    let _ = std::fs::remove_file(&path);
+}

@@ -327,12 +327,17 @@ async fn bridge<R, W>(
             maybe_ev = events.recv() => {
                 match maybe_ev {
                     Some(event) => {
-                        let this_seq = seq;
-                        seq += 1;
-                        if let Some(a) = after_seq
-                            && this_seq <= a {
-                                continue;
-                            }
+                        // A SessionPicker isn't in the replay buffer, so it reuses the
+                        // previous seq instead of shifting the resume cursor.
+                        let direct = matches!(event, ControllerEvent::SessionPicker { .. });
+                        let this_seq = if direct { seq.saturating_sub(1) } else { seq };
+                        if !direct {
+                            seq += 1;
+                            if let Some(a) = after_seq
+                                && this_seq <= a {
+                                    continue;
+                                }
+                        }
                         if writer
                             .send(&ServerFrame::Event { seq: this_seq, event })
                             .await

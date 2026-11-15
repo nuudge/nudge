@@ -8,7 +8,7 @@ pub mod session;
 pub mod store;
 
 pub use agent::{AgentConfig, Backend};
-pub use events::{AgentEvent, ControllerEvent, McpServerInfo, ModelInfo, UiEvent};
+pub use events::{AgentEvent, ControllerEvent, McpServerInfo, ModelInfo, SessionChoice, UiEvent};
 pub use host::{BrokerHandle, Controller, HandoffStatus, SessionHandle, SessionHost};
 pub use identity::{ClientIdentity, ClientKind};
 pub use peer::{PeerDialer, PeerFactory, PeerRegistration, PeerWiring};

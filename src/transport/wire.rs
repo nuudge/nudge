@@ -532,4 +532,32 @@ mod tests {
             ControllerEvent::SessionInfo { auto: false, .. }
         ));
     }
+
+    #[test]
+    fn session_picker_round_trips() {
+        let ev = ControllerEvent::SessionPicker {
+            sessions: vec![crate::core::SessionChoice {
+                id: "abc".into(),
+                name: Some("worker".into()),
+                live: true,
+                turns: 4,
+                last_activity: 1_700_000_000,
+                connected: false,
+            }],
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            json,
+            r#"{"SessionPicker":{"sessions":[{"id":"abc","name":"worker","live":true,"turns":4,"last_activity":1700000000,"connected":false}]}}"#
+        );
+        match serde_json::from_str::<ControllerEvent>(&json).unwrap() {
+            ControllerEvent::SessionPicker { sessions } => {
+                let ControllerEvent::SessionPicker { sessions: sent } = ev else {
+                    unreachable!()
+                };
+                assert_eq!(sessions, sent);
+            }
+            other => panic!("expected a SessionPicker, got {other:?}"),
+        }
+    }
 }

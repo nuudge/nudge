@@ -31,6 +31,19 @@ pub struct PeerInfo {
     pub task: Option<String>,
 }
 
+// A row of the bare `/connect-peer` picker. `live` comes from probing the session's
+// socket, not the stored state, which a crash leaves stale.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionChoice {
+    pub id: String,
+    pub name: Option<String>,
+    pub live: bool,
+    pub turns: u64,
+    // Unix seconds, so each client renders it relative to its own clock.
+    pub last_activity: i64,
+    pub connected: bool,
+}
+
 // PermissionRequest's tool_use_id is unused (the prompt is modal, nothing to
 // correlate) — hence the allow.
 #[allow(dead_code)]
@@ -88,6 +101,11 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+    },
+    // Exactly one per bare `/connect-peer`: the broker pairs each with the controller
+    // that typed it, in order.
+    SessionPicker {
+        sessions: Vec<SessionChoice>,
     },
 }
 
@@ -160,6 +178,10 @@ pub enum ControllerEvent {
     },
     Error {
         message: String,
+    },
+    // Sent only to the controller that asked, and never buffered for replay.
+    SessionPicker {
+        sessions: Vec<SessionChoice>,
     },
 }
 

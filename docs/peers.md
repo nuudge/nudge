@@ -26,6 +26,10 @@ project) or its name (within this directory):
 /connect-peer backend-api
 ```
 
+Or type `/connect-peer` alone to pick from this directory's other sessions: each row
+shows whether it's live or ended, its turns and last activity, and whether it's already
+a peer. `↑`/`↓` to move, `Enter` to connect, `Esc` to cancel.
+
 It connects over the target's local socket, `~/.nudge/run/<session-id>.sock`, which only
 your OS user can open. If the target's human is attached, the edge is an ordinary
 unsupervised peer. A target with no one attached to answer its prompts is
@@ -132,6 +136,7 @@ driving their own sessions throughout.
 
 | Surface | What it does |
 | --- | --- |
+| `/connect-peer` | pick one of this directory's sessions to connect |
 | `/connect-peer <id\|name>` | connect a session running on this machine over its socket |
 | `nudge --connect <target>` | start (or `--resume`) a session that runs `/connect-peer <target>` as it opens; works with `--daemon` too |
 | `/connect-peer <code>` | dial an agent-peer code; one call, bidirectional edge |

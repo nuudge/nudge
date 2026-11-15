@@ -211,6 +211,7 @@ fn mk_io(
         peer_register_rx,
         peer_factory: None,
         peer_dialer: None,
+        session_lister: None,
         self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
         multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
@@ -303,6 +304,7 @@ async fn runtime_registration_through_spawn_wiring_lands_in_the_loop() {
             initial_peers: PeerSet::default(),
             register_rx: Some(peer_reg_rx),
             dialer: None,
+            lister: None,
         },
     );
 
@@ -392,6 +394,7 @@ async fn connect_peer_command_invokes_dialer_and_registers_edge() {
             initial_peers: PeerSet::default(),
             register_rx: Some(reg_rx),
             dialer: Some(dialer),
+            lister: None,
         },
     );
     let mut ctrl = host
@@ -480,6 +483,7 @@ async fn a_failed_connect_peer_is_a_notice_and_the_session_carries_on() {
             initial_peers: PeerSet::default(),
             register_rx: None,
             dialer: Some(dialer),
+            lister: None,
         },
     );
     let mut ctrl = host.attach(ClientIdentity::human("me")).await.unwrap();
@@ -1730,6 +1734,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot)),
             peer_dialer: None,
+            session_lister: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
             multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -1822,6 +1827,7 @@ async fn spawn_denial_does_not_run_the_factory() {
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot.clone())),
             peer_dialer: None,
+            session_lister: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
             multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -2645,6 +2651,7 @@ async fn auto_mode_spawns_unprompted_and_steers_under_the_policy() {
             peer_register_rx: None,
             peer_factory: Some(stub_factory(slot.clone())),
             peer_dialer: None,
+            session_lister: None,
             self_handle: crate::core::host::spawn_bare_broker(Vec::new()).handle,
             multi_driver: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
@@ -3721,6 +3728,151 @@ async fn duplicate_edges_to_one_session_report_replace_and_reject() {
             }
         }
     }
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn stub_lister(ids: Vec<String>) -> crate::core::peer::SessionLister {
+    Box::new(move || {
+        let sessions = ids
+            .iter()
+            .map(|id| crate::core::SessionChoice {
+                id: id.clone(),
+                name: None,
+                live: false,
+                turns: 0,
+                last_activity: 0,
+                connected: false,
+            })
+            .collect();
+        Box::pin(async move { Ok(sessions) })
+    })
+}
+
+// Runs one bare /connect-peer through the loop; returns the Notices and the picker it sent.
+async fn bare_connect_peer(
+    peers: PeerSet,
+    lister: impl FnOnce(&str) -> Option<crate::core::peer::SessionLister>,
+) -> (Vec<String>, Vec<crate::core::SessionChoice>) {
+    let (session, dir) = mk_session();
+    let session_lister = lister(&session.id);
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            session_lister,
+            ..mk_io(ui_rx, agent_tx, peers, None)
+        },
+    ));
+    send_command(&ui_tx, "/connect-peer").await;
+    let mut notices = Vec::new();
+    let sessions = loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Notice { text }) => notices.push(text),
+            Some(AgentEvent::SessionPicker { sessions }) => break sessions,
+            Some(_) => {}
+            None => panic!("loop ended without a picker reply"),
+        }
+    };
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    (notices, sessions)
+}
+
+#[tokio::test]
+async fn bare_connect_peer_lists_other_sessions_and_marks_connected_ones() {
+    let mut peers = PeerSet::default();
+    let (ctrl, _ev, _ui) = fake_peer();
+    peers.register(PeerRegistration::new(
+        ctrl,
+        ClientIdentity {
+            session_id: Some("held".into()),
+            ..agent_who("held-peer")
+        },
+    ));
+
+    let (notices, sessions) = bare_connect_peer(peers, |self_id| {
+        Some(stub_lister(vec![
+            "held".into(),
+            self_id.into(),
+            "free".into(),
+        ]))
+    })
+    .await;
+
+    assert!(notices.is_empty(), "{notices:?}");
+    let rows: Vec<(&str, bool)> = sessions
+        .iter()
+        .map(|c| (c.id.as_str(), c.connected))
+        .collect();
+    assert_eq!(rows, [("held", true), ("free", false)]);
+}
+
+// The broker pairs replies with requesters in order, so even these paths send one picker.
+#[tokio::test]
+async fn bare_connect_peer_with_nothing_to_list_sends_a_notice_and_an_empty_picker() {
+    let (notices, sessions) = bare_connect_peer(PeerSet::default(), |self_id| {
+        Some(stub_lister(vec![self_id.into()]))
+    })
+    .await;
+    assert_eq!(notices, ["no other sessions in this directory"]);
+    assert!(sessions.is_empty());
+
+    let (notices, sessions) = bare_connect_peer(PeerSet::default(), |_| None).await;
+    assert_eq!(
+        notices,
+        ["peer connections are not available in this session"]
+    );
+    assert!(sessions.is_empty());
+}
+
+// A bare /connect-peer queued behind a message is stashed by the coalescer and answered
+// once the turn ends.
+#[tokio::test]
+async fn a_picker_request_queued_mid_turn_is_answered_after_the_turn() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    send_command(&ui_tx, "/connect-peer").await;
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        AgentIo {
+            session_lister: Some(stub_lister(vec!["other".into()])),
+            ..mk_io(ui_rx, agent_tx, PeerSet::default(), None)
+        },
+    ));
+
+    let mut turn_done = false;
+    let mut pickers = 0;
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::TurnComplete => turn_done = true,
+            AgentEvent::SessionPicker { sessions } => {
+                assert!(turn_done, "the picker arrived mid-turn");
+                assert_eq!(sessions.len(), 1);
+                pickers += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(pickers, 1);
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();
