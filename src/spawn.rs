@@ -93,6 +93,7 @@ pub fn peer_factory(
                     register_rx: None,
                     // /connect-peer is human-only, and a child has no human.
                     dialer: None,
+                    lister: None,
                 },
             );
 

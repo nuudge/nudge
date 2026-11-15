@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+use crate::coding;
 use crate::core::store::SessionRow;
 use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration};
 use crate::transport::SocketClient;
@@ -25,7 +26,7 @@ pub(super) async fn connect_local(
     who: ClientIdentity,
 ) -> Result<()> {
     check_target(&target, reference, self_id)?;
-    let socket = super::session_socket_path(&target.id)?;
+    let socket = coding::session_socket_path(&target.id)?;
     let client = SocketClient::new(socket.clone());
     ensure_running_then(
         &socket,

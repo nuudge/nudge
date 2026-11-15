@@ -169,6 +169,20 @@ impl App {
             }
             return;
         }
+        if let Some((sessions, sel)) = &mut self.session_picker {
+            match key.code {
+                KeyCode::Up => *sel = sel.saturating_sub(1),
+                KeyCode::Down => *sel = (*sel + 1).min(sessions.len() - 1),
+                KeyCode::Enter => {
+                    let line = format!("/connect-peer {}", sessions[*sel].id);
+                    self.session_picker = None;
+                    let _ = ui_tx.try_send(UiEvent::Command { line });
+                }
+                KeyCode::Esc => self.session_picker = None,
+                _ => {}
+            }
+            return;
+        }
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -650,5 +664,39 @@ mod tests {
         let off = header_after_session_info(false);
         assert!(!off.contains("AUTO"), "{off}");
         assert!(off.contains(" owner  nudge · s"), "{off}");
+    }
+
+    #[tokio::test]
+    async fn session_picker_enter_connects_by_id_and_esc_closes_it_keeping_typed_input() {
+        let choice = |id: &str, name: &str| crate::core::SessionChoice {
+            id: id.into(),
+            name: Some(name.into()),
+            live: true,
+            turns: 0,
+            last_activity: 0,
+            connected: false,
+        };
+        let open = |app: &mut App| {
+            app.handle_agent_event(crate::core::ControllerEvent::SessionPicker {
+                sessions: vec![choice("id-a", "alpha"), choice("id-b", "beta")],
+            })
+        };
+        let mut app = app_with_input("draft", 5, 80);
+        let (tx, mut rx) = mpsc::channel(4);
+
+        open(&mut app);
+        app.handle_key(press(KeyCode::Down), &tx);
+        app.handle_key(press(KeyCode::Enter), &tx);
+        assert!(app.session_picker.is_none());
+        match rx.try_recv() {
+            Ok(UiEvent::Command { line }) => assert_eq!(line, "/connect-peer id-b"),
+            other => panic!("expected the connect command, got {other:?}"),
+        }
+
+        open(&mut app);
+        app.handle_key(press(KeyCode::Esc), &tx);
+        assert!(app.session_picker.is_none());
+        assert!(rx.try_recv().is_err(), "Esc must send nothing");
+        assert_eq!(app.input, "draft");
     }
 }

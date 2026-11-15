@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::agent::{AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, run_agent};
+use super::agent::{
+    AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, requests_session_picker,
+    run_agent,
+};
 use super::events::{AgentEvent, ControllerEvent, UiEvent};
 use super::identity::{ClientIdentity, ClientKind};
 use super::peer::PeerWiring;
@@ -131,6 +134,7 @@ impl SessionHost {
                 peer_register_rx: peers.register_rx,
                 peer_factory: peers.factory,
                 peer_dialer: peers.dialer,
+                session_lister: peers.lister,
                 self_handle,
                 multi_driver: multi_driver.clone(),
             },
@@ -377,6 +381,7 @@ fn translate(
         AgentEvent::MaxIterations => ControllerEvent::MaxIterations,
         AgentEvent::Notice { text } => ControllerEvent::Notice { text },
         AgentEvent::Error { message } => ControllerEvent::Error { message },
+        AgentEvent::SessionPicker { sessions } => ControllerEvent::SessionPicker { sessions },
     }
 }
 
@@ -467,6 +472,9 @@ async fn broker(
     }
     let mut buffer: Vec<ControllerEvent> = seed;
     let mut pending: HashMap<String, (oneshot::Sender<bool>, String)> = HashMap::new();
+    // The loop takes commands in the order they're forwarded and answers each bare
+    // `/connect-peer` with exactly one SessionPicker, so replies pop in order.
+    let mut picker_requesters: std::collections::VecDeque<ControllerId> = Default::default();
     let (supervisors, _) = watch::channel(0usize);
 
     loop {
@@ -517,11 +525,21 @@ async fn broker(
             }
             ev = loop_agent_rx.recv() => {
                 match ev {
-                    Some(ev) => {
-                        let cev = translate(ev, &mut pending);
-                        buffer.push(cev.clone());
-                        fan_out(&mut attached, &cev);
-                    }
+                    Some(ev) => match translate(ev, &mut pending) {
+                        // An empty list is reported by the loop's Notice instead.
+                        ControllerEvent::SessionPicker { sessions } => {
+                            let requester = picker_requesters.pop_front();
+                            if let Some(c) = requester.and_then(|id| attached.get(&id))
+                                && !sessions.is_empty()
+                            {
+                                let _ = c.event_tx.send(ControllerEvent::SessionPicker { sessions });
+                            }
+                        }
+                        cev => {
+                            buffer.push(cev.clone());
+                            fan_out(&mut attached, &cev);
+                        }
+                    },
                     None => return,
                 }
             }
@@ -594,7 +612,12 @@ async fn broker(
                             .unwrap_or(false);
                         if allowed {
                             let who = attached.get(&id).map(|c| c.who.clone());
-                            let _ = loop_ui_tx.send((who, UiEvent::Command { line })).await;
+                            let picker = requests_session_picker(&line);
+                            if loop_ui_tx.send((who, UiEvent::Command { line })).await.is_ok()
+                                && picker
+                            {
+                                picker_requesters.push_back(id);
+                            }
                         } else if let Some(c) = attached.get(&id) {
                             let _ = c.event_tx.send(ControllerEvent::Notice {
                                 text: "commands are not permitted for this client".into(),
@@ -647,6 +670,149 @@ pub(crate) fn spawn_bare_broker(seed: Vec<ControllerEvent>) -> BareBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn picker_of(id: &str) -> AgentEvent {
+        AgentEvent::SessionPicker {
+            sessions: vec![crate::core::events::SessionChoice {
+                id: id.into(),
+                name: None,
+                live: true,
+                turns: 0,
+                last_activity: 0,
+                connected: false,
+            }],
+        }
+    }
+
+    // A command is forwarded before the next one is sent, fixing the request order.
+    async fn request_picker(bb: &mut BareBroker, ctrl: &Controller) {
+        ctrl.ui_tx
+            .send(UiEvent::Command {
+                line: "/connect-peer".into(),
+            })
+            .await
+            .unwrap();
+        let (_, ev) = bb.loop_ui_rx.recv().await.unwrap();
+        assert!(matches!(ev, UiEvent::Command { .. }));
+    }
+
+    // The marker is broadcast after the replies, so everything before it is what each
+    // controller was sent.
+    async fn events_until_marker(ctrl: &mut Controller) -> Vec<ControllerEvent> {
+        let mut seen = Vec::new();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), ctrl.events.recv())
+                .await
+                .expect("marker never arrived")
+                .unwrap()
+            {
+                ControllerEvent::AssistantText { text } if text == "marker" => return seen,
+                ev => seen.push(ev),
+            }
+        }
+    }
+
+    fn picked(events: &[ControllerEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|ev| match ev {
+                ControllerEvent::SessionPicker { sessions } => Some(sessions[0].id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn session_picker_replies_reach_only_their_requester_and_are_never_replayed() {
+        let mut bb = spawn_bare_broker(Vec::new());
+        let human = |n: &str| ClientIdentity::human(n);
+        let mut a = bb
+            .handle
+            .attach_as(human("a"), ClientProfile::human())
+            .await
+            .unwrap();
+        let mut b = bb
+            .handle
+            .attach_as(human("b"), ClientProfile::human())
+            .await
+            .unwrap();
+        let mut watcher = bb
+            .handle
+            .attach_as(human("w"), ClientProfile::watch_only())
+            .await
+            .unwrap();
+        let gone = bb
+            .handle
+            .attach_as(human("g"), ClientProfile::human())
+            .await
+            .unwrap();
+
+        request_picker(&mut bb, &a).await;
+        request_picker(&mut bb, &gone).await;
+        request_picker(&mut bb, &b).await;
+        drop(gone);
+        for ev in [
+            picker_of("for-a"),
+            picker_of("for-gone"),
+            picker_of("for-b"),
+        ] {
+            bb.agent_tx.send(ev).await.unwrap();
+        }
+        bb.agent_tx
+            .send(AgentEvent::AssistantText {
+                text: "marker".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(picked(&events_until_marker(&mut a).await), ["for-a"]);
+        assert_eq!(picked(&events_until_marker(&mut b).await), ["for-b"]);
+        assert!(picked(&events_until_marker(&mut watcher).await).is_empty());
+
+        let mut later = bb
+            .handle
+            .attach_as(human("later"), ClientProfile::human())
+            .await
+            .unwrap();
+        assert!(picked(&events_until_marker(&mut later).await).is_empty());
+        bb.task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_refused_command_queues_no_picker_request() {
+        let mut bb = spawn_bare_broker(Vec::new());
+        let mut watcher = bb
+            .handle
+            .attach_as(ClientIdentity::human("w"), ClientProfile::watch_only())
+            .await
+            .unwrap();
+        let mut a = bb
+            .handle
+            .attach_as(ClientIdentity::human("a"), ClientProfile::human())
+            .await
+            .unwrap();
+        watcher
+            .ui_tx
+            .send(UiEvent::Command {
+                line: "/connect-peer".into(),
+            })
+            .await
+            .unwrap();
+        match watcher.events.recv().await {
+            Some(ControllerEvent::Notice { text }) => assert!(text.contains("not permitted")),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        request_picker(&mut bb, &a).await;
+        bb.agent_tx.send(picker_of("for-a")).await.unwrap();
+        bb.agent_tx
+            .send(AgentEvent::AssistantText {
+                text: "marker".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(picked(&events_until_marker(&mut a).await), ["for-a"]);
+        bb.task.abort();
+    }
 
     async fn try_attach(
         ctl_tx: &mpsc::UnboundedSender<HostCommand>,

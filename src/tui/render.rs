@@ -458,7 +458,49 @@ impl App {
             f.render_widget(para, popup);
         }
 
-        // Drawn last so a permission prompt sits on top of an open model picker.
+        if let Some((sessions, sel)) = &self.session_picker {
+            let popup = centered_rect(60, 40, f.area());
+            f.render_widget(Clear, popup);
+            let now = chrono::Utc::now().timestamp();
+            let mut body = Vec::new();
+            for (i, s) in sessions.iter().enumerate() {
+                let marker = if i == *sel { "❯ " } else { "  " };
+                let name = s
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| s.id.chars().take(8).collect());
+                let state = if s.live { "live" } else { "ended" };
+                let connected = if s.connected { "  (connected)" } else { "" };
+                let style = if i == *sel {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                body.push(Line::from(Span::styled(
+                    format!(
+                        "{marker}{name} - {state} · {} turns · {}{connected}",
+                        s.turns,
+                        ago(now - s.last_activity)
+                    ),
+                    style,
+                )));
+            }
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "↑/↓ move · Enter connect · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let para = Paragraph::new(body).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Connect a peer session"),
+            );
+            f.render_widget(para, popup);
+        }
+
+        // Drawn last so a permission prompt sits on top of an open picker.
         if let Some(p) = &mut self.pending {
             let popup = centered_rect(60, 30, f.area());
             f.render_widget(Clear, popup);
@@ -492,5 +534,14 @@ impl App {
                 .scroll((p.scroll, 0));
             f.render_widget(para, popup);
         }
+    }
+}
+
+fn ago(secs: i64) -> String {
+    match secs {
+        ..60 => "just now".into(),
+        60..3600 => format!("{}m ago", secs / 60),
+        3600..86400 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
     }
 }

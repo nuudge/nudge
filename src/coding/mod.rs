@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
 
 use crate::core::ControllerEvent;
 use crate::core::session::{LoggedMessage, Resumed, Session};
-use crate::core::store::{SessionRow, SessionState, SessionStore};
+use crate::core::store::{SessionRow, SessionStore};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, merge_text_runs,
     ran_code_execution, web_fetch_result, web_fetch_url, web_search_query, web_search_results,
@@ -198,13 +199,32 @@ pub fn find_session(reference: &str) -> Result<Option<SessionRow>> {
     store.session(&id)
 }
 
-// `state` is best-effort: 'ended' is written only on graceful teardown, so a
-// crashed session still reads 'running'.
+pub fn session_socket_path(session_id: &str) -> Result<PathBuf> {
+    Ok(run_dir()?.join(format!("{session_id}.sock")))
+}
+
+fn run_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME env var not set")?;
+    let dir = PathBuf::from(home).join(".nudge").join("run");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+// The stored state can't say this: 'ended' is written only on graceful teardown, so a
+// crashed session would read 'running' forever.
+fn is_listening(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
 pub struct SessionListing {
     pub id: String,
     pub name: Option<String>,
     pub branch: Option<String>,
-    pub state: SessionState,
+    pub live: bool,
     pub last_activity: chrono::DateTime<chrono::Utc>,
     pub turns: i64,
 }
@@ -220,10 +240,10 @@ pub fn list_sessions() -> Result<Vec<SessionListing>> {
                 .with_context(|| format!("invalid last_activity on session {}", l.row.id))?
                 .with_timezone(&chrono::Utc);
             Ok(SessionListing {
+                live: is_listening(&session_socket_path(&l.row.id)?),
                 id: l.row.id,
                 name: l.row.name,
                 branch: l.row.branch,
-                state: l.row.state,
                 last_activity,
                 turns: l.turns,
             })
@@ -388,5 +408,25 @@ mod tests {
                 "TurnComplete",
             ]
         );
+    }
+
+    #[test]
+    fn liveness_is_whether_the_socket_answers() {
+        // Short: macOS caps socket paths at 104 bytes.
+        let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
+        let socket = std::env::temp_dir().join(format!("live-{token}.sock"));
+        assert!(!is_listening(&socket), "no file");
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(is_listening(&socket), "bound");
+
+        drop(listener);
+        // A child forked by a concurrent test holds the listener until its exec closes it.
+        let stale = (0..200).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            !is_listening(&socket)
+        });
+        assert!(stale, "stale file left by a crash");
+        std::fs::remove_file(&socket).ok();
     }
 }

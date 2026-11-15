@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::core::events::{AgentEvent, McpServerInfo, ModelInfo, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerDialer, PeerFactory, PeerRegistration, PeerSet};
+use crate::core::peer::{PeerDialer, PeerFactory, PeerRegistration, PeerSet, SessionLister};
 use crate::llm::SystemBlock;
 
 use super::command::McpCommand;
@@ -68,6 +68,8 @@ pub struct AgentIo {
     // None = this session may not dial peers (e.g. a spawned child). The dial runs
     // spawned so the loop never blocks; the edge returns via `peer_register_rx`.
     pub peer_dialer: Option<PeerDialer>,
+    // None = no session picker; set alongside `peer_dialer`.
+    pub session_lister: Option<SessionLister>,
     // This agent's own broker, so a spawned or dialed peer can attach back.
     pub self_handle: BrokerHandle,
     // Sticky: set once two distinct driving senders have connected.

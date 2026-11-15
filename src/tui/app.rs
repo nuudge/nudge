@@ -1,4 +1,4 @@
-use crate::core::HandoffStatus;
+use crate::core::{HandoffStatus, SessionChoice};
 
 // Stored semantically (not pre-rendered) so the Ctrl-O expand toggle can re-format.
 pub(super) enum LogEntry {
@@ -75,6 +75,8 @@ pub(super) struct App {
     // (display label, API model id)
     pub(super) models: Vec<(String, String)>,
     pub(super) model_picker: Option<usize>,
+    // (rows, selected); opened by the daemon's reply to a bare /connect-peer.
+    pub(super) session_picker: Option<(Vec<SessionChoice>, usize)>,
     pub(super) mode: Mode,
     // Set by handlers, applied by the run loop (which holds the host handle).
     pub(super) pending_transition: Option<Mode>,
@@ -152,6 +154,7 @@ impl App {
             pending: None,
             models: cfg.models,
             model_picker: None,
+            session_picker: None,
             mode: Mode::Foreground,
             pending_transition: None,
             pairing_qr: cfg.pairing_qr,
@@ -173,6 +176,7 @@ impl App {
         self.status.clear();
         self.pending = None;
         self.model_picker = None;
+        self.session_picker = None;
     }
 
     // Clear the log so it rebuilds from the broker's replay on reattach.

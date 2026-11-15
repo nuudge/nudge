@@ -35,6 +35,15 @@ pub type PeerDialer = Box<
         + Sync,
 >;
 
+// Lists this directory's sessions, newest first, for the bare `/connect-peer` picker.
+// Supplied by the composition root, which owns the session store and the sockets.
+pub type SessionLister = Box<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn Future<Output = anyhow::Result<Vec<super::events::SessionChoice>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 struct Peer {
     who: ClientIdentity,
     controller: Controller,
@@ -79,6 +88,7 @@ pub struct PeerWiring {
     pub initial_peers: PeerSet,
     pub register_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PeerRegistration>>,
     pub dialer: Option<PeerDialer>,
+    pub lister: Option<SessionLister>,
 }
 
 impl PeerRegistration {
