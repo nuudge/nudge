@@ -4,8 +4,6 @@ mod local;
 mod local_peer;
 
 use anyhow::{Context, Result};
-use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
 
 use crate::cli::Cli;
 use crate::coding;
@@ -110,7 +108,7 @@ pub async fn host(cli: Cli) -> Result<()> {
             .await;
     }
 
-    let socket_path = session_socket_path(&session.id)?;
+    let socket_path = coding::session_socket_path(&session.id)?;
     let listener = transport::bind_listener(&socket_path)?;
 
     let backend = coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
@@ -190,8 +188,17 @@ pub async fn host(cli: Cli) -> Result<()> {
             dialer: Some(dialer),
             lister: Some(Box::new(|| {
                 Box::pin(async {
-                    let listings = coding::list_sessions()?;
-                    Ok(local_peer::session_choices(listings, &run_dir()?).await)
+                    Ok(coding::list_sessions()?
+                        .into_iter()
+                        .map(|l| core::SessionChoice {
+                            id: l.id,
+                            name: l.name,
+                            live: l.live,
+                            turns: l.turns.max(0) as u64,
+                            last_activity: l.last_activity.timestamp(),
+                            connected: false,
+                        })
+                        .collect())
                 })
             })),
         },
@@ -290,21 +297,6 @@ async fn dial_peer(
                 .await
         }
     }
-}
-
-fn session_socket_path(session_id: &str) -> Result<PathBuf> {
-    Ok(run_dir()?.join(format!("{session_id}.sock")))
-}
-
-fn run_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME env var not set")?;
-    let dir = PathBuf::from(home).join(".nudge").join("run");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
 }
 
 #[cfg(test)]

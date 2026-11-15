@@ -4,6 +4,7 @@ use std::path::Path;
 use super::Target;
 use super::local_peer::{accepts, label};
 use crate::cli::Cli;
+use crate::coding;
 use crate::core::store::SessionRow;
 use crate::core::{ClientIdentity, Controller};
 use crate::run::local_identity;
@@ -45,7 +46,7 @@ pub async fn run(target: &str, cli: &Cli) -> Result<()> {
             tui::run(&client, ui_cfg, who, controller, None).await
         }
         Target::Local(row) => {
-            let socket = super::session_socket_path(&row.id)?;
+            let socket = coding::session_socket_path(&row.id)?;
             let client = SocketClient::new(socket.clone());
             let cwd = std::env::current_dir().context("could not determine cwd")?;
             let controller = attach_local(

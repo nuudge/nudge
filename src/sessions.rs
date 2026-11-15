@@ -22,7 +22,7 @@ pub fn print_sessions() -> Result<()> {
             s.name.as_deref().unwrap_or("(unnamed)"),
             s.id,
             s.branch.as_deref().unwrap_or("-"),
-            s.state.as_str(),
+            if s.live { "live" } else { "ended" },
             s.turns,
             when,
         );
