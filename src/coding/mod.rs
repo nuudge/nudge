@@ -188,15 +188,48 @@ pub fn open_resume(reference: &str) -> Result<Resumed> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
     let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
+    if let Some(row) = store.session(&id)? {
+        check_resume_dir(&row, &cwd.display().to_string())?;
+    }
     Session::open(&id, cwd, store)
+}
+
+// The tools are rooted at the cwd, so resuming elsewhere would point a session's history
+// at the wrong tree.
+fn check_resume_dir(row: &SessionRow, cwd: &str) -> Result<()> {
+    if row.cwd != cwd {
+        let label = row.name.as_deref().unwrap_or(&row.id);
+        anyhow::bail!(
+            "session {label} belongs to {dir}; resume it there: cd {dir} && nudge --resume {label}",
+            dir = row.cwd
+        );
+    }
+    Ok(())
 }
 
 // An id resolves from any project; a name only among this cwd's sessions.
 pub fn find_session(reference: &str) -> Result<Option<SessionRow>> {
     let cwd = std::env::current_dir().context("could not determine cwd")?;
     let store = open_store()?;
-    let id = store.resolve_reference(&cwd.display().to_string(), reference)?;
-    store.session(&id)
+    if let Some(row) = store.session(reference)? {
+        return Ok(Some(row));
+    }
+    let named = store
+        .list_by_cwd(&cwd.display().to_string())?
+        .into_iter()
+        .map(|l| l.row)
+        .filter(|r| r.name.as_deref() == Some(reference))
+        .collect();
+    Ok(pick_named(named, |id| {
+        session_socket_path(id).is_ok_and(|socket| is_listening(&socket))
+    }))
+}
+
+// `named` is newest first. A running one is the session the user means to reach, so it
+// beats a newer one that has ended.
+fn pick_named(mut named: Vec<SessionRow>, live: impl Fn(&str) -> bool) -> Option<SessionRow> {
+    let pick = named.iter().position(|r| live(&r.id)).unwrap_or(0);
+    (!named.is_empty()).then(|| named.swap_remove(pick))
 }
 
 pub fn session_socket_path(session_id: &str) -> Result<PathBuf> {
@@ -408,6 +441,41 @@ mod tests {
                 "TurnComplete",
             ]
         );
+    }
+
+    #[test]
+    fn resume_refuses_a_session_from_another_directory_with_a_cd_hint() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store.insert_session("abc", "/projB", None, None).unwrap();
+        let row = store.session("abc").unwrap().unwrap();
+
+        assert!(check_resume_dir(&row, "/projB").is_ok());
+        let err = check_resume_dir(&row, "/projA").unwrap_err().to_string();
+        assert!(
+            err.contains("cd /projB && nudge --resume abc"),
+            "hint names the dir and the id: {err}"
+        );
+    }
+
+    #[test]
+    fn a_name_resolves_to_its_running_session_before_a_newer_ended_one() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let row = |id: &str| {
+            store.insert_session(id, "/proj", None, None).unwrap();
+            store.session(id).unwrap().unwrap()
+        };
+        let (newer, older) = (row("newer"), row("older"));
+        let pick = |live: &'static str| {
+            pick_named(vec![newer.clone(), older.clone()], |id| id == live).map(|r| r.id)
+        };
+
+        assert_eq!(pick("older").as_deref(), Some("older"), "the live one wins");
+        assert_eq!(
+            pick("none").as_deref(),
+            Some("newer"),
+            "otherwise the newest"
+        );
+        assert!(pick_named(Vec::new(), |_| true).is_none());
     }
 
     #[test]
