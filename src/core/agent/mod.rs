@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::events::{AgentEvent, UiEvent};
 use crate::core::host::BrokerHandle;
 use crate::core::identity::ClientIdentity;
-use crate::core::peer::{PeerDialer, PeerFactory, PeerSet};
+use crate::core::peer::{PeerDialer, PeerFactory, PeerSet, Registered};
 use crate::core::session::{LoggedMessage, Session};
 use crate::llm::{
     CODE_EXECUTION_NOTICE, ContentBlock, Message, Provider, Request, WEB_FETCH_TOOL,
@@ -102,12 +102,20 @@ async fn run_loop<P: Provider, B: Backend>(
                             Some(reg) => {
                                 // Resolves the "connecting…" line on both sides.
                                 let name = reg.who.name.clone();
-                                peers.register(reg);
-                                let _ = agent_tx
-                                    .send(AgentEvent::Notice {
-                                        text: format!("connected to peer {name}"),
-                                    })
-                                    .await;
+                                let text = match peers.register(reg) {
+                                    Registered::Added(_) => format!("connected to peer {name}"),
+                                    Registered::Replaced(id) => format!(
+                                        "replaced the unsupervised edge to {} with a {} one",
+                                        peers.display_name(id),
+                                        peers.role(id)
+                                    ),
+                                    Registered::Rejected(id) => format!(
+                                        "already connected to {} ({})",
+                                        peers.display_name(id),
+                                        peers.role(id)
+                                    ),
+                                };
+                                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
                                 let _ = agent_tx
                                     .send(capabilities_event(&cfg, &backend, &peers))
                                     .await;

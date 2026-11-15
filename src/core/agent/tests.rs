@@ -8,7 +8,7 @@ use super::{AgentConfig, AgentIo, Backend, LoopInput, run_agent};
 use crate::core::events::{AgentEvent, ControllerEvent, UiEvent};
 use crate::core::host::Controller;
 use crate::core::identity::{ClientIdentity, ClientKind};
-use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet};
+use crate::core::peer::{PeerFactory, PeerRegistration, PeerSet, Registered};
 use crate::core::session::Session;
 use crate::core::store::{SessionState, SessionStore};
 use crate::core::{SessionHandle, SessionHost};
@@ -3622,6 +3622,105 @@ async fn consecutive_text_blocks_emit_one_assistant_text_per_run() {
             r#"text "xy""#,
         ]
     );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+fn session_who(session_id: &str) -> ClientIdentity {
+    ClientIdentity {
+        session_id: Some(session_id.into()),
+        ..agent_who("x")
+    }
+}
+
+// Rejecting rather than replacing keeps the child alive: dropping its Peer would quit it.
+#[tokio::test]
+async fn a_duplicate_edge_to_a_spawned_child_is_rejected() {
+    let (child_session, dir) = mk_session();
+    let child_id = child_session.id.clone();
+    let child_host = SessionHost::spawn(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        child_session,
+        Vec::new(),
+        Vec::new(),
+        crate::core::PeerWiring::default(),
+    );
+    let child_ctrl = child_host
+        .attach(agent_who("parent"))
+        .await
+        .expect("attach to child");
+
+    let mut peers = PeerSet::default();
+    peers.register(PeerRegistration {
+        host: Some(child_host),
+        ..supervised_reg(child_ctrl, session_who(&child_id))
+    });
+    for supervised in [false, true] {
+        let (ctrl, _ev, _ui) = fake_peer();
+        assert_eq!(
+            peers.register(PeerRegistration::forward(
+                ctrl,
+                session_who(&child_id),
+                supervised
+            )),
+            Registered::Rejected(0)
+        );
+    }
+    assert_eq!(peers.infos().len(), 1);
+    assert!(peers.is_supervised(0));
+
+    drop(peers);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn duplicate_edges_to_one_session_report_replace_and_reject() {
+    let (session, dir) = mk_session();
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let (reg_tx, reg_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        FakeProvider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), Some(reg_rx)),
+    ));
+
+    let mut far_ends = Vec::new();
+    for (supervised, want) in [
+        (false, "connected to peer x"),
+        (
+            true,
+            "replaced the unsupervised edge to x with a supervised one",
+        ),
+        (false, "already connected to x (supervised)"),
+    ] {
+        let (ctrl, ev, ui) = fake_peer();
+        far_ends.push((ev, ui));
+        reg_tx
+            .send(PeerRegistration::forward(
+                ctrl,
+                session_who("s"),
+                supervised,
+            ))
+            .unwrap();
+        loop {
+            match agent_rx.recv().await {
+                Some(AgentEvent::Notice { text }) => {
+                    assert_eq!(text, want);
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("loop ended early"),
+            }
+        }
+    }
 
     ui_tx.send((None, UiEvent::Quit)).await.unwrap();
     task.await.unwrap().unwrap();

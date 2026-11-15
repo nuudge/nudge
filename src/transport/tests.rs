@@ -11,7 +11,7 @@ use super::wire::{ClientFrame, ServerFrame};
 use super::{RelayClient, RelayLeg, SocketClient, bind_listener, run_relay_daemon, serve_socket};
 use crate::core::BrokerHandle;
 use crate::core::host::spawn_bare_broker;
-use crate::core::peer::{PeerRegistration, PeerSet};
+use crate::core::peer::{PeerRegistration, PeerSet, Registered};
 use crate::core::{
     AgentEvent, ClientIdentity, ClientKind, ClientProfile, Controller, ControllerEvent,
     SessionHandle, UiEvent,
@@ -285,6 +285,36 @@ async fn socket_peer_of_an_unattended_session_supervises_it() {
         Ok(Ok(true)),
         "the supervisor's answer must resolve the target's prompt"
     );
+
+    serve.abort();
+    bb_a.task.abort();
+    bb_b.task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+// A PeerSet drops a duplicate edge's half; the connection must close so the other
+// side's PeerSet reaps the mirror half.
+#[tokio::test]
+async fn dropping_either_half_of_a_socket_peer_edge_closes_the_other() {
+    let bb_a = spawn_bare_broker(Vec::new());
+    let bb_b = spawn_bare_broker(Vec::new());
+    let (path, serve, mut reg_b_rx) = spawn_socket_host(bb_b.handle.clone(), agent_id("peer-b"));
+
+    async fn expect_closed(mut ctrl: Controller) {
+        timeout(Duration::from_secs(5), async {
+            while ctrl.events.recv().await.is_some() {}
+        })
+        .await
+        .expect("the mirror half never closed");
+    }
+
+    let (dialer_half, acceptor_half) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
+    drop(dialer_half);
+    expect_closed(acceptor_half.controller).await;
+
+    let (dialer_half, acceptor_half) = dial_socket_peer(&bb_a.handle, &path, &mut reg_b_rx).await;
+    drop(acceptor_half);
+    expect_closed(dialer_half.controller).await;
 
     serve.abort();
     bb_a.task.abort();
@@ -822,8 +852,12 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
 
     let mut peers_a = PeerSet::default();
     let mut peers_b = PeerSet::default();
-    let id_b = peers_a.register(peer_b);
-    let id_a = peers_b.register(peer_a);
+    let Registered::Added(id_b) = peers_a.register(peer_b) else {
+        unreachable!()
+    };
+    let Registered::Added(id_a) = peers_b.register(peer_a) else {
+        unreachable!()
+    };
 
     bb_b.agent_tx
         .send(AgentEvent::AssistantText {

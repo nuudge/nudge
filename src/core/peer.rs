@@ -126,8 +126,35 @@ pub struct PeerSet {
     next_id: PeerId,
 }
 
+// Each carries the id of the edge that survived.
+#[derive(Debug, PartialEq)]
+pub enum Registered {
+    Added(PeerId),
+    Replaced(PeerId),
+    Rejected(PeerId),
+}
+
 impl PeerSet {
-    pub fn register(&mut self, reg: PeerRegistration) -> PeerId {
+    // One edge per peer session: a supervised or spawner edge replaces a plain one, and
+    // anything else is dropped, so a reconnect never downgrades an edge.
+    pub fn register(&mut self, reg: PeerRegistration) -> Registered {
+        let existing = reg.who.session_id.as_ref().and_then(|sid| {
+            self.peers
+                .iter()
+                .find(|(_, p)| p.who.session_id.as_ref() == Some(sid))
+                .map(|(id, p)| (*id, p.supervised || p.spawner))
+        });
+        match existing {
+            None => Registered::Added(self.insert(reg)),
+            Some((old, false)) if reg.supervised || reg.spawner => {
+                self.peers.remove(&old);
+                Registered::Replaced(self.insert(reg))
+            }
+            Some((old, _)) => Registered::Rejected(old),
+        }
+    }
+
+    fn insert(&mut self, reg: PeerRegistration) -> PeerId {
         let id = self.next_id;
         self.next_id += 1;
         self.peers.insert(
@@ -146,6 +173,14 @@ impl PeerSet {
 
     pub fn is_supervised(&self, id: PeerId) -> bool {
         self.peers.get(&id).is_some_and(|p| p.supervised)
+    }
+
+    pub fn role(&self, id: PeerId) -> &'static str {
+        match self.peers.get(&id) {
+            Some(p) if p.supervised => "supervised",
+            Some(p) if p.spawner => "supervising",
+            _ => "unsupervised",
+        }
     }
 
     pub fn spawner_id(&self) -> Option<PeerId> {
@@ -284,11 +319,17 @@ mod tests {
         let mut peers = PeerSet::default();
         let (a_ctrl, a_ev, _a_ui) = fake_peer();
         let (b_ctrl, b_ev, _b_ui) = fake_peer();
-        let a = peers.register(PeerRegistration::new(
+        let Registered::Added(a) = peers.register(PeerRegistration::new(
             a_ctrl,
             ClientIdentity::human("alice"),
-        ));
-        let b = peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")));
+        )) else {
+            unreachable!()
+        };
+        let Registered::Added(b) =
+            peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")))
+        else {
+            unreachable!()
+        };
 
         b_ev.send(ControllerEvent::Notice {
             text: "from-b".into(),
@@ -319,7 +360,11 @@ mod tests {
     async fn drive_reaches_the_addressed_peer() {
         let mut peers = PeerSet::default();
         let (ctrl, _ev, mut ui_rx) = fake_peer();
-        let id = peers.register(PeerRegistration::new(ctrl, ClientIdentity::human("child")));
+        let Registered::Added(id) =
+            peers.register(PeerRegistration::new(ctrl, ClientIdentity::human("child")))
+        else {
+            unreachable!()
+        };
 
         peers
             .drive(id, UiEvent::UserMessage { text: "go".into() })
@@ -335,11 +380,17 @@ mod tests {
         let mut peers = PeerSet::default();
         let (a_ctrl, a_ev, _a_ui) = fake_peer();
         let (b_ctrl, b_ev, _b_ui) = fake_peer();
-        let a = peers.register(PeerRegistration::new(
+        let Registered::Added(a) = peers.register(PeerRegistration::new(
             a_ctrl,
             ClientIdentity::human("alice"),
-        ));
-        let b = peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")));
+        )) else {
+            unreachable!()
+        };
+        let Registered::Added(b) =
+            peers.register(PeerRegistration::new(b_ctrl, ClientIdentity::human("bob")))
+        else {
+            unreachable!()
+        };
 
         drop(a_ev);
         match peers.recv().await {
@@ -361,5 +412,59 @@ mod tests {
             }
             other => panic!("expected B's Notice, got {other:?}"),
         }
+    }
+
+    fn edge(
+        session_id: Option<&str>,
+        supervised: bool,
+    ) -> (PeerRegistration, mpsc::Receiver<UiEvent>) {
+        let (ctrl, _ev, ui_rx) = fake_peer();
+        let who = ClientIdentity {
+            session_id: session_id.map(String::from),
+            ..ClientIdentity::human("x")
+        };
+        (PeerRegistration::forward(ctrl, who, supervised), ui_rx)
+    }
+
+    #[tokio::test]
+    async fn a_stronger_edge_to_the_same_session_replaces_the_plain_one() {
+        let mut peers = PeerSet::default();
+        let (plain, mut plain_ui) = edge(Some("s"), false);
+        let (strong, _strong_ui) = edge(Some("s"), true);
+        assert_eq!(peers.register(plain), Registered::Added(0));
+        assert_eq!(peers.register(strong), Registered::Replaced(1));
+        assert_eq!(peers.infos().len(), 1);
+        assert!(peers.is_supervised(1));
+        assert!(
+            plain_ui.recv().await.is_none(),
+            "the old edge's controller must drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_weaker_or_equal_edge_to_the_same_session_is_rejected() {
+        let mut peers = PeerSet::default();
+        let (strong, _strong_ui) = edge(Some("s"), true);
+        let (plain, mut plain_ui) = edge(Some("s"), false);
+        let (again, _again_ui) = edge(Some("s"), true);
+        assert_eq!(peers.register(strong), Registered::Added(0));
+        assert_eq!(peers.register(plain), Registered::Rejected(0));
+        assert_eq!(peers.register(again), Registered::Rejected(0));
+        assert_eq!(peers.infos().len(), 1);
+        assert!(peers.is_supervised(0));
+        assert!(
+            plain_ui.recv().await.is_none(),
+            "the new edge's controller must drop"
+        );
+    }
+
+    #[test]
+    fn edges_without_a_session_id_are_never_deduplicated() {
+        let mut peers = PeerSet::default();
+        let (a, _a_ui) = edge(None, false);
+        let (b, _b_ui) = edge(None, true);
+        assert_eq!(peers.register(a), Registered::Added(0));
+        assert_eq!(peers.register(b), Registered::Added(1));
+        assert_eq!(peers.infos().len(), 2);
     }
 }
