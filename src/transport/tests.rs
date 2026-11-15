@@ -929,7 +929,8 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
                 text: "a-drives".into(),
             },
         )
-        .await;
+        .await
+        .unwrap();
     match timeout(Duration::from_secs(5), bb_b.loop_ui_rx.recv())
         .await
         .expect("B loop timeout")
@@ -965,7 +966,8 @@ async fn duplex_peer_edge_mutual_drive_and_observe_over_one_socket() {
                 text: "b-drives".into(),
             },
         )
-        .await;
+        .await
+        .unwrap();
     match timeout(Duration::from_secs(5), bb_a.loop_ui_rx.recv())
         .await
         .expect("A loop timeout")

@@ -3852,3 +3852,103 @@ async fn an_edge_queued_with_the_task_is_usable_from_the_first_request() {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+// Each request's system text and messages.
+type SeenRequests = Vec<(String, Vec<Message>)>;
+
+// Drops the peer's far end during the first request, so the edge closes mid-turn.
+struct DisconnectingProvider {
+    far_end: std::sync::Mutex<Option<mpsc::Receiver<UiEvent>>>,
+    responses: std::sync::Mutex<Vec<Response>>,
+    seen: std::sync::Arc<std::sync::Mutex<SeenRequests>>,
+}
+impl Provider for DisconnectingProvider {
+    async fn complete(&self, req: &Request<'_>) -> Result<Response> {
+        self.far_end.lock().unwrap().take();
+        let system = req.system.iter().map(|b| b.text.as_str()).collect();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((system, req.messages.to_vec()));
+        Ok(self.responses.lock().unwrap().remove(0))
+    }
+    async fn count_tokens(&self, _req: &Request<'_>) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+#[tokio::test]
+async fn message_to_a_peer_gone_mid_turn_fails_and_the_peer_is_reaped() {
+    let (session, dir) = mk_session();
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, peer_ui) = fake_peer();
+    peers.register(supervised_reg(peer_ctrl, agent_who("child-1")));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = DisconnectingProvider {
+        far_end: std::sync::Mutex::new(Some(peer_ui)),
+        responses: std::sync::Mutex::new(vec![
+            tool_use_response(
+                "MessagePeer",
+                serde_json::json!({"peer": "child-1", "message": "hi"}),
+            ),
+            end_turn_response("ok"),
+        ]),
+        seen: seen.clone(),
+    };
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, peers, None),
+    ));
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut reaped = false;
+    loop {
+        match agent_rx.recv().await {
+            Some(AgentEvent::Notice { text }) if text == "[peer child-1] disconnected" => {
+                reaped = true
+            }
+            Some(AgentEvent::TurnComplete) => break,
+            Some(_) => {}
+            None => panic!("loop ended early"),
+        }
+    }
+    assert!(reaped, "the reap is announced");
+
+    let requests = seen.lock().unwrap().clone();
+    assert!(requests[0].0.contains("child-1"), "{}", requests[0].0);
+    let result = requests[1]
+        .1
+        .iter()
+        .flat_map(|m| &m.content)
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+    assert_eq!(
+        result,
+        Some((
+            "Tool execution error: peer child-1 has disconnected".into(),
+            true
+        )),
+        "MessagePeer reports the lost send"
+    );
+    assert!(
+        !requests[1].0.contains("child-1"),
+        "the next request's roster drops it: {}",
+        requests[1].0
+    );
+
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

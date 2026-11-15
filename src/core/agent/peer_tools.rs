@@ -298,7 +298,7 @@ pub(super) async fn execute(
                 };
                 peers
                     .drive(id, UiEvent::UserMessage { text: text.clone() })
-                    .await;
+                    .await?;
                 return Ok(format!(
                     "already supervising {name}; it is now working on: {text}"
                 ));
@@ -364,7 +364,7 @@ pub(super) async fn execute(
                         text: message.to_string(),
                     },
                 )
-                .await;
+                .await?;
             Ok(format!("message sent to {peer}"))
         }
     }

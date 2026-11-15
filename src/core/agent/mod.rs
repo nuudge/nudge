@@ -201,6 +201,19 @@ async fn run_loop<P: Provider, B: Backend>(
             while let Some(reg) = peer_register_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
                 take_registration(reg, &mut peers, &agent_tx, &cfg, &backend).await;
             }
+            let gone = peers.reap_closed();
+            for name in &gone {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        text: format!("[peer {name}] disconnected"),
+                    })
+                    .await;
+            }
+            if !gone.is_empty() {
+                let _ = agent_tx
+                    .send(capabilities_event(&cfg, &backend, &peers))
+                    .await;
+            }
             let (mut tools, tool_cache_boundary) = backend.tool_schemas();
             tools.extend(peer_tools::schemas(&peers, &peer_factory, auto));
             let mut system = backend.system_blocks();
@@ -478,7 +491,7 @@ async fn run_loop<P: Provider, B: Backend>(
                 // Notices never reach a spawner's model, so wake it with a message or
                 // the child stalls until a human notices.
                 if let Some(spawner) = peers.spawner_id() {
-                    peers
+                    let _ = peers
                         .drive(
                             spawner,
                             UiEvent::UserMessage {

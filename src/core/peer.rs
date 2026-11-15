@@ -241,11 +241,30 @@ impl PeerSet {
         }
     }
 
-    // A failed send is harmless: the gone peer is reaped on the next `recv`.
-    pub async fn drive(&self, id: PeerId, ev: UiEvent) {
-        if let Some(p) = self.peers.get(&id) {
-            let _ = p.controller.ui_tx.send(ev).await;
+    pub async fn drive(&self, id: PeerId, ev: UiEvent) -> anyhow::Result<()> {
+        let sent = match self.peers.get(&id) {
+            Some(p) => p.controller.ui_tx.send(ev).await.is_ok(),
+            None => false,
+        };
+        if !sent {
+            anyhow::bail!("peer {} has disconnected", self.display_name(id));
         }
+        Ok(())
+    }
+
+    // `recv` sees an edge close only while the loop is idle, so mid-turn a gone peer would
+    // stay in the roster. Returns the reaped names.
+    pub fn reap_closed(&mut self) -> Vec<String> {
+        let closed: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.controller.ui_tx.is_closed())
+            .map(|(id, _)| *id)
+            .collect();
+        closed
+            .into_iter()
+            .filter_map(|id| self.peers.remove(&id).map(|p| p.who.name))
+            .collect()
     }
 
     pub fn remove(&mut self, id: PeerId) {
@@ -381,7 +400,8 @@ mod tests {
 
         peers
             .drive(id, UiEvent::UserMessage { text: "go".into() })
-            .await;
+            .await
+            .unwrap();
         match ui_rx.recv().await {
             Some(UiEvent::UserMessage { text }) => assert_eq!(text, "go"),
             other => panic!("expected driven UserMessage, got {other:?}"),
