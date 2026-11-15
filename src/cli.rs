@@ -47,8 +47,9 @@ pub struct Cli {
     #[arg(long)]
     pub print_prompt: bool,
 
-    /// Host the session headless; clients attach with --connect. Uses $NUDGE_RELAY,
-    /// or a local Unix socket when --socket is given.
+    /// Host the session headless; clients attach with --connect. Serves the session's
+    /// local socket and $NUDGE_RELAY (only the socket with --local), or a local Unix
+    /// socket at a custom path when --socket is given.
     #[arg(long, group = "run_mode")]
     pub daemon: bool,
 
@@ -80,8 +81,40 @@ pub struct Cli {
     #[arg(long, requires = "daemon", conflicts_with = "socket")]
     pub peer: bool,
 
-    /// Internal: a headless host started by `/connect-peer` for an ended session. It
-    /// exits when its last supervisor leaves.
-    #[arg(long, hide = true, requires = "resume", group = "run_mode")]
-    pub peer_host: bool,
+    /// (--daemon) Serve only the session's local socket and open no relay legs, even
+    /// with $NUDGE_RELAY set. Peers on this machine connect by session id or name.
+    #[arg(long, requires = "daemon", conflicts_with_all = ["socket", "watch", "peer"])]
+    pub local: bool,
+
+    /// Internal: exit when the last supervisor leaves, or when none attaches within a
+    /// grace period. Set on the host `/connect-peer` starts for an ended session.
+    #[arg(long, hide = true, requires_all = ["daemon", "resume"])]
+    pub needs_supervisor: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parses(args: &[&str]) -> bool {
+        Cli::try_parse_from(std::iter::once("nudge").chain(args.iter().copied())).is_ok()
+    }
+
+    #[test]
+    fn local_and_needs_supervisor_flag_rules() {
+        assert!(parses(&[
+            "--daemon",
+            "--local",
+            "--needs-supervisor",
+            "--resume",
+            "x"
+        ]));
+        assert!(!parses(&["--local"]));
+        for relay_only in ["--watch", "--peer"] {
+            assert!(!parses(&["--daemon", "--local", relay_only]));
+        }
+        assert!(!parses(&["--daemon", "--local", "--socket", "/tmp/s"]));
+        assert!(!parses(&["--daemon", "--needs-supervisor"]));
+        assert!(!parses(&["--needs-supervisor", "--resume", "x"]));
+    }
 }

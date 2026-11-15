@@ -136,6 +136,7 @@ driving their own sessions throughout.
 | `/connect-peer <code>` | dial an agent-peer code; one call, bidirectional edge |
 | `/peers` | list connected peers and spawned subagents |
 | `w` (background screen) | cycle the pairing QR: full-access → watch-only → agent-peer |
+| `--daemon --local` | headless session that only peers on this machine can connect to |
 | `--daemon --peer` | headless session that prints an agent-peer code |
 | `--daemon --watch` | …and/or a watch-only code |
 

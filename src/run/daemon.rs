@@ -6,7 +6,8 @@ use tokio::sync::watch;
 use crate::core::SessionHost;
 use crate::transport::{self, PairingScope};
 
-// The caller serves `socket`; with `socket_only` (`--socket`) there are no relay legs.
+// The caller serves `socket`; with `socket_only` (`--local`, `--socket`) there are no
+// relay legs.
 pub(super) async fn run(
     host: SessionHost,
     socket: &Path,
@@ -14,10 +15,23 @@ pub(super) async fn run(
     relay: Option<String>,
     watch: bool,
     peer_accept: Option<transport::PeerAccept>,
+    needs_supervisor: bool,
 ) -> Result<()> {
     let broker = host.broker_handle();
+    let supervisors = if needs_supervisor {
+        eprintln!("[daemon] waiting for a supervisor");
+        Some(
+            broker
+                .supervisors()
+                .await
+                .context("the session broker is gone")?,
+        )
+    } else {
+        None
+    };
     eprintln!("[daemon] listening on {}", socket.display());
-    // A controller leaving never ends the daemon; only a process signal does.
+    // Only a process signal or, with `needs_supervisor`, losing supervision ends the
+    // daemon; an ordinary controller leaving never does.
     let run = async move {
         if socket_only {
             broker.closed().await;
@@ -26,9 +40,8 @@ pub(super) async fn run(
         } else {
             // Dial OUT to the relay: the only direction that crosses NAT. Each scope
             // (full, watch, agent) gets its own room + key.
-            let base = relay.context(
-                "set NUDGE_RELAY to host over a relay, or pass --socket <path> for a local debug daemon",
-            )?;
+            let base =
+                relay.context("--daemon serves the relay too: set NUDGE_RELAY, or pass --local")?;
             let full = transport::Pairing::generate(base.clone());
             print_pairing(&full, "full-access")?;
             let mut legs = vec![transport::RelayLeg {
@@ -61,8 +74,18 @@ pub(super) async fn run(
             transport::run_relay_daemon(legs, broker).await
         }
     };
+    let supervised_out = async {
+        match supervisors {
+            Some(s) => wait_for_exit(s, SUPERVISOR_GRACE).await,
+            None => std::future::pending().await,
+        }
+    };
     let daemon_result = tokio::select! {
         r = run => r,
+        _ = supervised_out => {
+            eprintln!("[daemon] no supervisor left; stopping");
+            Ok(())
+        }
         _ = shutdown_signal() => {
             eprintln!("[daemon] shutdown signal received; stopping");
             Ok(())
@@ -72,26 +95,9 @@ pub(super) async fn run(
     daemon_result
 }
 
-// Long enough for the dialer that spawned this host to finish its handshake.
+// Long enough for the dialer that started this host (`--needs-supervisor`) to finish
+// its handshake.
 const SUPERVISOR_GRACE: Duration = Duration::from_secs(30);
-
-// Started by `connect_local` for an ended session; nobody else will ever quit it, so it
-// ends with its supervision. Shutting down marks the session ended.
-pub(super) async fn run_peer_host(host: SessionHost) -> Result<()> {
-    let supervisors = host
-        .broker_handle()
-        .supervisors()
-        .await
-        .context("the session broker is gone")?;
-    eprintln!("[peer-host] waiting for a supervisor");
-    tokio::select! {
-        _ = wait_for_exit(supervisors, SUPERVISOR_GRACE) => {
-            eprintln!("[peer-host] no supervisor left; stopping");
-        }
-        _ = shutdown_signal() => eprintln!("[peer-host] shutdown signal received; stopping"),
-    }
-    host.shutdown().await
-}
 
 // Resolves when no supervisor attached within `grace`, or once the last one detaches.
 async fn wait_for_exit(mut supervisors: watch::Receiver<usize>, grace: Duration) {

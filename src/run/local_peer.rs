@@ -90,7 +90,13 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", log_path.display()))?;
     let mut child =
         tokio::process::Command::new(std::env::current_exe().context("locating the nudge binary")?)
-            .args(["--peer-host", "--resume", &target.id])
+            .args([
+                "--daemon",
+                "--local",
+                "--needs-supervisor",
+                "--resume",
+                &target.id,
+            ])
             .current_dir(&target.cwd)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)

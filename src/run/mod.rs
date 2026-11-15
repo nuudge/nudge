@@ -217,7 +217,7 @@ pub async fn host(cli: Cli) -> Result<()> {
             identity: peer_identity,
             registrar: peer_reg_tx,
         });
-        let socket_only = cli.socket.is_some();
+        let socket_only = cli.local || cli.socket.is_some();
         daemon::run(
             host,
             &socket_path,
@@ -225,10 +225,9 @@ pub async fn host(cli: Cli) -> Result<()> {
             relay,
             cli.watch,
             peer_accept,
+            cli.needs_supervisor,
         )
         .await
-    } else if cli.peer_host {
-        daemon::run_peer_host(host).await
     } else {
         local::run(host, ui_cfg, who, relay, peer_identity, peer_reg_tx).await
     };
