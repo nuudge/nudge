@@ -25,7 +25,7 @@ pub fn bind_listener(path: &Path) -> Result<UnixListener> {
     let listener = match UnixListener::bind(path) {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            if crate::core::is_listening(path) {
                 anyhow::bail!("a session is already listening at {}", path.display());
             }
             std::fs::remove_file(path)

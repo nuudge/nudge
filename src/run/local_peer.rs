@@ -4,11 +4,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::net::UnixStream;
 
 use crate::coding;
 use crate::core::store::SessionRow;
-use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration, SpawnRequest, UiEvent};
+use crate::core::{
+    BrokerHandle, ClientIdentity, PeerRegistration, SpawnRequest, UiEvent, is_listening,
+};
 use crate::logging;
 use crate::transport::SocketClient;
 
@@ -108,18 +109,14 @@ where
     S: FnOnce() -> SF,
     SF: Future<Output = Result<()>>,
 {
-    if accepts(socket).await {
+    if is_listening(socket) {
         return dial.await;
     }
     let _lock = lock(socket.with_extension("lock")).await?;
-    if !accepts(socket).await {
+    if !is_listening(socket) {
         start().await?;
     }
     dial.await
-}
-
-pub(super) async fn accepts(socket: &Path) -> bool {
-    UnixStream::connect(socket).await.is_ok()
 }
 
 // `drop` runs before the fields drop, so the path is unlinked while `_file` still holds
@@ -185,7 +182,7 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
 
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
-        if accepts(socket).await {
+        if is_listening(socket) {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {

@@ -47,7 +47,7 @@ pub async fn host(cli: Cli) -> Result<()> {
     let socket_path = coding::session_socket_path(&session.id)?;
     // Refuses before the log is opened, so a second host can't trim or mark a live
     // session's log. Two hosts racing through MCP setup both pass; bind_listener decides.
-    if local_peer::accepts(&socket_path).await {
+    if core::is_listening(&socket_path) {
         anyhow::bail!("session {} is already running", session.id);
     }
     let mode = if cli.daemon || cli.print_prompt {
