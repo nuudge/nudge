@@ -180,6 +180,11 @@ async fn run_loop<P: Provider, B: Backend>(
         }
 
         // The log stores clean text + sender; only the model-facing copy is attributed.
+        tracing::info!(
+            sender = who.as_ref().map_or("-", |w| w.name.as_str()),
+            sender_session = ?who.as_ref().and_then(|w| w.session_id.as_deref()),
+            "turn started"
+        );
         messages.push(Message {
             role: "user".into(),
             content: vec![ContentBlock::Text { text: user_text }],
@@ -242,6 +247,7 @@ async fn run_loop<P: Provider, B: Backend>(
             let resp = match provider.complete(&req).await {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "turn rolled back: the API call failed");
                     let _ = agent_tx
                         .send(AgentEvent::Error {
                             message: format!("{e:#}"),
@@ -537,7 +543,21 @@ async fn take_registration<B: Backend>(
     backend: &B,
 ) {
     let name = reg.who.name.clone();
-    let text = match peers.register(reg) {
+    let session = reg.who.session_id.clone();
+    let supervised = reg.supervised;
+    let registered = peers.register(reg);
+    tracing::info!(
+        peer = %name,
+        session = ?session,
+        supervised,
+        outcome = match registered {
+            Registered::Added(_) => "added",
+            Registered::Replaced(_) => "replaced",
+            Registered::Rejected(_) => "rejected",
+        },
+        "peer edge registered"
+    );
+    let text = match registered {
         Registered::Added(_) => format!("connected to peer {name}"),
         Registered::Replaced(id) => format!(
             "replaced the unsupervised edge to {} with a {} one",

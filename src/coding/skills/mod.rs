@@ -31,7 +31,7 @@ struct Frontmatter {
 pub struct SkillRegistry {
     /// Sorted so the `use_skill` description is byte-stable for caching.
     skills: BTreeMap<String, Skill>,
-    /// Printed before the TUI starts so a malformed SKILL.md fails loudly.
+    /// Written to the session log by the caller.
     pub discovery_log: Vec<String>,
 }
 

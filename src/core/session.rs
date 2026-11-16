@@ -114,11 +114,10 @@ impl Session {
 
     // `message` must be the clean, unattributed form (see `LoggedMessage`). Serialized
     // once and stored byte-exact, which the floating cache breakpoint depends on.
-    pub fn log_from(&mut self, message: &Message, sender: Option<&ClientIdentity>) -> Result<()> {
+    pub fn log_from(&mut self, message: &Message, sender: Option<&ClientIdentity>) -> Result<i64> {
         let content = serde_json::to_string(message).context("serializing message")?;
         self.store
-            .append_message(&self.id, &message.role, &content, sender)?;
-        Ok(())
+            .append_message(&self.id, &message.role, &content, sender)
     }
 
     // `message` must be the clean, unattributed form (see `LoggedMessage`).
@@ -127,8 +126,13 @@ impl Session {
     }
 
     pub fn commit(&mut self) -> Result<()> {
+        let mut ordinals = None;
         for (message, sender) in std::mem::take(&mut self.staged) {
-            self.log_from(&message, sender.as_ref())?;
+            let ordinal = self.log_from(&message, sender.as_ref())?;
+            ordinals = Some((ordinals.map_or(ordinal, |(first, _)| first), ordinal));
+        }
+        if let Some((first, last)) = ordinals {
+            tracing::info!(first, last, "turn committed");
         }
         Ok(())
     }

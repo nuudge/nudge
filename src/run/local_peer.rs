@@ -1,21 +1,20 @@
 use anyhow::{Context, Result};
 use std::future::Future;
-use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::net::UnixStream;
 
 use crate::coding;
 use crate::core::store::SessionRow;
 use crate::core::{BrokerHandle, ClientIdentity, PeerRegistration, SpawnRequest, UiEvent};
+use crate::logging;
 use crate::transport::SocketClient;
 
 // Covers the MCP bootstrap, which runs before the host binds its socket.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_TAIL_LINES: usize = 10;
-const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // Makes a session on this machine a peer of this one over its socket, starting it
 // headless first if it has ended.
@@ -51,14 +50,16 @@ pub(super) async fn spawn_child(
     };
     let socket = coding::session_socket_path(&row.id)?;
     let client = SocketClient::new(socket.clone());
-    claim(
+    let reg = claim(
         &row,
         &socket,
         || start_host(&row, &socket),
         client.dial_peer(self_broker, who),
         task,
     )
-    .await
+    .await?;
+    tracing::info!(session = %row.id, name = ?row.name, "spawned child");
+    Ok(reg)
 }
 
 // The target grants supervision only when nothing else answers its prompts, so a refused
@@ -159,31 +160,11 @@ async fn lock(path: PathBuf) -> Result<RunLock> {
     .context("lock task panicked")?
 }
 
-// Best-effort: housekeeping must never stop a session from starting.
-fn prune_logs(dir: &Path, now: SystemTime) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "log")
-            && let Ok(modified) = entry.metadata().and_then(|m| m.modified())
-            && now
-                .duration_since(modified)
-                .is_ok_and(|age| age > LOG_RETENTION)
-        {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
     let label = label(target);
-    if let Some(dir) = socket.parent() {
-        prune_logs(dir, SystemTime::now());
-    }
+    tracing::info!(session = %target.id, cwd = %target.cwd, "starting a background host");
     let log_path = socket.with_extension("log");
-    let log = open_run_log(&log_path, chrono::Local::now())?;
+    let log = logging::open_run_log(&log_path, chrono::Local::now())?;
     let mut child =
         tokio::process::Command::new(std::env::current_exe().context("locating the nudge binary")?)
             .args([
@@ -210,7 +191,7 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
                 "session {label} exited ({status}) before it started listening:\n{}",
-                log_tail(&log_path)
+                logging::log_tail(&log_path, LOG_TAIL_LINES)
             );
         }
         if tokio::time::Instant::now() >= deadline {
@@ -219,7 +200,7 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
             anyhow::bail!(
                 "session {label} didn't start within {}s:\n{}",
                 START_TIMEOUT.as_secs(),
-                log_tail(&log_path)
+                logging::log_tail(&log_path, LOG_TAIL_LINES)
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -229,32 +210,6 @@ async fn start_host(target: &SessionRow, socket: &Path) -> Result<()> {
 // The full id, not a prefix, so the label also works as a `--resume` argument.
 pub(super) fn label(target: &SessionRow) -> String {
     target.name.clone().unwrap_or_else(|| target.id.clone())
-}
-
-const RUN_SEPARATOR: &str = "--- started ";
-
-// Appended, so a revived session's log still shows how its previous run ended.
-fn open_run_log(path: &Path, now: chrono::DateTime<chrono::Local>) -> Result<std::fs::File> {
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(log, "{RUN_SEPARATOR}{} ---", now.to_rfc3339())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(log)
-}
-
-// Only the current run: earlier runs' lines would misreport why this one failed.
-fn log_tail(path: &Path) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    let run_start = lines
-        .iter()
-        .rposition(|l| l.starts_with(RUN_SEPARATOR))
-        .map_or(0, |i| i + 1);
-    let run = &lines[run_start..];
-    run[run.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }
 
 #[cfg(test)]
@@ -377,57 +332,6 @@ mod tests {
             locker.await.unwrap();
         }
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn a_restart_appends_to_the_log_and_the_tail_is_the_current_run() {
-        let path =
-            std::env::temp_dir().join(format!("lp-log-{}.log", uuid::Uuid::new_v4().simple()));
-        let mut first = open_run_log(&path, chrono::Local::now()).unwrap();
-        writeln!(
-            first,
-            "[daemon] no one left to answer its prompts; stopping"
-        )
-        .unwrap();
-        drop(first);
-        let mut second = open_run_log(&path, chrono::Local::now()).unwrap();
-        writeln!(second, "error: bad config").unwrap();
-        drop(second);
-
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("stopping"), "the earlier run is kept: {text}");
-        assert_eq!(text.matches(RUN_SEPARATOR).count(), 2, "{text}");
-        assert_eq!(log_tail(&path), "error: bad config");
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn prune_logs_removes_only_old_logs() {
-        let dir = std::env::temp_dir().join(format!("lp-prune-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir(&dir).unwrap();
-        let now = SystemTime::now();
-        let old = now - LOG_RETENTION - Duration::from_secs(60);
-        for (name, modified) in [
-            ("old.log", old),
-            ("new.log", now),
-            ("old.lock", old),
-            ("old.sock", old),
-        ] {
-            std::fs::File::create(dir.join(name))
-                .unwrap()
-                .set_modified(modified)
-                .unwrap();
-        }
-
-        prune_logs(&dir, now);
-        let mut left: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        left.sort();
-        assert_eq!(left, ["new.log", "old.lock", "old.sock"]);
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn child_row() -> SessionRow {

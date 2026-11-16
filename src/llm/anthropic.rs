@@ -331,16 +331,46 @@ impl Provider for AnthropicProvider {
         if let Some(beta) = beta_header(&body) {
             post = post.header("anthropic-beta", beta);
         }
-        let resp = post
-            .json(&body)
-            .send()
-            .await
-            .context("API request failed")?;
-        let resp: MessagesResponse = check_status(resp, "API")
-            .await?
-            .json()
-            .await
-            .context("failed to parse API response")?;
+        let started = std::time::Instant::now();
+        let mut request_id = None;
+        let result = async {
+            let resp = post
+                .json(&body)
+                .send()
+                .await
+                .context("API request failed")?;
+            request_id = resp
+                .headers()
+                .get("request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            check_status(resp, "API")
+                .await?
+                .json::<MessagesResponse>()
+                .await
+                .context("failed to parse API response")
+        }
+        .await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let request_id = request_id.as_deref().unwrap_or("-");
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(model = req.model, request_id, latency_ms, error = %format!("{e:#}"), "API call failed");
+                return Err(e);
+            }
+        };
+        tracing::info!(
+            model = req.model,
+            request_id,
+            latency_ms,
+            input_tokens = resp.usage.input_tokens,
+            output_tokens = resp.usage.output_tokens,
+            cache_read = resp.usage.cache_read_input_tokens,
+            cache_write = resp.usage.cache_creation_input_tokens,
+            stop_reason = %resp.stop_reason,
+            "API call"
+        );
         Ok(Response {
             content: resp.content,
             stop_reason: resp.stop_reason,

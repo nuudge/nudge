@@ -6,6 +6,7 @@ mod coding;
 mod config;
 mod core;
 mod llm;
+mod logging;
 mod models;
 mod run;
 mod sessions;
@@ -20,14 +21,28 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // --list and --attach run before `run::host`: they need no API key or session.
+    // These run before `run::host`: they need no API key or session.
     if cli.list {
         return sessions::print_sessions();
+    }
+
+    if cli.prune_logs {
+        return sessions::prune_logs(cli.older_than.unwrap_or(logging::DEFAULT_PRUNE_AGE));
+    }
+
+    if let Some(reference) = &cli.log {
+        return sessions::print_log(reference);
     }
 
     if let Some(target) = &cli.attach {
         return run::attach::run(target, &cli).await;
     }
 
-    run::host(cli).await
+    // A no-op if the host failed before it installed the logger.
+    let result = run::host(cli).await;
+    match &result {
+        Ok(()) => tracing::info!("session host stopped"),
+        Err(e) => tracing::error!(error = %format!("{e:#}"), "session host failed"),
+    }
+    result
 }

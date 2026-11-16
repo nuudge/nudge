@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use std::time::Duration;
 
 /// Thinking display mode.
 #[derive(Clone, ValueEnum)]
@@ -86,6 +87,36 @@ pub struct Cli {
     /// the host `/connect-peer` starts for an ended session.
     #[arg(long, hide = true, requires_all = ["daemon", "resume"])]
     pub needs_answerer: bool,
+
+    /// Delete the logs of sessions that aren't running and haven't written for
+    /// --older-than (default 14d), then exit.
+    #[arg(long)]
+    pub prune_logs: bool,
+
+    /// (--prune-logs) Minimum age of a log to delete, e.g. 7d or 12h; 0d takes them all.
+    #[arg(long, value_name = "age", requires = "prune_logs", value_parser = parse_age)]
+    pub older_than: Option<Duration>,
+
+    /// Print the current run's log of a session: an id or short id (any project) or name
+    /// (this directory), then exit.
+    #[arg(long, value_name = "id|name")]
+    pub log: Option<String>,
+}
+
+fn parse_age(s: &str) -> Result<Duration, String> {
+    let (n, unit_secs) = if let Some(n) = s.strip_suffix('d') {
+        (n, 24 * 60 * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 60 * 60)
+    } else {
+        return Err(format!("expected a d or h suffix, e.g. 7d, got {s:?}"));
+    };
+    let n: u64 = n
+        .parse()
+        .map_err(|_| format!("expected a number then d or h, e.g. 7d, got {s:?}"))?;
+    n.checked_mul(unit_secs)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("{s:?} is too long"))
 }
 
 #[cfg(test)]
@@ -139,6 +170,25 @@ mod tests {
         }
         assert!(parse(&["--daemon", "--needs-answerer"]).is_err());
         assert!(parse(&["--needs-answerer", "--resume", "x"]).is_err());
+    }
+
+    #[test]
+    fn prune_logs_takes_an_optional_age() {
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert!(parse(&["--prune-logs"]).unwrap().older_than.is_none());
+        let cli = parse(&["--prune-logs", "--older-than", "7d"]).unwrap();
+        assert_eq!(cli.older_than, Some(7 * day));
+        let cli = parse(&["--prune-logs", "--older-than", "12h"]).unwrap();
+        assert_eq!(cli.older_than, Some(day / 2));
+        let cli = parse(&["--prune-logs", "--older-than", "0d"]).unwrap();
+        assert_eq!(cli.older_than, Some(Duration::ZERO));
+        for bad in ["7", "d", "7w", "-1d", "", "7日", "99999999999999999d"] {
+            assert!(
+                parse(&["--prune-logs", "--older-than", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse(&["--older-than", "7d"]).is_err());
     }
 
     #[test]

@@ -95,7 +95,7 @@ async fn revive_saved_credentials(
     match am.refresh_token().await {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("[mcp] {name}: cached token refresh failed ({e}); re-authorizing");
+            tracing::warn!("[mcp] {name}: cached token refresh failed ({e}); re-authorizing");
             return None;
         }
     }

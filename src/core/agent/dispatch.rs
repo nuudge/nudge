@@ -1,3 +1,4 @@
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::events::AgentEvent;
@@ -37,11 +38,14 @@ pub(super) async fn dispatch_tools<B: Backend>(
                 summary,
             })
             .await;
+        tracing::info!(tool = %name, tool_use_id = %id, "tool started");
+        let started = Instant::now();
 
         if denied {
             // The API requires a tool_result per tool_use_id.
             let content =
                 "Cancelled: a prior tool call in this turn was denied by the user.".to_string();
+            tracing::info!(tool = %name, tool_use_id = %id, "tool cancelled after a denial");
             let _ = agent_tx
                 .send(AgentEvent::ToolResult {
                     id: id.clone(),
@@ -106,6 +110,14 @@ pub(super) async fn dispatch_tools<B: Backend>(
             }
         };
 
+        tracing::info!(
+            tool = %name,
+            tool_use_id = %id,
+            duration_ms = started.elapsed().as_millis() as u64,
+            ok = !is_error,
+            output_bytes = content.len(),
+            "tool finished"
+        );
         let _ = agent_tx
             .send(AgentEvent::ToolResult {
                 id: id.clone(),

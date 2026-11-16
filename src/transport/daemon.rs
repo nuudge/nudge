@@ -107,7 +107,11 @@ pub struct PeerAccept {
 pub async fn run_relay_daemon(legs: Vec<RelayLeg>, broker: BrokerHandle) -> Result<()> {
     let mut tasks = Vec::new();
     for leg in legs {
-        eprintln!("[daemon] hosting over relay at {}", leg.dial_url);
+        tracing::info!(
+            grant = leg.profile.grant_name(),
+            agent_peers = leg.peer_accept.is_some(),
+            "relay leg opened"
+        );
         let broker = broker.clone();
         tasks.push(tokio::spawn(async move {
             relay_dial_loop(
@@ -137,6 +141,11 @@ pub async fn serve_relay_handoff(
     profile: ClientProfile,
     peer_accept: Option<PeerAccept>,
 ) {
+    tracing::info!(
+        grant = profile.grant_name(),
+        agent_peers = peer_accept.is_some(),
+        "relay leg opened"
+    );
     relay_dial_loop(
         relay_url,
         cipher,
@@ -221,11 +230,12 @@ async fn relay_dial_loop(
             Err(e) => match &status {
                 // Live bridges keep running; the next /background re-arms.
                 Some(s) => {
+                    tracing::warn!(grant = profile.grant_name(), error = %e, "relay dial failed");
                     let _ = s.send(HandoffStatus::Failed(format!("{e}"))).await;
                     break;
                 }
                 None => {
-                    eprintln!("[daemon] relay dial failed: {e:#}; retrying in 2s");
+                    tracing::warn!(grant = profile.grant_name(), error = %e, "relay dial failed; retrying in 2s");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             },

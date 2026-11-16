@@ -177,7 +177,7 @@ pub struct McpRegistry {
     /// Keyed by namespaced tool name.
     routes: HashMap<String, Route>,
     dormant: BTreeMap<String, ServerSpec>,
-    /// Emitted by the caller before the TUI starts.
+    /// Written to the session log by the caller.
     pub connect_log: Vec<String>,
 }
 

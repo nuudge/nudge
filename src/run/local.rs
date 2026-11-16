@@ -101,6 +101,7 @@ pub(super) async fn run(
         .await
         .expect("initial attach on a fresh session cannot be busy");
     let tui_result = tui::run(&host, ui_cfg, who, controller, handoff_rx).await;
+    tracing::info!("stopping: the TUI closed");
     // The loop outlives the front-end, so end the session explicitly.
     let _ = host.shutdown().await;
     tui_result

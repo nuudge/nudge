@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
+use tracing::info;
 
 use super::agent::{
     AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, requests_session_picker,
@@ -307,10 +309,13 @@ impl SessionHandle for BrokerHandle {
 
 // Terminates the permission `oneshot`: the broker keeps the Sender until the matching
 // PermissionResponse arrives.
-fn translate(
-    ev: AgentEvent,
-    pending: &mut HashMap<String, (oneshot::Sender<bool>, String)>,
-) -> ControllerEvent {
+struct PendingPrompt {
+    respond: oneshot::Sender<bool>,
+    tool_name: String,
+    asked: Instant,
+}
+
+fn translate(ev: AgentEvent, pending: &mut HashMap<String, PendingPrompt>) -> ControllerEvent {
     match ev {
         AgentEvent::SessionInfo {
             model,
@@ -360,7 +365,15 @@ fn translate(
             summary,
             respond,
         } => {
-            pending.insert(tool_use_id.clone(), (respond, tool_name.clone()));
+            info!(tool = %tool_name, tool_use_id = %tool_use_id, "permission requested");
+            pending.insert(
+                tool_use_id.clone(),
+                PendingPrompt {
+                    respond,
+                    tool_name: tool_name.clone(),
+                    asked: Instant::now(),
+                },
+            );
             ControllerEvent::PermissionRequest {
                 tool_use_id,
                 tool_name,
@@ -425,7 +438,19 @@ fn fan_out(attached: &mut HashMap<ControllerId, ControllerChannels>, ev: &Contro
         }
     }
     for id in dead {
-        attached.remove(&id);
+        detach(attached, id);
+    }
+}
+
+fn detach(attached: &mut HashMap<ControllerId, ControllerChannels>, id: ControllerId) {
+    if let Some(c) = attached.remove(&id) {
+        info!(
+            client = %c.who.name,
+            kind = ?c.who.kind,
+            session = ?c.who.session_id,
+            grant = c.profile.grant_name(),
+            "controller detached"
+        );
     }
 }
 
@@ -470,7 +495,7 @@ async fn broker(
         multi_driver.store(true, Ordering::Relaxed);
     }
     let mut buffer: Vec<ControllerEvent> = seed;
-    let mut pending: HashMap<String, (oneshot::Sender<bool>, String)> = HashMap::new();
+    let mut pending: HashMap<String, PendingPrompt> = HashMap::new();
     // The loop takes commands in the order they're forwarded and answers each bare
     // `/connect-peer` with exactly one SessionPicker, so replies pop in order.
     let mut picker_requesters: std::collections::VecDeque<ControllerId> = Default::default();
@@ -496,6 +521,7 @@ async fn broker(
                         (ui_rx, event_tx, who, profile, false, ack)
                     }
                     Some(HostCommand::Quit) | None => {
+                        info!("session shutting down");
                         let _ = loop_ui_tx.send((None, UiEvent::Quit)).await;
                         return;
                     }
@@ -519,6 +545,14 @@ async fn broker(
                 }
                 let id = next_id;
                 next_id += 1;
+                info!(
+                    client = %who.name,
+                    kind = ?who.kind,
+                    session = ?who.session_id,
+                    grant = profile.grant_name(),
+                    replay,
+                    "controller attached"
+                );
                 attached.insert(id, ControllerChannels { ui_rx, event_tx, who, profile: profile.clone() });
                 let _ = ack.send(profile);
             }
@@ -557,9 +591,23 @@ async fn broker(
                                     text: "answering permission prompts is not permitted for this client".into(),
                                 });
                             }
-                        } else if let Some((tx, tool_name)) = pending.remove(&tool_use_id) {
-                            let _ = tx.send(allow);
-                            let resolved = ControllerEvent::PermissionResolved { tool_name, allow };
+                        } else if let Some(prompt) = pending.remove(&tool_use_id) {
+                            let _ = prompt.respond.send(allow);
+                            if let Some(c) = attached.get(&id) {
+                                info!(
+                                    tool = %prompt.tool_name,
+                                    tool_use_id = %tool_use_id,
+                                    allow,
+                                    by = %c.who.name,
+                                    by_session = ?c.who.session_id,
+                                    wait_ms = prompt.asked.elapsed().as_millis() as u64,
+                                    "permission resolved"
+                                );
+                            }
+                            let resolved = ControllerEvent::PermissionResolved {
+                                tool_name: prompt.tool_name,
+                                allow,
+                            };
                             buffer.push(resolved.clone());
                             fan_out(&mut attached, &resolved);
                         }
@@ -597,6 +645,7 @@ async fn broker(
                             .unwrap_or(false);
                         if allowed {
                             let who = attached.get(&id).map(|c| c.who.clone());
+                            info!(by = ?who.as_ref().map(|w| &w.name), "quit requested");
                             let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
                         } else if let Some(c) = attached.get(&id) {
                             let _ = c.event_tx.send(ControllerEvent::Notice {
@@ -623,12 +672,14 @@ async fn broker(
                             });
                         }
                     }
-                    None => { attached.remove(&id); }
+                    None => detach(&mut attached, id),
                 }
             }
         }
         let count = attached.values().filter(|c| answers(c)).count();
-        answerers.send_if_modified(|n| std::mem::replace(n, count) != count);
+        if answerers.send_if_modified(|n| std::mem::replace(n, count) != count) {
+            info!(count, "answerers changed");
+        }
     }
 }
 

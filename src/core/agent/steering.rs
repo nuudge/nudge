@@ -41,6 +41,13 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     checkin: CheckIn,
 ) -> Result<()> {
     let name = peers.display_name(checkin.pid);
+    tracing::info!(
+        peer = %name,
+        session = ?peers.session_id(checkin.pid),
+        tool = %checkin.tool_name,
+        tool_use_id = %checkin.tool_use_id,
+        "peer check-in"
+    );
     let digest = peers.drain_activity(checkin.pid);
 
     let mut text = format!(
@@ -163,6 +170,13 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
 
     // The peer paused on denial, so a redirect message sent right after becomes its
     // next instruction.
+    tracing::info!(
+        peer = %name,
+        tool_use_id = %checkin.tool_use_id,
+        allow,
+        redirected = message.is_some(),
+        "check-in decided"
+    );
     let _ = peers
         .drive(
             checkin.pid,
@@ -289,6 +303,7 @@ async fn settle_unjudged(
 ) -> Result<()> {
     messages.truncate(last_good_snapshot);
     session.rollback();
+    tracing::error!(peer = %name, tool_use_id = %checkin.tool_use_id, reason, "check-in turn rolled back");
     if auto {
         let _ = agent_tx
             .send(AgentEvent::Notice {
