@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::agent::{
     AgentConfig, AgentIo, Backend, LoopInput, pre_approves_permissions, requests_session_picker,
@@ -391,8 +391,16 @@ fn translate(ev: AgentEvent, pending: &mut HashMap<String, PendingPrompt>) -> Co
         },
         AgentEvent::TurnComplete => ControllerEvent::TurnComplete,
         AgentEvent::MaxIterations => ControllerEvent::MaxIterations,
-        AgentEvent::Notice { text } => ControllerEvent::Notice { text },
-        AgentEvent::Error { message } => ControllerEvent::Error { message },
+        AgentEvent::Notice { log, text } => {
+            if log {
+                info!(text = %text, "notice");
+            }
+            ControllerEvent::Notice { text }
+        }
+        AgentEvent::Error { message } => {
+            warn!(message = %message, "error sent to controllers");
+            ControllerEvent::Error { message }
+        }
         AgentEvent::SessionPicker { sessions } => ControllerEvent::SessionPicker { sessions },
     }
 }
@@ -587,9 +595,7 @@ async fn broker(
                             .unwrap_or(false);
                         if !may_answer {
                             if let Some(c) = attached.get(&id) {
-                                let _ = c.event_tx.send(ControllerEvent::Notice {
-                                    text: "answering permission prompts is not permitted for this client".into(),
-                                });
+                                refuse(c, "answering permission prompts is not permitted for this client");
                             }
                         } else if let Some(prompt) = pending.remove(&tool_use_id) {
                             let _ = prompt.respond.send(allow);
@@ -621,9 +627,7 @@ async fn broker(
                             .unwrap_or(false);
                         if !allowed {
                             if let Some(c) = attached.get(&id) {
-                                let _ = c.event_tx.send(ControllerEvent::Notice {
-                                    text: "this client is watch-only and cannot send messages".into(),
-                                });
+                                refuse(c, "this client is watch-only and cannot send messages");
                             }
                         } else {
                             let who = attached.get(&id).map(|c| c.who.clone());
@@ -648,9 +652,7 @@ async fn broker(
                             info!(by = ?who.as_ref().map(|w| &w.name), "quit requested");
                             let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
                         } else if let Some(c) = attached.get(&id) {
-                            let _ = c.event_tx.send(ControllerEvent::Notice {
-                                text: "quit is not permitted for agent clients".into(),
-                            });
+                            refuse(c, "quit is not permitted for agent clients");
                         }
                     }
                     Some(UiEvent::Command { line }) => {
@@ -667,9 +669,7 @@ async fn broker(
                                 picker_requesters.push_back(id);
                             }
                         } else if let Some(c) = attached.get(&id) {
-                            let _ = c.event_tx.send(ControllerEvent::Notice {
-                                text: "commands are not permitted for this client".into(),
-                            });
+                            refuse(c, "commands are not permitted for this client");
                         }
                     }
                     None => detach(&mut attached, id),
@@ -681,6 +681,13 @@ async fn broker(
             info!(count, "answerers changed");
         }
     }
+}
+
+fn refuse(c: &ControllerChannels, text: &str) {
+    info!(client = %c.who.name, session = ?c.who.session_id, text, "refused");
+    let _ = c
+        .event_tx
+        .send(ControllerEvent::Notice { text: text.into() });
 }
 
 // A dropped front-end lingers until reaped; it answers nothing.
@@ -988,6 +995,7 @@ mod tests {
 
         loop_agent_tx
             .send(AgentEvent::Notice {
+                log: true,
                 text: "peer did a thing".into(),
             })
             .await
@@ -1599,6 +1607,7 @@ mod tests {
 
         loop_agent_tx
             .send(AgentEvent::Notice {
+                log: true,
                 text: "still here".into(),
             })
             .await
@@ -1686,6 +1695,7 @@ mod tests {
 
         loop_agent_tx
             .send(AgentEvent::Notice {
+                log: true,
                 text: "live".into(),
             })
             .await

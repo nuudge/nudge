@@ -41,13 +41,6 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     checkin: CheckIn,
 ) -> Result<()> {
     let name = peers.display_name(checkin.pid);
-    tracing::info!(
-        peer = %name,
-        session = ?peers.session_id(checkin.pid),
-        tool = %checkin.tool_name,
-        tool_use_id = %checkin.tool_use_id,
-        "peer check-in"
-    );
     let digest = peers.drain_activity(checkin.pid);
 
     let mut text = format!(
@@ -130,6 +123,11 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         .await;
     };
 
+    let verdict_name = match &verdict {
+        Verdict::Approve => "approve",
+        Verdict::Deny(_) => "deny",
+        Verdict::Escalate => "escalate",
+    };
     let (allow, message, closing) = match verdict {
         Verdict::Approve => (
             true,
@@ -152,6 +150,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         Verdict::Escalate => {
             let _ = agent_tx
                 .send(AgentEvent::Notice {
+                    log: true,
                     text: format!("escalating peer {name}'s {} call to you", checkin.tool_name),
                 })
                 .await;
@@ -170,11 +169,14 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
 
     // The peer paused on denial, so a redirect message sent right after becomes its
     // next instruction.
+    let peer_session = peers.session_id(checkin.pid).map(String::from);
     tracing::info!(
         peer = %name,
+        session = ?peer_session,
+        tool = %checkin.tool_name,
         tool_use_id = %checkin.tool_use_id,
+        verdict = verdict_name,
         allow,
-        redirected = message.is_some(),
         "check-in decided"
     );
     let _ = peers
@@ -187,6 +189,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         )
         .await;
     if !allow && let Some(m) = message.filter(|m| !m.is_empty()) {
+        tracing::info!(peer = %name, session = ?peer_session, tool = %checkin.tool_name, "redirect sent");
         let _ = peers
             .drive(checkin.pid, UiEvent::UserMessage { text: m })
             .await;
@@ -225,7 +228,12 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     *last_good_snapshot = messages.len();
     session.commit()?;
 
-    let _ = agent_tx.send(AgentEvent::Notice { text: closing }).await;
+    let _ = agent_tx
+        .send(AgentEvent::Notice {
+            log: false,
+            text: closing,
+        })
+        .await;
     Ok(())
 }
 
@@ -307,6 +315,7 @@ async fn settle_unjudged(
     if auto {
         let _ = agent_tx
             .send(AgentEvent::Notice {
+                log: true,
                 text: format!(
                     "couldn't decide peer {name}'s {} call ({reason}) — told it to skip the step and report it",
                     checkin.tool_name
@@ -334,6 +343,7 @@ async fn settle_unjudged(
     }
     let _ = agent_tx
         .send(AgentEvent::Notice {
+            log: true,
             text: format!(
                 "couldn't decide peer {name}'s {} call ({reason}) — escalating to you",
                 checkin.tool_name

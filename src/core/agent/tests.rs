@@ -262,7 +262,7 @@ async fn peer_activity_surfaces_as_a_notice() {
 
     let mut saw = None;
     while let Some(ev) = agent_rx.recv().await {
-        if let AgentEvent::Notice { text } = ev {
+        if let AgentEvent::Notice { text, .. } = ev {
             if text.contains("connected to peer") {
                 continue;
             }
@@ -777,7 +777,7 @@ async fn answer_escalation(
                 respond.send(allow).unwrap();
                 return (summary, notices);
             }
-            Some(AgentEvent::Notice { text }) => notices.push(text),
+            Some(AgentEvent::Notice { text, .. }) => notices.push(text),
             Some(_) => {}
             None => panic!("loop ended before escalation"),
         }
@@ -946,8 +946,8 @@ async fn unsupervised_check_in_is_not_answered() {
 
     loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) if text.contains("sentinel") => break,
-            Some(AgentEvent::Notice { text }) => {
+            Some(AgentEvent::Notice { text, .. }) if text.contains("sentinel") => break,
+            Some(AgentEvent::Notice { text, .. }) => {
                 assert!(
                     !text.contains("asks to use"),
                     "unsupervised prompt must not narrate: {text}"
@@ -962,6 +962,41 @@ async fn unsupervised_check_in_is_not_answered() {
     task.await.unwrap().unwrap();
     assert!(peer_ui.recv().await.is_none(), "peer must not be answered");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn relayed_peer_content_is_kept_out_of_the_log() {
+    let mut peers = PeerSet::default();
+    let (peer_ctrl, _peer_ev, _peer_ui) = fake_peer();
+    peers.register(PeerRegistration::forward(
+        peer_ctrl,
+        agent_who("child-1"),
+        true,
+    ));
+    let pid = peers.find("child-1").unwrap().unwrap();
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+
+    for ev in [
+        ControllerEvent::AssistantText {
+            text: "the plan".into(),
+        },
+        ControllerEvent::ToolUseStart {
+            id: "t1".into(),
+            name: "Bash".into(),
+            summary: "rm -rf build".into(),
+        },
+        ControllerEvent::PermissionRequest {
+            tool_use_id: "t2".into(),
+            tool_name: "Bash".into(),
+            summary: "rm -rf build".into(),
+        },
+    ] {
+        super::supervision::supervise_peer_event(&mut peers, &agent_tx, pid, Some(ev)).await;
+        match agent_rx.try_recv() {
+            Ok(AgentEvent::Notice { log, .. }) => assert!(!log),
+            other => panic!("expected a Notice, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -1716,7 +1751,7 @@ async fn spawn_tool_gates_then_registers_the_child() {
         .unwrap();
     loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) if text.contains("child-test") => break,
+            Some(AgentEvent::Notice { text, .. }) if text.contains("child-test") => break,
             Some(_) => {}
             None => panic!("expected the registered child's Notice"),
         }
@@ -2110,7 +2145,7 @@ async fn peers_command_reports_the_roster() {
         .await
         .unwrap();
     match agent_rx.recv().await {
-        Some(AgentEvent::Notice { text }) => {
+        Some(AgentEvent::Notice { text, .. }) => {
             assert!(text.contains("child-1"), "roster names the peer: {text}");
             assert!(text.contains("agent"), "roster shows the kind: {text}");
             assert!(
@@ -2150,7 +2185,7 @@ async fn peers_command_with_no_peers_says_so() {
         .await
         .unwrap();
     match agent_rx.recv().await {
-        Some(AgentEvent::Notice { text }) => assert_eq!(text, "no peers held"),
+        Some(AgentEvent::Notice { text, .. }) => assert_eq!(text, "no peers held"),
         other => panic!("expected empty-roster Notice, got {other:?}"),
     }
 
@@ -2420,7 +2455,7 @@ async fn unsupervised_peer_activity_is_not_narrated() {
 
     let mut first_activity_notice = None;
     while let Some(ev) = agent_rx.recv().await {
-        if let AgentEvent::Notice { text } = ev {
+        if let AgentEvent::Notice { text, .. } = ev {
             if text.contains("connected to peer") {
                 continue;
             }
@@ -2556,7 +2591,7 @@ async fn send_command(ui_tx: &mpsc::Sender<LoopInput>, line: &str) {
 
 async fn expect_notice(agent_rx: &mut mpsc::Receiver<AgentEvent>, needle: &str) {
     match agent_rx.recv().await {
-        Some(AgentEvent::Notice { text }) => assert!(text.contains(needle), "{text}"),
+        Some(AgentEvent::Notice { text, .. }) => assert!(text.contains(needle), "{text}"),
         other => panic!("expected a Notice containing {needle:?}, got {other:?}"),
     }
 }
@@ -2654,7 +2689,7 @@ async fn auto_mode_spawns_unprompted_and_steers_under_the_policy() {
     send_command(&ui_tx, "/auto").await;
     drain_until(
         &mut agent_rx,
-        |ev| matches!(ev, AgentEvent::Notice { text } if text == "auto mode off"),
+        |ev| matches!(ev, AgentEvent::Notice { text, .. } if text == "auto mode off"),
     )
     .await;
     ui_tx
@@ -2933,7 +2968,7 @@ async fn auto_mode_unjudged_check_in_is_skipped_not_escalated() {
     loop {
         match agent_rx.recv().await {
             Some(AgentEvent::PermissionRequest { .. }) => panic!("auto mode must not escalate"),
-            Some(AgentEvent::Notice { text }) if text.contains("told it to skip") => break,
+            Some(AgentEvent::Notice { text, .. }) if text.contains("told it to skip") => break,
             Some(_) => {}
             None => panic!("expected the skip Notice"),
         }
@@ -3357,7 +3392,7 @@ async fn context_cleared_notice_shows_only_when_it_changes() {
             .unwrap();
         while let Some(ev) = agent_rx.recv().await {
             match ev {
-                AgentEvent::Notice { text } => notices.push(text),
+                AgentEvent::Notice { text, .. } => notices.push(text),
                 AgentEvent::TurnComplete => break,
                 _ => {}
             }
@@ -3501,7 +3536,7 @@ async fn code_execution_blocks_render_as_one_notice_without_cards() {
         match ev {
             AgentEvent::ToolUseStart { id, name, .. } => events.push(format!("start {id} {name}")),
             AgentEvent::ToolResult { id, .. } => events.push(format!("result {id}")),
-            AgentEvent::Notice { text } => events.push(format!("notice {text}")),
+            AgentEvent::Notice { text, .. } => events.push(format!("notice {text}")),
             AgentEvent::TurnComplete => break,
             _ => {}
         }
@@ -3621,7 +3656,7 @@ async fn duplicate_edges_to_one_session_report_replace_and_reject() {
             .unwrap();
         loop {
             match agent_rx.recv().await {
-                Some(AgentEvent::Notice { text }) => {
+                Some(AgentEvent::Notice { text, .. }) => {
                     assert_eq!(text, want);
                     break;
                 }
@@ -3677,7 +3712,7 @@ async fn bare_connect_peer(
     let mut notices = Vec::new();
     let sessions = loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) => notices.push(text),
+            Some(AgentEvent::Notice { text, .. }) => notices.push(text),
             Some(AgentEvent::SessionPicker { sessions }) => break sessions,
             Some(_) => {}
             None => panic!("loop ended without a picker reply"),
@@ -3912,7 +3947,7 @@ async fn message_to_a_peer_gone_mid_turn_fails_and_the_peer_is_reaped() {
     let mut reaped = false;
     loop {
         match agent_rx.recv().await {
-            Some(AgentEvent::Notice { text }) if text == "[peer child-1] disconnected" => {
+            Some(AgentEvent::Notice { text, .. }) if text == "[peer child-1] disconnected" => {
                 reaped = true
             }
             Some(AgentEvent::TurnComplete) => break,
