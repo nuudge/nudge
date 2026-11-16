@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::core::ControllerEvent;
 use crate::core::reference::{self, Candidate};
@@ -251,7 +251,7 @@ pub fn find_session(reference: &str) -> Result<SessionRow> {
         &open_store()?,
         &cwd.display().to_string(),
         reference,
-        |id| session_socket_path(id).is_ok_and(|socket| is_listening(&socket)),
+        |id| session_socket_path(id).is_ok_and(|socket| crate::core::is_listening(&socket)),
     )
 }
 
@@ -302,12 +302,6 @@ pub fn run_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-// The stored state can't say this: 'ended' is written only on graceful teardown, so a
-// crashed session would read 'running' forever.
-pub fn is_listening(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
-}
-
 pub struct SessionListing {
     pub id: String,
     pub name: Option<String>,
@@ -328,7 +322,7 @@ pub fn list_sessions() -> Result<Vec<SessionListing>> {
                 .with_context(|| format!("invalid last_activity on session {}", l.row.id))?
                 .with_timezone(&chrono::Utc);
             Ok(SessionListing {
-                live: is_listening(&session_socket_path(&l.row.id)?),
+                live: crate::core::is_listening(&session_socket_path(&l.row.id)?),
                 id: l.row.id,
                 name: l.row.name,
                 branch: l.row.branch,
@@ -617,25 +611,5 @@ mod tests {
         }
         let err = find_child_in(&store, "/proj", "parent", "ghost").unwrap_err();
         assert!(err.to_string().contains("no session matches"), "{err}");
-    }
-
-    #[test]
-    fn liveness_is_whether_the_socket_answers() {
-        // Short: macOS caps socket paths at 104 bytes.
-        let token = &uuid::Uuid::new_v4().simple().to_string()[..12];
-        let socket = std::env::temp_dir().join(format!("live-{token}.sock"));
-        assert!(!is_listening(&socket), "no file");
-
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        assert!(is_listening(&socket), "bound");
-
-        drop(listener);
-        // A child forked by a concurrent test holds the listener until its exec closes it.
-        let stale = (0..200).any(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            !is_listening(&socket)
-        });
-        assert!(stale, "stale file left by a crash");
-        std::fs::remove_file(&socket).ok();
     }
 }

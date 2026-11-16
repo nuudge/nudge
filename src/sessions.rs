@@ -9,7 +9,7 @@ pub fn prune_logs(older_than: Duration) -> Result<()> {
         &coding::run_dir()?,
         older_than,
         SystemTime::now(),
-        coding::is_listening,
+        crate::core::is_listening,
     )?;
     println!(
         "Removed {} log file(s), freeing {:.1} MB.",

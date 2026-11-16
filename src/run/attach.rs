@@ -2,11 +2,11 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 use super::Target;
-use super::local_peer::{accepts, label};
+use super::local_peer::label;
 use crate::cli::Cli;
 use crate::coding;
 use crate::core::store::SessionRow;
-use crate::core::{ClientIdentity, Controller};
+use crate::core::{ClientIdentity, Controller, is_listening};
 use crate::run::local_identity;
 use crate::transport::{self, SocketClient};
 use crate::tui;
@@ -71,7 +71,7 @@ async fn attach_local(
     cwd: &str,
     who: ClientIdentity,
 ) -> Result<Controller> {
-    if !accepts(socket).await {
+    if !is_listening(socket) {
         let label = label(row);
         if row.cwd == cwd {
             bail!("session {label} isn't running (resume it with nudge --resume {label})");
