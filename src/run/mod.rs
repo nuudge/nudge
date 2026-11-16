@@ -115,11 +115,12 @@ pub async fn host(cli: Cli) -> Result<()> {
         })
         .collect();
 
-    // Failures are logged and skipped.
+    // Failures are skipped; a TUI user also sees them as Notices, since the log is out of view.
+    let mut startup_errors = Vec::new();
     let mcp_specs = match coding::mcp::load_config(&session.cwd) {
         Ok(specs) => specs,
         Err(e) => {
-            warn!("[mcp] config error: {e:#}");
+            startup_errors.push(format!("[mcp] config error: {e:#}"));
             Vec::new()
         }
     };
@@ -127,11 +128,16 @@ pub async fn host(cli: Cli) -> Result<()> {
     for line in &mcp.connect_log {
         info!("{line}");
     }
+    startup_errors.extend(mcp.connect_errors.iter().cloned());
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let skills = coding::skills::SkillRegistry::discover(&session.cwd, home.as_deref());
     for line in &skills.discovery_log {
         info!("{line}");
+    }
+    startup_errors.extend(skills.discovery_errors.iter().cloned());
+    for line in &startup_errors {
+        warn!("{line}");
     }
 
     if cli.print_prompt {
@@ -172,10 +178,9 @@ pub async fn host(cli: Cli) -> Result<()> {
         },
     );
     // Agents never receive Notices, so a subagent's model isn't told.
-    if let Some(text) = size_warning
-        && !cli.daemon
-    {
-        seed.push(core::ControllerEvent::Notice { text });
+    if !cli.daemon {
+        let notices = startup_errors.into_iter().chain(size_warning);
+        seed.extend(notices.map(|text| core::ControllerEvent::Notice { text }));
     }
     let peer_identity = core::ClientIdentity {
         kind: core::ClientKind::Agent,

@@ -177,8 +177,9 @@ pub struct McpRegistry {
     /// Keyed by namespaced tool name.
     routes: HashMap<String, Route>,
     dormant: BTreeMap<String, ServerSpec>,
-    /// Written to the session log by the caller.
+    /// Written to the session log by the caller, which also shows the errors to a TUI user.
     pub connect_log: Vec<String>,
+    pub connect_errors: Vec<String>,
 }
 
 impl McpRegistry {
@@ -192,6 +193,7 @@ impl McpRegistry {
                 .map(|s| (s.name.clone(), s))
                 .collect(),
             connect_log: Vec::new(),
+            connect_errors: Vec::new(),
         };
         for spec in user_specs {
             match connect_one(spec, None).await {
@@ -201,7 +203,7 @@ impl McpRegistry {
                         .push(format!("[mcp] connected: {} ({n} tools)", spec.name));
                 }
                 Err(e) => {
-                    reg.connect_log
+                    reg.connect_errors
                         .push(format!("[mcp] FAILED to connect {}: {e:#}", spec.name));
                 }
             }
