@@ -31,8 +31,9 @@ struct Frontmatter {
 pub struct SkillRegistry {
     /// Sorted so the `use_skill` description is byte-stable for caching.
     skills: BTreeMap<String, Skill>,
-    /// Printed before the TUI starts so a malformed SKILL.md fails loudly.
+    /// Written to the session log by the caller, which also shows the errors to a TUI user.
     pub discovery_log: Vec<String>,
+    pub discovery_errors: Vec<String>,
 }
 
 impl SkillRegistry {
@@ -41,6 +42,7 @@ impl SkillRegistry {
         let mut reg = Self {
             skills: BTreeMap::new(),
             discovery_log: Vec::new(),
+            discovery_errors: Vec::new(),
         };
         // Project scans last so its `insert` overwrites.
         if let Some(home) = home {
@@ -72,7 +74,7 @@ impl SkillRegistry {
                     self.skills.insert(skill.name.clone(), skill);
                 }
                 Err(e) => self
-                    .discovery_log
+                    .discovery_errors
                     .push(format!("[skills] skipped {}: {e:#}", body_path.display())),
             }
         }
@@ -232,7 +234,7 @@ mod tests {
         write_skill(&cwd, "bad", "# no frontmatter here\njust a body\n");
         let reg = SkillRegistry::discover(&cwd, None);
         assert!(reg.skills.is_empty());
-        assert!(reg.discovery_log.iter().any(|l| l.contains("skipped")));
+        assert!(reg.discovery_errors.iter().any(|l| l.contains("skipped")));
     }
 
     #[test]

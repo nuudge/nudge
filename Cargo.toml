@@ -51,3 +51,5 @@ clap = { workspace = true }
 qrcode = { version = "0.14", default-features = false }
 base64 = "0.22"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }

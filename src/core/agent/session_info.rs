@@ -47,6 +47,7 @@ pub(super) async fn finalize_rename(
         Ok(()) => {
             let _ = tx
                 .send(AgentEvent::Notice {
+                    log: true,
                     text: format!("session renamed to '{name}'"),
                 })
                 .await;

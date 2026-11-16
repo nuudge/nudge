@@ -36,7 +36,7 @@ fn pick_models(
         Ok(models) if !models.is_empty() => models,
         Ok(_) => owned_models(fallback),
         Err(e) => {
-            eprintln!("[models] falling back to built-in list: {e:#}");
+            tracing::warn!("[models] falling back to built-in list: {e:#}");
             owned_models(fallback)
         }
     }

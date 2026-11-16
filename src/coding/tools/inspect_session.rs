@@ -10,6 +10,8 @@ use crate::llm::{
 
 const DEFAULT_LAST_N: i64 = 10;
 const MAX_LAST_N: i64 = 50;
+const DEFAULT_LOG_LINES: i64 = 50;
+const MAX_LOG_LINES: i64 = 500;
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 const TASK_CHARS: usize = 200;
@@ -40,22 +42,22 @@ struct Input {
 pub fn schema() -> Value {
     json!({
         "name": "InspectSession",
-        "description": "Read past agent sessions from the session store (read-only). Three modes:\n- `inspect`: one session's metadata (state, spawn provenance, timestamps) and a compact transcript view — the last N entries by default, or a window centered on `around_ordinal` (e.g. an ordinal from a search hit). `include_superseded` adds the audit view: entries dropped by resume truncation, flagged.\n- `list`: sessions for the current project (or `all_projects`) — id, name, state, turns, last activity, spawn edges.\n- `search`: naive substring search over stored message content; each hit carries session, ordinal, timestamp, and a capped snippet. Scope to one session with `session`.\nlist/search disclose truncation with a leading \"showing N of M\" line when the limit cut results.\n\nWhen to use: answering \"what did session X actually do?\" for an ENDED, dismissed, or crashed session; finding an old session; recovering context from history. For a LIVE peer you hold a connection to, prefer MessagePeer — the peer compresses with its own reasoning, while a raw transcript is the expensive channel. State honesty: 'running' can also mean the process crashed (nothing marks a crash) — judge liveness by last_activity.",
+        "description": "Read past agent sessions from the session store (read-only). Four modes:\n- `inspect`: one session's metadata (state, spawn provenance, timestamps) and a compact transcript view — the last N entries by default, or a window centered on `around_ordinal` (e.g. an ordinal from a search hit). `include_superseded` adds the audit view: entries dropped by resume truncation, flagged.\n- `list`: sessions for the current project (or `all_projects`) — id, name, state, turns, last activity, spawn edges.\n- `search`: naive substring search over stored message content; each hit carries session, ordinal, timestamp, and a capped snippet. Scope to one session with `session`.\n- `log`: the last N lines of one session's process log for its current run — startup, peers attaching, turns committed or rolled back with the error, API and tool calls, why it stopped. Use it to tell whether a session is crashed, stuck or done; the transcript only holds committed turns.\nlist/search disclose truncation with a leading \"showing N of M\" line when the limit cut results.\n\nWhen to use: answering \"what did session X actually do?\" for an ENDED, dismissed, or crashed session; finding an old session; recovering context from history. For a LIVE peer you hold a connection to, prefer MessagePeer — the peer compresses with its own reasoning, while a raw transcript is the expensive channel. State honesty: 'running' can also mean the process crashed (nothing marks a crash) — judge liveness by last_activity, and check `log` for the reason.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "mode": {
                     "type": "string",
-                    "enum": ["inspect", "list", "search"],
-                    "description": "What to do: inspect one session, list sessions, or search message content."
+                    "enum": ["inspect", "list", "search", "log"],
+                    "description": "What to do: inspect one session, list sessions, search message content, or read one session's log."
                 },
                 "session": {
                     "type": "string",
-                    "description": "inspect mode (required) or search mode (optional): session id, its 8-character short id, or a session name (resolved within the current project). In search mode, scopes the search to that one session."
+                    "description": "inspect and log modes (required) or search mode (optional): session id, its 8-character short id, or a session name (resolved within the current project). In search mode, scopes the search to that one session."
                 },
                 "last_n": {
                     "type": "integer",
-                    "description": "inspect mode: how many transcript entries to show — the trailing N, or the window size around `around_ordinal`. Default 10, max 50."
+                    "description": "inspect mode: how many transcript entries to show — the trailing N, or the window size around `around_ordinal`. Default 10, max 50. log mode: how many trailing log lines to show. Default 50, max 500."
                 },
                 "around_ordinal": {
                     "type": "integer",
@@ -86,6 +88,7 @@ pub fn schema() -> Value {
 pub fn summarize(input: &Value) -> String {
     match input["mode"].as_str().unwrap_or("?") {
         "inspect" => format!("inspect {}", input["session"].as_str().unwrap_or("?")),
+        "log" => format!("log of {}", input["session"].as_str().unwrap_or("?")),
         "list" => {
             if input["all_projects"].as_bool().unwrap_or(false) {
                 "list sessions (all projects)".into()
@@ -150,8 +153,52 @@ pub(crate) fn run(input: &Value, store: &SessionStore, cwd: &str) -> Result<Stri
                 limit,
             )
         }
-        other => bail!("InspectSession: unknown mode {other:?}; expected inspect | list | search"),
+        "log" => {
+            let Some(reference) = &input.session else {
+                bail!("InspectSession: log mode requires a `session` (id or name)");
+            };
+            let last_n = input
+                .last_n
+                .unwrap_or(DEFAULT_LOG_LINES)
+                .clamp(1, MAX_LOG_LINES);
+            log(
+                store,
+                cwd,
+                reference,
+                last_n as usize,
+                &crate::coding::run_dir()?,
+            )
+        }
+        other => {
+            bail!("InspectSession: unknown mode {other:?}; expected inspect | list | search | log")
+        }
     }
+}
+
+fn log(
+    store: &SessionStore,
+    cwd: &str,
+    reference: &str,
+    last_n: usize,
+    run_dir: &std::path::Path,
+) -> Result<String> {
+    let row = crate::coding::resolve_session(store, cwd, reference, |_| false)?;
+    let path = run_dir.join(format!("{}.log", row.id));
+    let run = match crate::logging::read_current_run(&path) {
+        Ok(run) => run,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(format!("session {} has no log", row.id));
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let shown = &run[run.len().saturating_sub(last_n)..];
+    let mut out = format!("log of session {} (current run", row.id);
+    if shown.len() < run.len() {
+        out.push_str(&format!(", last {} of {} lines", shown.len(), run.len()));
+    }
+    out.push_str(")\n");
+    out.push_str(&shown.join("\n"));
+    Ok(out)
 }
 
 fn inspect(
@@ -890,5 +937,36 @@ mod tests {
         // A match found only in JSON structure falls back to the text's prefix.
         let structural = snippet(content, "toolu_01AbCdEf");
         assert!(structural.starts_with("running the suite"), "{structural}");
+    }
+
+    #[test]
+    fn log_mode_returns_only_the_current_runs_tail() {
+        let s = store();
+        s.insert_session("abc", "/proj", None, None).unwrap();
+        s.insert_session("quiet", "/proj", None, None).unwrap();
+        let dir = std::env::temp_dir().join(format!("is-log-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&dir).unwrap();
+        let sep = crate::logging::RUN_SEPARATOR;
+        std::fs::write(
+            dir.join("abc.log"),
+            format!("{sep}1 ---\nold run\n{sep}2 ---\none\ntwo\nthree\n"),
+        )
+        .unwrap();
+
+        let out = log(&s, "/proj", "abc", 50, &dir).unwrap();
+        assert!(out.contains("one\ntwo\nthree"), "{out}");
+        assert!(!out.contains("old run"), "{out}");
+        let tail = log(&s, "/proj", "abc", 2, &dir).unwrap();
+        assert!(
+            tail.ends_with("two\nthree") && !tail.contains("one"),
+            "{tail}"
+        );
+        assert!(
+            log(&s, "/proj", "quiet", 50, &dir)
+                .unwrap()
+                .contains("no log")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

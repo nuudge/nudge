@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::time::Duration;
 use tokio::sync::watch;
+use tracing::info;
 
 use crate::core::SessionHost;
 use crate::transport::{self, PairingScope};
@@ -17,7 +18,7 @@ pub(super) async fn run(
 ) -> Result<()> {
     let broker = host.broker_handle();
     let answerers = if needs_answerer {
-        eprintln!("[daemon] waiting for someone to answer its prompts");
+        info!("waiting for someone to answer its prompts");
         Some(
             broker
                 .answerers()
@@ -27,13 +28,13 @@ pub(super) async fn run(
     } else {
         None
     };
-    eprintln!("[daemon] listening on {}", socket.display());
+    info!(socket = %socket.display(), "listening");
     // Only a process signal or, with `needs_answerer`, losing the last answerer ends the
     // daemon; an ordinary controller leaving never does.
     let run = async move {
         let Some(base) = relay else {
             broker.closed().await;
-            eprintln!("[daemon] session ended; shutting down");
+            info!("stopping: the session ended");
             return Ok(());
         };
         // Dial OUT to the relay: the only direction that crosses NAT. Each scope
@@ -78,11 +79,11 @@ pub(super) async fn run(
     let daemon_result = tokio::select! {
         r = run => r,
         _ = unattended => {
-            eprintln!("[daemon] no one left to answer its prompts; stopping");
+            info!("stopping: no one left to answer its prompts");
             Ok(())
         }
         _ = shutdown_signal() => {
-            eprintln!("[daemon] shutdown signal received; stopping");
+            info!("stopping: shutdown signal received");
             Ok(())
         }
     };

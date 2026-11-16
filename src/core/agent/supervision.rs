@@ -67,6 +67,7 @@ pub(super) async fn supervise_peer_event(
             peers.disconnect(pid);
             let _ = agent_tx
                 .send(AgentEvent::Notice {
+                    log: true,
                     text: format!("[peer {name}] disconnected"),
                 })
                 .await;
@@ -78,8 +79,16 @@ pub(super) async fn supervise_peer_event(
             summary,
         }) => {
             if peers.is_supervised(pid) {
+                tracing::info!(
+                    peer = %name,
+                    session = peers.session_id(pid).map(tracing::field::display),
+                    tool = %tool_name,
+                    tool_use_id = %tool_use_id,
+                    "check-in requested"
+                );
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
+                        log: false,
                         text: format!("[peer {name}] checks in — {tool_name}: {summary}"),
                     })
                     .await;
@@ -102,7 +111,22 @@ pub(super) async fn supervise_peer_event(
             let narrate =
                 peers.is_supervised(pid) || matches!(other, ControllerEvent::Error { .. });
             if narrate && let Some(text) = peer_notice(&name, &other) {
-                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+                let (kind, tool) = match &other {
+                    ControllerEvent::AssistantText { .. } => ("text", None),
+                    ControllerEvent::ToolUseStart { name, .. } => ("tool_use", Some(name)),
+                    ControllerEvent::PermissionResolved { tool_name, .. } => {
+                        ("permission_resolved", Some(tool_name))
+                    }
+                    _ => ("error", None),
+                };
+                tracing::info!(
+                    peer = %name,
+                    session = peers.session_id(pid).map(tracing::field::display),
+                    kind,
+                    tool = tool.map(tracing::field::display),
+                    "peer activity"
+                );
+                let _ = agent_tx.send(AgentEvent::Notice { log: false, text }).await;
             }
             Observed::Handled
         }

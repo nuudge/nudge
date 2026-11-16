@@ -4,6 +4,7 @@ mod local;
 mod local_peer;
 
 use anyhow::Result;
+use tracing::{info, warn};
 
 use crate::cli::Cli;
 use crate::coding;
@@ -11,6 +12,7 @@ use crate::config::Config;
 use crate::core::store::SessionRow;
 use crate::core::{self, AgentConfig, Backend, ClientIdentity};
 use crate::llm;
+use crate::logging;
 use crate::models::{MODELS, owned_models, resolve_models};
 use crate::transport;
 use crate::tui;
@@ -42,6 +44,40 @@ pub async fn host(cli: Cli) -> Result<()> {
     };
 
     let thinking_display = crate::config::resolve_thinking(cli.thinking.as_ref())?;
+    let socket_path = coding::session_socket_path(&session.id)?;
+    // Refuses before the log is opened, so a second host can't trim or mark a live
+    // session's log. Two hosts racing through MCP setup both pass; bind_listener decides.
+    if local_peer::accepts(&socket_path).await {
+        anyhow::bail!("session {} is already running", session.id);
+    }
+    let mode = if cli.daemon || cli.print_prompt {
+        logging::Mode::Headless
+    } else {
+        logging::Mode::Tui
+    };
+    let mode = logging::init(&socket_path.with_extension("log"), mode)?;
+    let parent = coding::parent_of(&session.id)?;
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        mode,
+        session = %session.id,
+        cwd = %session.cwd.display(),
+        model = %config.model,
+        thinking = %thinking_display,
+        resume = cli.resume.as_deref().map(tracing::field::display),
+        local = cli.local,
+        needs_answerer = cli.needs_answerer,
+        watch = cli.watch,
+        peer = cli.peer,
+        connect = cli.connect.is_some(),
+        spawned_by = parent.as_ref().map(|p| tracing::field::display(&p.id)),
+        "session host starting"
+    );
+    let size_warning = logging::size_warning(&coding::run_dir()?)?;
+    if let Some(text) = &size_warning {
+        warn!("{text}");
+    }
+
     let who = local_identity();
     let mut ui_cfg = tui::UiConfig {
         session_id: session.id.clone(),
@@ -79,24 +115,29 @@ pub async fn host(cli: Cli) -> Result<()> {
         })
         .collect();
 
-    // MCP and skills load before the TUI takes the screen so their logs print
-    // cleanly to stderr. Failures are logged and skipped.
+    // Failures are skipped; a TUI user also sees them as Notices, since the log is out of view.
+    let mut startup_errors = Vec::new();
     let mcp_specs = match coding::mcp::load_config(&session.cwd) {
         Ok(specs) => specs,
         Err(e) => {
-            eprintln!("[mcp] config error: {e:#}");
+            startup_errors.push(format!("[mcp] config error: {e:#}"));
             Vec::new()
         }
     };
     let mcp = coding::mcp::McpRegistry::bootstrap(&mcp_specs).await;
     for line in &mcp.connect_log {
-        eprintln!("{line}");
+        info!("{line}");
     }
+    startup_errors.extend(mcp.connect_errors.iter().cloned());
 
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let skills = coding::skills::SkillRegistry::discover(&session.cwd, home.as_deref());
     for line in &skills.discovery_log {
-        eprintln!("{line}");
+        info!("{line}");
+    }
+    startup_errors.extend(skills.discovery_errors.iter().cloned());
+    for line in &startup_errors {
+        warn!("{line}");
     }
 
     if cli.print_prompt {
@@ -104,10 +145,9 @@ pub async fn host(cli: Cli) -> Result<()> {
             .await;
     }
 
-    let socket_path = coding::session_socket_path(&session.id)?;
     let listener = transport::bind_listener(&socket_path)?;
 
-    let role = subagent_role(coding::parent_of(&session.id)?.is_some());
+    let role = subagent_role(parent.is_some());
     let mut backend =
         coding::CodingBackend::new(session.cwd.clone(), mcp, skills, config.web_search);
 
@@ -137,6 +177,11 @@ pub async fn host(cli: Cli) -> Result<()> {
             peers: Vec::new(),
         },
     );
+    // Agents never receive Notices, so a subagent's model isn't told.
+    if !cli.daemon {
+        let notices = startup_errors.into_iter().chain(size_warning);
+        seed.extend(notices.map(|text| core::ControllerEvent::Notice { text }));
+    }
     let peer_identity = core::ClientIdentity {
         kind: core::ClientKind::Agent,
         name: peer_name(session.name.as_deref(), &session.id),

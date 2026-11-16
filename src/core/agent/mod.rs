@@ -87,6 +87,7 @@ async fn run_loop<P: Provider, B: Backend>(
     if auto {
         let _ = agent_tx
             .send(AgentEvent::Notice {
+                log: true,
                 text: "auto mode is on (restored from the last run) — /auto turns it off".into(),
             })
             .await;
@@ -180,6 +181,14 @@ async fn run_loop<P: Provider, B: Backend>(
         }
 
         // The log stores clean text + sender; only the model-facing copy is attributed.
+        tracing::info!(
+            sender = who.as_ref().map_or("-", |w| w.name.as_str()),
+            sender_session = who
+                .as_ref()
+                .and_then(|w| w.session_id.as_deref())
+                .map(tracing::field::display),
+            "turn started"
+        );
         messages.push(Message {
             role: "user".into(),
             content: vec![ContentBlock::Text { text: user_text }],
@@ -205,6 +214,7 @@ async fn run_loop<P: Provider, B: Backend>(
             for name in &gone {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
+                        log: true,
                         text: format!("[peer {name}] disconnected"),
                     })
                     .await;
@@ -242,6 +252,7 @@ async fn run_loop<P: Provider, B: Backend>(
             let resp = match provider.complete(&req).await {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "turn rolled back: the API call failed");
                     let _ = agent_tx
                         .send(AgentEvent::Error {
                             message: format!("{e:#}"),
@@ -262,13 +273,13 @@ async fn run_loop<P: Provider, B: Backend>(
                 })
                 .await;
             if let Some(text) = resp.warning {
-                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+                let _ = agent_tx.send(AgentEvent::Notice { log: true, text }).await;
             }
             if let Some(text) = resp.context_cleared
                 && last_context_cleared.as_ref() != Some(&text)
             {
                 last_context_cleared = Some(text.clone());
-                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+                let _ = agent_tx.send(AgentEvent::Notice { log: true, text }).await;
             }
             if resp.container_id.is_some() {
                 container = resp.container_id;
@@ -350,6 +361,7 @@ async fn run_loop<P: Provider, B: Backend>(
             if ran_code_execution(&assistant_msg.content) {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
+                        log: true,
                         text: CODE_EXECUTION_NOTICE.into(),
                     })
                     .await;
@@ -537,7 +549,21 @@ async fn take_registration<B: Backend>(
     backend: &B,
 ) {
     let name = reg.who.name.clone();
-    let text = match peers.register(reg) {
+    let session = reg.who.session_id.clone();
+    let supervised = reg.supervised;
+    let registered = peers.register(reg);
+    tracing::info!(
+        peer = %name,
+        session = session.as_deref().map(tracing::field::display),
+        supervised,
+        outcome = match registered {
+            Registered::Added(_) => "added",
+            Registered::Replaced(_) => "replaced",
+            Registered::Rejected(_) => "rejected",
+        },
+        "peer edge registered"
+    );
+    let text = match registered {
         Registered::Added(_) => format!("connected to peer {name}"),
         Registered::Replaced(id) => format!(
             "replaced the unsupervised edge to {} with a {} one",
@@ -550,7 +576,7 @@ async fn take_registration<B: Backend>(
             peers.role(id)
         ),
     };
-    let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+    let _ = agent_tx.send(AgentEvent::Notice { log: true, text }).await;
     let _ = agent_tx.send(capabilities_event(cfg, backend, peers)).await;
 }
 
@@ -601,7 +627,10 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 }
             };
             let _ = agent_tx
-                .send(AgentEvent::Notice { text: text.into() })
+                .send(AgentEvent::Notice {
+                    log: true,
+                    text: text.into(),
+                })
                 .await;
             emit_session_info_if_changed(
                 agent_tx,
@@ -669,7 +698,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
         }
         Command::Mcp(mcp) => {
             let text = backend.handle_mcp(&mcp, agent_tx).await;
-            let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            let _ = agent_tx.send(AgentEvent::Notice { log: true, text }).await;
             if matches!(mcp, McpCommand::Load(_) | McpCommand::Unload(_)) {
                 let _ = agent_tx.send(capabilities_event(cfg, backend, peers)).await;
             }
@@ -703,11 +732,13 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 }
                 lines.join("\n")
             };
-            let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+            // Lists each peer's task, a message body.
+            let _ = agent_tx.send(AgentEvent::Notice { log: false, text }).await;
         }
         Command::ModelUsage => {
             let _ = agent_tx
                 .send(AgentEvent::Notice {
+                    log: true,
                     text: "usage: /model <id>".into(),
                 })
                 .await;
@@ -739,7 +770,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
                 Err(e) => (Vec::new(), Some(format!("{e:#}"))),
             };
             if let Some(text) = notice {
-                let _ = agent_tx.send(AgentEvent::Notice { text }).await;
+                let _ = agent_tx.send(AgentEvent::Notice { log: true, text }).await;
             }
             let _ = agent_tx.send(AgentEvent::SessionPicker { sessions }).await;
         }
@@ -748,6 +779,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
             if let Some(dialer) = peer_dialer {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
+                        log: true,
                         text: "connecting to peer…".into(),
                     })
                     .await;
@@ -757,6 +789,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
                     if let Err(e) = fut.await {
                         let _ = agent_tx
                             .send(AgentEvent::Notice {
+                                log: true,
                                 text: format!("could not connect to peer: {e:#}"),
                             })
                             .await;
@@ -765,6 +798,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
             } else {
                 let _ = agent_tx
                     .send(AgentEvent::Notice {
+                        log: true,
                         text: "peer connections are not available in this session".into(),
                     })
                     .await;
@@ -773,6 +807,7 @@ async fn dispatch_command<P: Provider, B: Backend>(
         Command::Unknown(cmd) => {
             let _ = agent_tx
                 .send(AgentEvent::Notice {
+                    log: true,
                     text: format!("unknown command: {cmd}"),
                 })
                 .await;

@@ -287,7 +287,11 @@ pub fn session_socket_path(session_id: &str) -> Result<PathBuf> {
     Ok(run_dir()?.join(format!("{session_id}.sock")))
 }
 
-fn run_dir() -> Result<PathBuf> {
+pub fn session_log_path(session_id: &str) -> Result<PathBuf> {
+    Ok(run_dir()?.join(format!("{session_id}.log")))
+}
+
+pub fn run_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
     let dir = PathBuf::from(home).join(".nudge").join("run");
     std::fs::DirBuilder::new()
@@ -300,7 +304,7 @@ fn run_dir() -> Result<PathBuf> {
 
 // The stored state can't say this: 'ended' is written only on graceful teardown, so a
 // crashed session would read 'running' forever.
-fn is_listening(socket: &Path) -> bool {
+pub fn is_listening(socket: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 

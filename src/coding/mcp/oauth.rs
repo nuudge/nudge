@@ -43,10 +43,17 @@ pub async fn authorized_transport(
     client_secret: Option<&str>,
     notify: Notify<'_>,
 ) -> Result<AuthedTransport> {
-    match client_id {
+    let result = match client_id {
         Some(cid) => pre_registered_transport(name, url, scopes, cid, client_secret, notify).await,
         None => dcr_transport(name, url, scopes, notify).await,
+    };
+    match &result {
+        Ok(_) => tracing::info!(server = name, "oauth authorized"),
+        Err(e) => {
+            tracing::warn!(server = name, error = %format!("{e:#}"), "oauth authorization failed")
+        }
     }
+    result
 }
 
 async fn dcr_transport(
@@ -66,7 +73,7 @@ async fn dcr_transport(
     let mut state = OAuthState::new(url, None)
         .await
         .map_err(|e| anyhow!("oauth discovery failed: {e}"))?;
-    run_browser_flow(&mut state, scopes, notify).await?;
+    run_browser_flow(name, &mut state, scopes, notify).await?;
     if let Ok((client_id, Some(token))) = state.get_credentials().await {
         // Failing to save just means re-auth later.
         let _ = save_tokens(name, &PersistedAuth { client_id, token });
@@ -95,7 +102,7 @@ async fn revive_saved_credentials(
     match am.refresh_token().await {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("[mcp] {name}: cached token refresh failed ({e}); re-authorizing");
+            tracing::warn!("[mcp] {name}: cached token refresh failed ({e}); re-authorizing");
             return None;
         }
     }
@@ -114,6 +121,7 @@ fn make_transport(url: &str, am: AuthorizationManager) -> AuthedTransport {
 }
 
 async fn run_browser_flow(
+    name: &str,
     state: &mut OAuthState,
     scopes: &[String],
     notify: Notify<'_>,
@@ -130,7 +138,7 @@ async fn run_browser_flow(
         .await
         .map_err(|e| anyhow!("oauth get_authorization_url failed: {e}"))?;
 
-    let (code, csrf) = prompt_and_capture(&auth_url, notify).await?;
+    let (code, csrf) = prompt_and_capture(name, &auth_url, notify).await?;
     state
         .handle_callback(&code, &csrf)
         .await
@@ -175,7 +183,7 @@ async fn pre_registered_transport(
             .get_authorization_url(&scope_refs)
             .await
             .map_err(|e| anyhow!("oauth get_authorization_url failed: {e}"))?;
-        let (code, csrf) = prompt_and_capture(&auth_url, notify).await?;
+        let (code, csrf) = prompt_and_capture(name, &auth_url, notify).await?;
         mgr.exchange_code_for_token(&code, &csrf)
             .await
             .map_err(|e| anyhow!("oauth token exchange failed: {e}"))?;
@@ -194,14 +202,24 @@ fn redirect_uri() -> String {
 
 /// Also sent as a `Notice` when `notify` is set, since stderr is hidden behind
 /// the TUI mid-session.
-async fn prompt_and_capture(auth_url: &str, notify: Notify<'_>) -> Result<(String, String)> {
+async fn prompt_and_capture(
+    name: &str,
+    auth_url: &str,
+    notify: Notify<'_>,
+) -> Result<(String, String)> {
+    tracing::info!(server = name, "oauth authorization started");
     let msg = format!(
         "[mcp] Authorize access in your browser:\n  {auth_url}\n  (waiting for the redirect on {} ...)",
         redirect_uri()
     );
     eprintln!("\n{msg}\n");
     if let Some(tx) = notify {
-        let _ = tx.send(AgentEvent::Notice { text: msg }).await;
+        let _ = tx
+            .send(AgentEvent::Notice {
+                log: false,
+                text: msg,
+            })
+            .await;
     }
     open_browser(auth_url);
     wait_for_callback(CALLBACK_PORT).await

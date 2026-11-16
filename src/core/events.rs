@@ -96,7 +96,10 @@ pub enum AgentEvent {
     TurnComplete,
     MaxIterations,
     // Logs can't go to stderr once the TUI owns the screen, so they ride back as this.
+    // `log: false` keeps text carrying message bodies, tool arguments or auth URLs out of
+    // the session log; the source logs metadata instead.
     Notice {
+        log: bool,
         text: String,
     },
     Error {

@@ -162,7 +162,7 @@ the relay, and anything else is resolved as a session id or name (`run::local_pe
 dialed over that session's socket. If nothing listens there, the dialer takes an exclusive lock on
 `~/.nudge/run/<id>.lock`, re-probes, and if the socket is still dead starts a headless
 host for the session in its stored cwd (`--daemon --local --needs-answerer --resume
-<id>`, logging to `<id>.log`; logs older than 7 days are pruned then). It holds the lock
+<id>`, logging to `<id>.log`). It holds the lock
 until its own handshake completes, then unlinks the lock file before releasing it; a
 locker that wins an unlinked file retries on the current one. So the dialer that started
 the host becomes its supervisor and a racing dialer gets a plain
@@ -180,6 +180,26 @@ with `start_host` and the socket dial, requires the returned edge to be `supervi
 the `Spawn` tool to register. A session whose row has `spawned_by` is hosted with no
 factory and with the subagent role note, however it was started. The note names no one:
 the roster marks the spawner edge as "your parent", so a rename can't make them disagree.
+
+## Session logs
+
+Every session host writes one log, `~/.nudge/run/<id>.log`, through `tracing`
+(`src/logging.rs`, installed by `logging::init` once the session id is known). The
+transcript records what the model saw and said; the log records what the process did:
+startup, peers and controllers attaching (always with the other session's id), turns
+committed or rolled back with the error chain, API calls with their `request-id`, tool
+calls, permission prompts and who answered them, and why the session stopped. It never
+holds credentials, pairing codes, or message and tool bodies, so agents read it without a
+permission prompt (`InspectSession` `mode: "log"`); humans use `nudge --log <id|name>`.
+
+`NUDGE_LOG` sets the filter (`EnvFilter` syntax, default `nudge=info,warn`). A TUI host
+writes the file only; a `--daemon` also mirrors to stderr. A host started by
+`start_host` finds its stderr already is the log (same device and inode, opened by the
+parent), so it writes through stderr and doesn't reopen the file. Each run starts with a
+`--- started` separator, and readers show only the current run. Opening a log over 10 MB
+trims it in place to its last 5 MB. Nothing is pruned automatically: past 200 MB of logs
+the TUI shows a Notice, and `nudge --prune-logs [--older-than 14d]` deletes the logs of
+sessions that aren't running.
 
 ## Run modes (selected in `main.rs`)
 

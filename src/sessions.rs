@@ -1,6 +1,34 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::time::{Duration, SystemTime};
 
 use crate::coding;
+use crate::logging;
+
+pub fn prune_logs(older_than: Duration) -> Result<()> {
+    let pruned = logging::prune(
+        &coding::run_dir()?,
+        older_than,
+        SystemTime::now(),
+        coding::is_listening,
+    )?;
+    println!(
+        "Removed {} log file(s), freeing {:.1} MB.",
+        pruned.files,
+        pruned.bytes as f64 / (1024.0 * 1024.0)
+    );
+    Ok(())
+}
+
+pub fn print_log(reference: &str) -> Result<()> {
+    let row = coding::find_session(reference)?;
+    let path = coding::session_log_path(&row.id)?;
+    let run = logging::read_current_run(&path)
+        .with_context(|| format!("reading the log of session {}", row.id))?;
+    for line in run {
+        println!("{line}");
+    }
+    Ok(())
+}
 
 pub fn print_sessions() -> Result<()> {
     let sessions = coding::list_sessions()?;

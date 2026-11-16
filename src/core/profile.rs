@@ -62,6 +62,18 @@ impl ClientProfile {
         self.may_answer_permissions && !self.may_quit
     }
 
+    pub fn grant_name(&self) -> &'static str {
+        if self.may_quit {
+            "full"
+        } else if self.is_supervisor() {
+            "supervisor"
+        } else if self.may_drive {
+            "peer"
+        } else {
+            "watch"
+        }
+    }
+
     pub fn watch_only() -> Self {
         Self {
             may_quit: false,
