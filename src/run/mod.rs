@@ -45,8 +45,8 @@ pub async fn host(cli: Cli) -> Result<()> {
 
     let thinking_display = crate::config::resolve_thinking(cli.thinking.as_ref())?;
     let socket_path = coding::session_socket_path(&session.id)?;
-    // A second host must not reopen and mark a live session's log; binding the socket
-    // later refuses it authoritatively.
+    // Refuses before the log is opened, so a second host can't trim or mark a live
+    // session's log. Two hosts racing through MCP setup both pass; bind_listener decides.
     if local_peer::accepts(&socket_path).await {
         anyhow::bail!("session {} is already running", session.id);
     }
