@@ -71,10 +71,16 @@ pub fn init(log_path: &Path, mode: Mode) -> Result<&'static str> {
         .try_init()
         .map_err(|e| anyhow::anyhow!("installing the logger: {e}"))?;
 
+    // Verbatim: a str-slicing panic quotes the string it sliced, which may be a message
+    // body. Accepted, since the payload is usually the only clue to the crash.
     let previous = std::panic::take_hook();
+    let chain = out != Output::Stderr;
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
-        previous(info);
+        // The default hook writes to stderr, which in the background is the log itself.
+        if chain {
+            previous(info);
+        }
     }));
     Ok(name)
 }

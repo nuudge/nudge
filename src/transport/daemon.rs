@@ -7,6 +7,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::error::{Error as WsError, UrlError};
 
 use super::encryption::Cipher;
 use super::wire::{
@@ -230,16 +231,24 @@ async fn relay_dial_loop(
             Err(e) => match &status {
                 // Live bridges keep running; the next /background re-arms.
                 Some(s) => {
-                    tracing::warn!(grant = profile.grant_name(), error = %e, "relay dial failed");
+                    tracing::warn!(grant = profile.grant_name(), error = %loggable(&e), "relay dial failed");
                     let _ = s.send(HandoffStatus::Failed(format!("{e}"))).await;
                     break;
                 }
                 None => {
-                    tracing::warn!(grant = profile.grant_name(), error = %e, "relay dial failed; retrying in 2s");
+                    tracing::warn!(grant = profile.grant_name(), error = %loggable(&e), "relay dial failed; retrying in 2s");
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             },
         }
+    }
+}
+
+// `UnableToConnect` quotes the dial URL, which carries the room id.
+fn loggable(e: &WsError) -> String {
+    match e {
+        WsError::Url(UrlError::UnableToConnect(_)) => "unable to connect to the relay".into(),
+        e => e.to_string(),
     }
 }
 
@@ -395,5 +404,18 @@ async fn recv_opt_ui(rx: &mut Option<mpsc::Receiver<UiEvent>>) -> Option<UiEvent
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_logged_dial_error_never_carries_the_room() {
+        let e = WsError::Url(UrlError::UnableToConnect(
+            "wss://relay.example/host/room-secret".into(),
+        ));
+        assert!(!loggable(&e).contains("room-secret"));
     }
 }
