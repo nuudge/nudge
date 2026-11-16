@@ -81,7 +81,7 @@ pub(super) async fn supervise_peer_event(
             if peers.is_supervised(pid) {
                 tracing::info!(
                     peer = %name,
-                    session = ?peers.session_id(pid),
+                    session = peers.session_id(pid).map(tracing::field::display),
                     tool = %tool_name,
                     tool_use_id = %tool_use_id,
                     "check-in requested"
@@ -121,9 +121,9 @@ pub(super) async fn supervise_peer_event(
                 };
                 tracing::info!(
                     peer = %name,
-                    session = ?peers.session_id(pid),
+                    session = peers.session_id(pid).map(tracing::field::display),
                     kind,
-                    tool = ?tool,
+                    tool = tool.map(tracing::field::display),
                     "peer activity"
                 );
                 let _ = agent_tx.send(AgentEvent::Notice { log: false, text }).await;

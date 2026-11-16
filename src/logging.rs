@@ -107,8 +107,13 @@ pub fn open_run_log(path: &Path, now: chrono::DateTime<chrono::Local>) -> Result
         .append(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    writeln!(log, "{RUN_SEPARATOR}{} ---", now.to_rfc3339())
-        .with_context(|| format!("writing {}", path.display()))?;
+    writeln!(
+        log,
+        "{RUN_SEPARATOR}{} ---",
+        now.to_utc()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
     Ok(log)
 }
 

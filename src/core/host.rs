@@ -455,7 +455,7 @@ fn detach(attached: &mut HashMap<ControllerId, ControllerChannels>, id: Controll
         info!(
             client = %c.who.name,
             kind = ?c.who.kind,
-            session = ?c.who.session_id,
+            session = c.who.session_id.as_deref().map(tracing::field::display),
             grant = c.profile.grant_name(),
             "controller detached"
         );
@@ -556,7 +556,7 @@ async fn broker(
                 info!(
                     client = %who.name,
                     kind = ?who.kind,
-                    session = ?who.session_id,
+                    session = who.session_id.as_deref().map(tracing::field::display),
                     grant = profile.grant_name(),
                     replay,
                     "controller attached"
@@ -605,7 +605,7 @@ async fn broker(
                                     tool_use_id = %tool_use_id,
                                     allow,
                                     by = %c.who.name,
-                                    by_session = ?c.who.session_id,
+                                    by_session = c.who.session_id.as_deref().map(tracing::field::display),
                                     wait_ms = prompt.asked.elapsed().as_millis() as u64,
                                     "permission resolved"
                                 );
@@ -649,7 +649,7 @@ async fn broker(
                             .unwrap_or(false);
                         if allowed {
                             let who = attached.get(&id).map(|c| c.who.clone());
-                            info!(by = ?who.as_ref().map(|w| &w.name), "quit requested");
+                            info!(by = who.as_ref().map(|w| tracing::field::display(&w.name)), "quit requested");
                             let _ = loop_ui_tx.send((who, UiEvent::Quit)).await;
                         } else if let Some(c) = attached.get(&id) {
                             refuse(c, "quit is not permitted for agent clients");
@@ -684,7 +684,7 @@ async fn broker(
 }
 
 fn refuse(c: &ControllerChannels, text: &str) {
-    info!(client = %c.who.name, session = ?c.who.session_id, text, "refused");
+    info!(client = %c.who.name, session = c.who.session_id.as_deref().map(tracing::field::display), text, "refused");
     let _ = c
         .event_tx
         .send(ControllerEvent::Notice { text: text.into() });

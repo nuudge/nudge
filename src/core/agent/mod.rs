@@ -183,7 +183,10 @@ async fn run_loop<P: Provider, B: Backend>(
         // The log stores clean text + sender; only the model-facing copy is attributed.
         tracing::info!(
             sender = who.as_ref().map_or("-", |w| w.name.as_str()),
-            sender_session = ?who.as_ref().and_then(|w| w.session_id.as_deref()),
+            sender_session = who
+                .as_ref()
+                .and_then(|w| w.session_id.as_deref())
+                .map(tracing::field::display),
             "turn started"
         );
         messages.push(Message {
@@ -551,7 +554,7 @@ async fn take_registration<B: Backend>(
     let registered = peers.register(reg);
     tracing::info!(
         peer = %name,
-        session = ?session,
+        session = session.as_deref().map(tracing::field::display),
         supervised,
         outcome = match registered {
             Registered::Added(_) => "added",

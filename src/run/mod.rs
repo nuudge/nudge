@@ -64,13 +64,13 @@ pub async fn host(cli: Cli) -> Result<()> {
         cwd = %session.cwd.display(),
         model = %config.model,
         thinking = %thinking_display,
-        resume = ?cli.resume,
+        resume = cli.resume.as_deref().map(tracing::field::display),
         local = cli.local,
         needs_answerer = cli.needs_answerer,
         watch = cli.watch,
         peer = cli.peer,
         connect = cli.connect.is_some(),
-        spawned_by = ?parent.as_ref().map(|p| &p.id),
+        spawned_by = parent.as_ref().map(|p| tracing::field::display(&p.id)),
         "session host starting"
     );
     let size_warning = logging::size_warning(&coding::run_dir()?)?;

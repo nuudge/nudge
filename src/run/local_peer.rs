@@ -58,7 +58,7 @@ pub(super) async fn spawn_child(
         task,
     )
     .await?;
-    tracing::info!(session = %row.id, name = ?row.name, "spawned child");
+    tracing::info!(session = %row.id, name = row.name.as_deref().map(tracing::field::display), "spawned child");
     Ok(reg)
 }
 

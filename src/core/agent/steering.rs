@@ -172,7 +172,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
     let peer_session = peers.session_id(checkin.pid).map(String::from);
     tracing::info!(
         peer = %name,
-        session = ?peer_session,
+        session = peer_session.as_deref().map(tracing::field::display),
         tool = %checkin.tool_name,
         tool_use_id = %checkin.tool_use_id,
         verdict = verdict_name,
@@ -189,7 +189,7 @@ pub(super) async fn run_steering_turn<P: Provider, B: Backend>(
         )
         .await;
     if !allow && let Some(m) = message.filter(|m| !m.is_empty()) {
-        tracing::info!(peer = %name, session = ?peer_session, tool = %checkin.tool_name, "redirect sent");
+        tracing::info!(peer = %name, session = peer_session.as_deref().map(tracing::field::display), tool = %checkin.tool_name, "redirect sent");
         let _ = peers
             .drive(checkin.pid, UiEvent::UserMessage { text: m })
             .await;

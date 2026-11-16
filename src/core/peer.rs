@@ -277,7 +277,7 @@ impl PeerSet {
     // For an edge whose far side went away; returns its name.
     pub fn disconnect(&mut self, id: PeerId) -> Option<String> {
         let who = self.peers.remove(&id)?.who;
-        tracing::info!(peer = %who.name, session = ?who.session_id, "peer edge closed");
+        tracing::info!(peer = %who.name, session = who.session_id.as_deref().map(tracing::field::display), "peer edge closed");
         let name = who.name.clone();
         self.disconnected.push(who);
         Some(name)
