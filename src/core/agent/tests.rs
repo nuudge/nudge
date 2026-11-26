@@ -2118,6 +2118,93 @@ async fn successful_multi_iteration_turn_persists_all_entries() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// The earlier complete call runs; the trailing call truncated by max_tokens is answered
+// with an error instead, and the turn continues to a normal end.
+#[tokio::test]
+async fn tool_call_cut_off_by_max_tokens_gets_an_error_result_and_the_turn_continues() {
+    let (session, dir) = mk_session();
+    let seen_messages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cut_off = Response {
+        content: vec![
+            ContentBlock::ToolUse {
+                id: "tu0".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            ContentBlock::ToolUse {
+                id: "tu1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
+            },
+        ],
+        stop_reason: "max_tokens".into(),
+        usage: Usage::default(),
+        container_id: None,
+        warning: None,
+        context_cleared: None,
+    };
+    let provider = ScriptedProvider {
+        responses: std::sync::Mutex::new(vec![cut_off, end_turn_response("split it")]),
+        seen_messages: seen_messages.clone(),
+        seen_tools: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+
+    let (ui_tx, ui_rx) = mpsc::channel(16);
+    let (agent_tx, mut agent_rx) = mpsc::channel(16);
+    let task = tokio::spawn(run_agent(
+        mk_cfg(),
+        provider,
+        FakeBackend,
+        session,
+        Vec::new(),
+        mk_io(ui_rx, agent_tx, PeerSet::default(), None),
+    ));
+
+    ui_tx
+        .send((None, UiEvent::UserMessage { text: "go".into() }))
+        .await
+        .unwrap();
+    let mut noticed = false;
+    while let Some(ev) = agent_rx.recv().await {
+        match ev {
+            AgentEvent::Notice { log: true, text } if text.contains("output token limit") => {
+                noticed = true
+            }
+            AgentEvent::TurnComplete => break,
+            _ => {}
+        }
+    }
+    ui_tx.send((None, UiEvent::Quit)).await.unwrap();
+    task.await.unwrap().unwrap();
+    assert!(noticed, "the cut-off call is surfaced as a logged notice");
+
+    let sent = seen_messages.lock().unwrap().clone();
+    let results: Vec<(String, bool, String)> = sent
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => Some((tool_use_id.clone(), *is_error, content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2, "every tool_use is answered: {results:?}");
+    assert_eq!((results[0].0.as_str(), results[0].1), ("tu0", false));
+    assert_eq!((results[1].0.as_str(), results[1].1), ("tu1", true));
+    assert!(results[1].2.contains("output token limit"));
+    assert_eq!(
+        logged_roles(&dir),
+        vec!["user", "assistant", "user", "assistant"]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test]
 async fn peers_command_reports_the_roster() {
     let (session, dir) = mk_session();

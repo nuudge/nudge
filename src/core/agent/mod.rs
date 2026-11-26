@@ -375,7 +375,17 @@ async fn run_loop<P: Provider, B: Backend>(
                 continue;
             }
 
-            if resp.stop_reason != "tool_use" {
+            // A tool call truncated by max_tokens still needs a tool_result, or every
+            // later request is rejected; answer it with an error so the model can retry.
+            let cut_off = match assistant_msg.content.last() {
+                Some(ContentBlock::ToolUse { id, name, .. })
+                    if resp.stop_reason == "max_tokens" =>
+                {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            };
+            if resp.stop_reason != "tool_use" && cut_off.is_none() {
                 messages.push(assistant_msg);
                 last_good_snapshot = messages.len();
                 session.commit()?;
@@ -394,9 +404,22 @@ async fn run_loop<P: Provider, B: Backend>(
                 break;
             }
 
+            if let Some((_, name)) = &cut_off {
+                let _ = agent_tx
+                    .send(AgentEvent::Notice {
+                        log: true,
+                        text: format!(
+                            "the response hit the output token limit ({}) inside a {name} call; it was not run and the model was told to split it into smaller calls",
+                            cfg.max_tokens
+                        ),
+                    })
+                    .await;
+            }
+
             let roster_before = peers.roster();
             let (mut tool_results, denied) = dispatch_tools(
                 &assistant_msg,
+                cut_off.as_ref().map(|(id, _)| id.as_str()),
                 &agent_tx,
                 &mut backend,
                 &mut peers,
@@ -460,8 +483,8 @@ async fn run_loop<P: Provider, B: Backend>(
                             )
                             .await;
                         }
-                        // Dropping this turn's uncommitted staged entries is fine: resume
-                        // truncation would discard them anyway.
+                        // Dropping this turn's uncommitted staged entries is fine: the
+                        // store still ends at the last committed turn.
                         (_, UiEvent::Quit) => return Ok(()),
                         (_, UiEvent::PermissionResponse { .. }) => {}
                     }
