@@ -28,6 +28,8 @@ pub struct Resumed {
     pub session: Session,
     pub entries: Vec<LoggedMessage>,
     pub dropped: usize,
+    // Closing entries appended to finish an interrupted turn.
+    pub added: usize,
 }
 
 impl Session {
@@ -44,8 +46,8 @@ impl Session {
         })
     }
 
-    // Truncates to a boundary the Messages API accepts and marks the dropped tail
-    // superseded, so a later resume doesn't replay it mid-transcript.
+    // Brings the transcript to a state the Messages API accepts: an unanswered trailing
+    // prompt is marked superseded, and an interrupted turn is closed rather than dropped.
     pub fn open(id: &str, cwd: PathBuf, store: SessionStore) -> Result<Resumed> {
         let row = store
             .session(id)?
@@ -70,7 +72,7 @@ impl Session {
         }
 
         let original_len = entries.len();
-        truncate_to_clean_boundary(&mut entries);
+        drop_unanswered_prompts(&mut entries);
         let dropped = original_len - entries.len();
         if dropped > 0 {
             let last_kept = match entries.len() {
@@ -80,17 +82,30 @@ impl Session {
             store.mark_superseded_after(id, last_kept)?;
         }
 
+        let mut session = Self {
+            id: id.to_string(),
+            cwd,
+            name: row.name,
+            auto,
+            store,
+            staged: Vec::new(),
+        };
+        // Persisted so the store keeps matching what the model is sent.
+        let closing = closing_messages(&entries);
+        let added = closing.len();
+        for message in closing {
+            session.log_from(&message, None)?;
+            entries.push(LoggedMessage {
+                message,
+                sender: None,
+            });
+        }
+
         Ok(Resumed {
-            session: Self {
-                id: id.to_string(),
-                cwd,
-                name: row.name,
-                auto,
-                store,
-                staged: Vec::new(),
-            },
+            session,
             entries,
             dropped,
+            added,
         })
     }
 
@@ -160,26 +175,59 @@ pub fn tilde_path(path: &Path) -> String {
     }
 }
 
-// Keep through the last assistant turn with no ToolUse: the only point where the next
-// role is "user" and no tool_use awaits a result. Everything after is discarded.
-fn truncate_to_clean_boundary(entries: &mut Vec<LoggedMessage>) {
-    let mut cutoff: Option<usize> = None;
-    for (i, entry) in entries.iter().enumerate().rev() {
-        let msg = &entry.message;
-        let is_clean_assistant = msg.role == "assistant"
-            && !msg
+// Drops trailing prompts that never got a reply; they would precede the next prompt as
+// two consecutive user turns.
+fn drop_unanswered_prompts(entries: &mut Vec<LoggedMessage>) {
+    while entries.last().is_some_and(|e| {
+        e.message.role == "user"
+            && !e
+                .message
                 .content
                 .iter()
-                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
-        if is_clean_assistant {
-            cutoff = Some(i + 1);
-            break;
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    }) {
+        entries.pop();
+    }
+}
+
+// The messages that close an interrupted turn so the API accepts the transcript: an
+// error tool_result for each tool_use left without one, then an assistant turn so the
+// next prompt doesn't follow a user turn.
+fn closing_messages(entries: &[LoggedMessage]) -> Vec<Message> {
+    let Some(last) = entries.last() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if last.message.role == "assistant" {
+        let results: Vec<ContentBlock> = last
+            .message
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(ContentBlock::ToolResult {
+                    tool_use_id: id.clone(),
+                    content: "Interrupted: this tool call did not run.".into(),
+                    is_error: true,
+                }),
+                _ => None,
+            })
+            .collect();
+        if results.is_empty() {
+            return out;
         }
+        out.push(Message {
+            role: "user".into(),
+            content: results,
+        });
     }
-    match cutoff {
-        Some(n) => entries.truncate(n),
-        None => entries.clear(),
-    }
+    out.push(Message {
+        role: "assistant".into(),
+        content: vec![ContentBlock::Text {
+            text: "This turn was interrupted before it finished; the work above may be partial."
+                .into(),
+        }],
+    });
+    out
 }
 
 #[cfg(test)]
@@ -319,9 +367,9 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // The second open proves the dropped tail was persisted as superseded.
+    // The second open proves the dropped prompt was persisted as superseded.
     #[test]
-    fn open_truncates_orphaned_tail_and_supersedes_it() {
+    fn open_supersedes_an_unanswered_trailing_prompt() {
         let db = temp_db();
         let mut s = Session::create(cwd(), store_at(&db)).unwrap();
         let id = s.id.clone();
@@ -331,11 +379,91 @@ mod tests {
 
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 1);
+        assert_eq!(resumed.added, 0);
         assert_eq!(resumed.entries.len(), 2);
 
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 0);
         assert_eq!(resumed.entries.len(), 2);
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    fn tool_use_msg(id: &str) -> Message {
+        Message {
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "CreateNew".into(),
+                input: serde_json::json!({"file_path": "/proj/big.py"}),
+            }],
+        }
+    }
+
+    fn tool_result_msg(id: &str) -> Message {
+        Message {
+            role: "user".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    // One long turn where every assistant message calls a tool, ending in a tool_use
+    // that never got a result: the turn is closed, not dropped.
+    #[test]
+    fn open_closes_an_interrupted_tool_turn_and_persists_the_repair() {
+        let db = temp_db();
+        let mut s = Session::create(cwd(), store_at(&db)).unwrap();
+        let id = s.id.clone();
+        s.log_from(&text_msg("user", "write it"), None).unwrap();
+        for i in 0..5 {
+            s.log_from(&tool_use_msg(&format!("t{i}")), None).unwrap();
+            s.log_from(&tool_result_msg(&format!("t{i}")), None)
+                .unwrap();
+        }
+        s.log_from(&tool_use_msg("cut"), None).unwrap();
+
+        let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 2);
+        let msgs: Vec<&Message> = resumed.entries.iter().map(|e| &e.message).collect();
+        assert_eq!(msgs.len(), 14);
+        match msgs[12].content.as_slice() {
+            [
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                },
+            ] => assert_eq!(tool_use_id, "cut"),
+            other => panic!("expected an error tool_result for the cut call, got {other:?}"),
+        }
+        assert_eq!(msgs[13].role, "assistant");
+        assert!(
+            msgs.windows(2).all(|w| w[0].role != w[1].role),
+            "roles must alternate"
+        );
+        for (i, m) in msgs.iter().enumerate() {
+            for b in &m.content {
+                if let ContentBlock::ToolUse { id, .. } = b {
+                    assert!(
+                        msgs[i + 1].content.iter().any(|r| matches!(
+                            r,
+                            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                        )),
+                        "tool_use {id} has no tool_result in the next message"
+                    );
+                }
+            }
+        }
+
+        let reopened = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(reopened.added, 0);
+        assert_eq!(reopened.entries.len(), 14, "the repair is persisted once");
 
         std::fs::remove_file(&db).ok();
     }

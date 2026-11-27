@@ -401,10 +401,10 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    // Import lands all rows; the first resume supersedes (not deletes) the
-    // orphaned tail: an unanswered prompt and a dangling tool_use.
+    // Import lands all rows; the first resume closes the dangling tool_use with an
+    // error result and a closing assistant turn, persisted after the imported rows.
     #[test]
-    fn resume_of_imported_session_truncates_and_supersedes_the_orphaned_tail() {
+    fn resume_of_imported_session_closes_a_dangling_tool_use() {
         let root = temp_root();
         let dir = root.join("p");
         std::fs::create_dir_all(&dir).unwrap();
@@ -425,22 +425,30 @@ mod tests {
         assert_eq!(import_tree(&root, &mut store).unwrap().messages, 4);
 
         let resumed = Session::open("aaaa", PathBuf::from("/proj/alpha"), store).unwrap();
-        assert_eq!(resumed.dropped, 2);
-        assert_eq!(resumed.entries.len(), 2);
+        assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 2);
+        assert_eq!(resumed.entries.len(), 6);
+        match resumed.entries[4].message.content.as_slice() {
+            [
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error: true,
+                    ..
+                },
+            ] => assert_eq!(tool_use_id, "t1"),
+            other => panic!("expected an error tool_result, got {other:?}"),
+        }
+        assert_eq!(resumed.entries[5].message.role, "assistant");
 
         let conn = rusqlite::Connection::open(&db).unwrap();
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(
             count("SELECT COUNT(*) FROM messages WHERE session_id='aaaa'"),
-            4
+            6
         );
         assert_eq!(
             count("SELECT COUNT(*) FROM messages WHERE session_id='aaaa' AND superseded=1"),
-            2
-        );
-        assert_eq!(
-            count("SELECT MIN(ordinal) FROM messages WHERE session_id='aaaa' AND superseded=1"),
-            2
+            0
         );
 
         std::fs::remove_dir_all(&root).ok();

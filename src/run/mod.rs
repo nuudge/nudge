@@ -35,11 +35,11 @@ pub async fn host(cli: Cli) -> Result<()> {
     if cli.daemon && !cli.local && config.relay.is_none() {
         anyhow::bail!("--daemon serves the relay too: set NUDGE_RELAY, or pass --local");
     }
-    let (session, entries, dropped) = match &cli.resume {
-        None => (coding::open_new()?, Vec::new(), 0),
+    let (session, entries, dropped, added) = match &cli.resume {
+        None => (coding::open_new()?, Vec::new(), 0, 0),
         Some(id) => {
             let r = coding::open_resume(id)?;
-            (r.session, r.entries, r.dropped)
+            (r.session, r.entries, r.dropped, r.added)
         }
     };
 
@@ -73,6 +73,9 @@ pub async fn host(cli: Cli) -> Result<()> {
         spawned_by = parent.as_ref().map(|p| tracing::field::display(&p.id)),
         "session host starting"
     );
+    if added > 0 {
+        info!(added, "closed an interrupted turn on resume");
+    }
     let size_warning = logging::size_warning(&coding::run_dir()?)?;
     if let Some(text) = &size_warning {
         warn!("{text}");

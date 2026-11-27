@@ -9,8 +9,11 @@ use crate::llm::{ContentBlock, Message};
 use super::{Backend, peer_tools};
 
 // Peer tools are executed here, never by the backend: they act on the loop's `PeerSet`.
+// `cut_off` names a tool_use truncated by max_tokens: it is answered with an error, not run.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn dispatch_tools<B: Backend>(
     assistant_msg: &Message,
+    cut_off: Option<&str>,
     agent_tx: &mpsc::Sender<AgentEvent>,
     backend: &mut B,
     peers: &mut PeerSet,
@@ -40,6 +43,24 @@ pub(super) async fn dispatch_tools<B: Backend>(
             .await;
         tracing::info!(tool = %name, tool_use_id = %id, "tool started");
         let started = Instant::now();
+
+        if cut_off == Some(id.as_str()) {
+            let content = "Not run: this tool call was cut off by the output token limit, so its input is incomplete. Split the work into smaller calls (e.g. create the file with part of the content, then append the rest).".to_string();
+            tracing::warn!(tool = %name, tool_use_id = %id, "tool call cut off by max_tokens; not run");
+            let _ = agent_tx
+                .send(AgentEvent::ToolResult {
+                    id: id.clone(),
+                    content: content.clone(),
+                    is_error: true,
+                })
+                .await;
+            tool_results.push(ContentBlock::ToolResult {
+                tool_use_id: id.clone(),
+                content,
+                is_error: true,
+            });
+            continue;
+        }
 
         if denied {
             // The API requires a tool_result per tool_use_id.
