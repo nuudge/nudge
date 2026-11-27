@@ -426,6 +426,7 @@ mod tests {
 
         let resumed = Session::open("aaaa", PathBuf::from("/proj/alpha"), store).unwrap();
         assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 2);
         assert_eq!(resumed.entries.len(), 6);
         match resumed.entries[4].message.content.as_slice() {
             [

@@ -28,6 +28,8 @@ pub struct Resumed {
     pub session: Session,
     pub entries: Vec<LoggedMessage>,
     pub dropped: usize,
+    // Closing entries appended to finish an interrupted turn.
+    pub added: usize,
 }
 
 impl Session {
@@ -90,12 +92,7 @@ impl Session {
         };
         // Persisted so the store keeps matching what the model is sent.
         let closing = closing_messages(&entries);
-        if !closing.is_empty() {
-            tracing::info!(
-                added = closing.len(),
-                "closed an interrupted turn on resume"
-            );
-        }
+        let added = closing.len();
         for message in closing {
             session.log_from(&message, None)?;
             entries.push(LoggedMessage {
@@ -108,6 +105,7 @@ impl Session {
             session,
             entries,
             dropped,
+            added,
         })
     }
 
@@ -381,10 +379,12 @@ mod tests {
 
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 1);
+        assert_eq!(resumed.added, 0);
         assert_eq!(resumed.entries.len(), 2);
 
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 0);
         assert_eq!(resumed.entries.len(), 2);
 
         std::fs::remove_file(&db).ok();
@@ -429,6 +429,7 @@ mod tests {
 
         let resumed = Session::open(&id, cwd(), store_at(&db)).unwrap();
         assert_eq!(resumed.dropped, 0);
+        assert_eq!(resumed.added, 2);
         let msgs: Vec<&Message> = resumed.entries.iter().map(|e| &e.message).collect();
         assert_eq!(msgs.len(), 14);
         match msgs[12].content.as_slice() {
@@ -461,6 +462,7 @@ mod tests {
         }
 
         let reopened = Session::open(&id, cwd(), store_at(&db)).unwrap();
+        assert_eq!(reopened.added, 0);
         assert_eq!(reopened.entries.len(), 14, "the repair is persisted once");
 
         std::fs::remove_file(&db).ok();
